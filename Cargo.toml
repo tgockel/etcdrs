@@ -1,24 +1,18 @@
-[package]
-name = "etcdrs"
-version.workspace = true
-edition.workspace = true
+[workspace]
+members = [
+    "etcdrs",
+]
+resolver = "2"
 
-[lib]
-doctest = false  # <- can't seem to disable comments
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
 
-[dependencies]
-prost.workspace = true
-prost-types.workspace = true
-tonic.workspace = true
-
-[dev-dependencies]
-rstest.workspace = true
-tokio = { workspace = true, default-features = false, features = ["macros", "rt"] }
-
-[build-dependencies]
-tonic-build = { workspace = true, optional = true }
-
-[features]
-default = []
-generate = ["dep:tonic-build"]
-generate-save = ["generate"]
+[workspace.dependencies]
+prost = "^0.13.1"
+prost-types = "^0.13.1"
+rstest = "^0.21.0"
+tokio = { version = "^1.38.0", default-features = false }
+tonic = "^0.12.0"
+tonic-build = "^0.12.0"
+url = "^2.5.2"
