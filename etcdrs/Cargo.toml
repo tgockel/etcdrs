@@ -3,9 +3,6 @@ name = "etcdrs"
 version.workspace = true
 edition.workspace = true
 
-[lib]
-doctest = false  # <- can't seem to disable comments
-
 [dependencies]
 prost.workspace = true
 prost-types.workspace = true
@@ -21,4 +18,3 @@ tonic-build = { workspace = true, optional = true }
 [features]
 default = []
 generate = ["dep:tonic-build"]
-generate-save = ["generate"]
