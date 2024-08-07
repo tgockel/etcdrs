@@ -1,6 +1,12 @@
 #[cfg(feature = "generate")]
 mod generate {
-    use std::{env, ffi::OsStr, fs, io::Write, path::{Path, PathBuf}};
+    use std::{
+        env,
+        ffi::OsStr,
+        fs,
+        io::Write,
+        path::{Path, PathBuf},
+    };
 
     type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
@@ -39,7 +45,7 @@ mod generate {
             // make it work. Having comments interferes with `doctest` and since none of the generated files are public,
             // there is no value to keeping the comments.
             if line.trim_start().starts_with("///") {
-                continue
+                continue;
             }
 
             let need_allow_unused = is_aggregate && line.starts_with("pub mod ");
@@ -63,7 +69,7 @@ mod generate {
         const SAVE_GENERATED_FILES_VAR: &str = "ETCDRS_SAVE_GENERATED_FILES";
         println!("cargo:rerun-if-env-changed={SAVE_GENERATED_FILES_VAR}");
         let Some(var) = env::var_os(SAVE_GENERATED_FILES_VAR) else {
-            return false
+            return false;
         };
         var.to_str().unwrap() == "1"
     }

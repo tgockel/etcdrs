@@ -1,5 +1,5 @@
 use crate::{
-    error::{ErrorInner, ErrorKind},
+    error::{Error, ErrorInner, ErrorKind},
     pb::{etcdserverpb, mvccpb},
     LeaseId, Result, Revision, Version,
 };
@@ -7,11 +7,13 @@ use std::{
     future::{Future, IntoFuture},
     marker::PhantomData,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
+#[derive(Clone)]
 pub struct Client {
-    channel: tonic::transport::Channel,
+    inner: Arc<ClientInner>,
 }
 
 impl Client {
@@ -19,12 +21,14 @@ impl Client {
         let uri: tonic::transport::Uri = host.parse().map_err(|e| format!("{e:?}"))?;
         let endpoint = tonic::transport::Channel::builder(uri);
         let channel = endpoint.connect_lazy();
-        Ok(Self { channel })
+        Ok(Self {
+            inner: Arc::new(ClientInner { channel }),
+        })
     }
 
     fn get_impl(&self, key: Vec<u8>) -> Get {
         Get {
-            channel: self.channel.clone(),
+            client: self.inner.clone(),
             request: etcdserverpb::RangeRequest {
                 key,
                 ..Default::default()
@@ -38,7 +42,7 @@ impl Client {
 
     fn put_impl(&self, key: Vec<u8>) -> Put<()> {
         Put {
-            channel: self.channel.clone(),
+            client: self.inner.clone(),
             request: etcdserverpb::PutRequest {
                 key,
                 ..Default::default()
@@ -50,6 +54,10 @@ impl Client {
     pub fn put(&self, key: impl Into<Vec<u8>>) -> Put<()> {
         self.put_impl(key.into())
     }
+}
+
+struct ClientInner {
+    channel: tonic::transport::Channel,
 }
 
 pub struct BoxedFuture<T> {
@@ -74,21 +82,20 @@ impl<T> Future for BoxedFuture<T> {
 }
 
 pub struct Get {
-    channel: tonic::transport::Channel,
+    client: Arc<ClientInner>,
     request: etcdserverpb::RangeRequest,
 }
 
 impl Get {
     async fn call(self) -> Result<Option<Entry>> {
-        let mut client = etcdserverpb::kv_client::KvClient::new(self.channel);
-        let resp = client
-            .range(self.request)
-            .await
-            .map_err(|err| {
-                // TODO
-                ErrorInner::from_unknown(err)
-            })?
-            .into_inner();
+        let resp = self
+            .client
+            .wrap_unary_call(
+                etcdserverpb::kv_client::KvClient::new,
+                etcdserverpb::kv_client::KvClient::range,
+                self.request,
+            )
+            .await?;
         if resp.more || resp.kvs.len() > 1 {
             Err(ErrorInner::with_static_message(
                 ErrorKind::TooMany,
@@ -115,22 +122,21 @@ impl IntoFuture for Get {
 pub struct GetPreviousValue;
 
 pub struct Put<R> {
-    channel: tonic::transport::Channel,
+    client: Arc<ClientInner>,
     request: etcdserverpb::PutRequest,
     _return: PhantomData<R>,
 }
 
 impl<R> Put<R> {
     async fn call(self) -> Result<Option<Entry>> {
-        let mut client = etcdserverpb::kv_client::KvClient::new(self.channel);
-        let resp = client
-            .put(self.request)
-            .await
-            .map_err(|err| {
-                // TODO
-                ErrorInner::from_unknown(err)
-            })?
-            .into_inner();
+        let resp = self
+            .client
+            .wrap_unary_call(
+                etcdserverpb::kv_client::KvClient::new,
+                etcdserverpb::kv_client::KvClient::put,
+                self.request,
+            )
+            .await?;
         Ok(resp.prev_kv.map(Entry::from_pb))
     }
 
@@ -139,7 +145,7 @@ impl<R> Put<R> {
         let mut request = self.request;
         request.prev_kv = true;
         Put {
-            channel: self.channel,
+            client: self.client,
             request,
             _return: Default::default(),
         }
@@ -249,9 +255,61 @@ impl Entry {
     }
 }
 
+impl ClientInner {
+    async fn wrap_unary_call<
+        'a,
+        R,
+        F: Future<Output = Result<tonic::Response<R>, tonic::Status>>,
+        GrpcClient: 'a,
+        Request: Clone,
+    >(
+        &self,
+        create_client: impl Fn(tonic::transport::Channel) -> GrpcClient,
+        call: impl Fn(&'a mut GrpcClient, Request) -> F,
+        request: Request,
+    ) -> Result<R, Error> {
+        // TODO: configurable
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            // TODO: Cycle channels if needed
+            let channel = self.channel.clone();
+            let response = {
+                let mut client = create_client(channel);
+                // safety -- this transmute is only needed to give `'a` some sort of lifetime. It is needed because Rust
+                // does not support async closures as of 2024, so the `&mut self` on an async function needs some sort
+                // of lifetime.
+                let client_ref: &'a mut GrpcClient = unsafe { std::mem::transmute(&mut client) };
+                call(client_ref, request.clone()).await
+            };
+            match response {
+                Ok(r) => break Ok(r.into_inner()),
+                Err(e) => {
+                    use tonic::Code;
+                    let err = match e.code() {
+                        Code::Unavailable => {
+                            if std::time::Instant::now() > deadline {
+                                Error::new(ErrorKind::Unavailable, e.message())
+                            } else {
+                                continue;
+                            }
+                        }
+                        Code::InvalidArgument => {
+                            Error::new(ErrorKind::InvalidArgument, e.message())
+                        }
+                        _ => ErrorInner::from_unknown(e).into(),
+                    };
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::task::JoinSet;
+
+    use crate::error::ErrorKind;
 
     #[tokio::test]
     async fn foo() {
@@ -268,5 +326,15 @@ mod tests {
 
         let abc = client.get(b"abc").await.unwrap().unwrap();
         assert_eq!(b"def", abc.value());
+    }
+
+    #[tokio::test]
+    async fn get_with_dead_server() {
+        // we make a server, but never start it
+        let server = crate::fake::FakeServer::builder().build().unwrap();
+        let client = server.lazy_client();
+
+        let err = client.get(b"abc").await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unavailable);
     }
 }

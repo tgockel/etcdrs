@@ -45,6 +45,10 @@ impl fmt::Debug for Error {
 pub enum ErrorKind {
     Unknown,
     Canceled,
+    /// Specified arguments were invalid. The associated message might have more details about which arguments were
+    /// invalid.
+    InvalidArgument,
+    Unavailable,
     /// The key was not found.
     NotFound,
     /// Too many items were returned.
@@ -56,6 +60,8 @@ impl ErrorKind {
         match self {
             Self::Unknown => "unknown",
             Self::Canceled => "canceled",
+            Self::InvalidArgument => "invalid argument",
+            Self::Unavailable => "unavailable",
             Self::NotFound => "not found",
             Self::TooMany => "too many items",
         }
@@ -68,6 +74,7 @@ pub(crate) struct ErrorInner {
 }
 
 impl ErrorInner {
+    /// Create an error with a static error code.
     pub fn with_static_message(kind: ErrorKind, message: &'static str) -> Self {
         Self {
             kind,
