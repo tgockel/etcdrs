@@ -66,9 +66,7 @@ pub struct BoxedFuture<T> {
 
 impl<T> BoxedFuture<T> {
     fn new(src: impl Future<Output = T> + 'static) -> Self {
-        Self {
-            inner: Box::new(src),
-        }
+        Self { inner: Box::new(src) }
     }
 }
 
@@ -97,11 +95,7 @@ impl Get {
             )
             .await?;
         if resp.more || resp.kvs.len() > 1 {
-            Err(ErrorInner::with_static_message(
-                ErrorKind::TooMany,
-                "call to get should have only 1 response",
-            )
-            .into())
+            Err(ErrorInner::with_static_message(ErrorKind::TooMany, "call to get should have only 1 response").into())
         } else if let Some(r) = resp.kvs.into_iter().next() {
             Ok(Some(Entry::from_pb(r)))
         } else {
@@ -293,9 +287,7 @@ impl ClientInner {
                                 continue;
                             }
                         }
-                        Code::InvalidArgument => {
-                            Error::new(ErrorKind::InvalidArgument, e.message())
-                        }
+                        Code::InvalidArgument => Error::new(ErrorKind::InvalidArgument, e.message()),
                         _ => ErrorInner::from_unknown(e).into(),
                     };
                     return Err(err);

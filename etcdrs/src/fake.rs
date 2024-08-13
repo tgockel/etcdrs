@@ -1,8 +1,6 @@
 use crate::{
     pb::{
-        etcdserverpb::{
-            kv_server, PutRequest, PutResponse, RangeRequest, RangeResponse, ResponseHeader,
-        },
+        etcdserverpb::{kv_server, PutRequest, PutResponse, RangeRequest, RangeResponse, ResponseHeader},
         mvccpb::KeyValue,
     },
     Client, ClusterId, LeaseId, MemberId, Revision, Term, Version,
@@ -32,8 +30,7 @@ impl FakeServer {
     }
 
     pub async fn run(&self) {
-        let server =
-            Server::builder().add_service(kv_server::KvServer::from_arc(self.inner.clone()));
+        let server = Server::builder().add_service(kv_server::KvServer::from_arc(self.inner.clone()));
         server.serve(self.host_addr).await.unwrap();
     }
 }

@@ -1,0 +1,2 @@
+match_arm_leading_pipes = "Preserve"
+max_width = 120
