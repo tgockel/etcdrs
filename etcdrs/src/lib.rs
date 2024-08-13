@@ -4,6 +4,7 @@ pub mod client;
 pub mod error;
 pub mod fake;
 mod pb;
+pub mod record;
 
 pub use client::Client;
 

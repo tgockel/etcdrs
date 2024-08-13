@@ -1,6 +1,7 @@
 use crate::{
     error::{Error, ErrorInner, ErrorKind},
     pb::{etcdserverpb, mvccpb},
+    record::{AsKey, AsValue, Metadata, Record},
     LeaseId, Result, Revision, Version,
 };
 use std::{
@@ -36,8 +37,8 @@ impl Client {
         }
     }
 
-    pub fn get(&self, key: impl Into<Vec<u8>>) -> Get {
-        self.get_impl(key.into())
+    pub fn get(&self, key: impl AsKey) -> Get {
+        self.get_impl(key.as_key().into())
     }
 
     fn put_impl(&self, key: Vec<u8>) -> Put<()> {
@@ -51,8 +52,8 @@ impl Client {
         }
     }
 
-    pub fn put(&self, key: impl Into<Vec<u8>>) -> Put<()> {
-        self.put_impl(key.into())
+    pub fn put(&self, key: impl AsKey) -> Put<()> {
+        self.put_impl(key.as_key().into())
     }
 }
 
@@ -85,7 +86,7 @@ pub struct Get {
 }
 
 impl Get {
-    async fn call(self) -> Result<Option<Entry>> {
+    async fn call(self) -> Result<Option<Record>> {
         let resp = self
             .client
             .wrap_unary_call(
@@ -97,7 +98,7 @@ impl Get {
         if resp.more || resp.kvs.len() > 1 {
             Err(ErrorInner::with_static_message(ErrorKind::TooMany, "call to get should have only 1 response").into())
         } else if let Some(r) = resp.kvs.into_iter().next() {
-            Ok(Some(Entry::from_pb(r)))
+            Ok(Some(record_from_pb(r)))
         } else {
             Ok(None)
         }
@@ -105,7 +106,7 @@ impl Get {
 }
 
 impl IntoFuture for Get {
-    type Output = Result<Option<Entry>>;
+    type Output = Result<Option<Record>>;
     type IntoFuture = BoxedFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -122,7 +123,7 @@ pub struct Put<R> {
 }
 
 impl<R> Put<R> {
-    async fn call(self) -> Result<Option<Entry>> {
+    async fn call(self) -> Result<Option<Record>> {
         let resp = self
             .client
             .wrap_unary_call(
@@ -131,7 +132,7 @@ impl<R> Put<R> {
                 self.request,
             )
             .await?;
-        Ok(resp.prev_kv.map(Entry::from_pb))
+        Ok(resp.prev_kv.map(record_from_pb))
     }
 
     /// Return the previous key-value.
@@ -145,8 +146,9 @@ impl<R> Put<R> {
         }
     }
 
-    pub fn value(mut self, value: impl Into<Vec<u8>>) -> Self {
-        self.request.value = value.into();
+    /// Set the record to `value`.
+    pub fn value(mut self, value: impl AsValue) -> Self {
+        self.request.value = value.as_value().into();
         self.request.ignore_value = false;
         self
     }
@@ -173,7 +175,7 @@ impl<R> Put<R> {
 }
 
 impl IntoFuture for Put<GetPreviousValue> {
-    type Output = Result<Option<Entry>>;
+    type Output = Result<Option<Record>>;
     type IntoFuture = BoxedFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -190,63 +192,14 @@ impl IntoFuture for Put<()> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Entry {
-    version: Version,
-    lease: Option<LeaseId>,
-    create_revision: Revision,
-    modified_revision: Revision,
-    key: Vec<u8>,
-    value: Vec<u8>,
-}
-
-impl Entry {
-    pub fn version(&self) -> Version {
-        self.version
-    }
-
-    pub fn lease(&self) -> Option<LeaseId> {
-        self.lease
-    }
-
-    pub fn created(&self) -> Revision {
-        self.create_revision
-    }
-
-    pub fn modified(&self) -> Revision {
-        self.modified_revision
-    }
-
-    pub fn key(&self) -> &[u8] {
-        &self.key
-    }
-
-    pub fn take_key(self) -> Vec<u8> {
-        self.key
-    }
-
-    pub fn value(&self) -> &[u8] {
-        &self.value
-    }
-
-    pub fn take_value(self) -> Vec<u8> {
-        self.value
-    }
-
-    pub fn take(self) -> (Vec<u8>, Vec<u8>) {
-        (self.key, self.value)
-    }
-
-    fn from_pb(r: mvccpb::KeyValue) -> Self {
-        Self {
-            version: Version::new(r.version as u64),
-            lease: LeaseId::new(r.lease),
-            create_revision: Revision::new(r.create_revision).unwrap(),
-            modified_revision: Revision::new(r.mod_revision).unwrap(),
-            key: r.key,
-            value: r.value,
-        }
-    }
+fn record_from_pb(r: mvccpb::KeyValue) -> Record {
+    let metadata = Metadata {
+        create_revision: Revision::new(r.create_revision).unwrap(),
+        modified_revision: Revision::new(r.mod_revision).unwrap(),
+        version: Version::new(r.version as u64),
+        lease: LeaseId::new(r.lease),
+    };
+    Record::new(r.key, r.value, metadata)
 }
 
 impl ClientInner {
@@ -317,7 +270,7 @@ mod tests {
         client.put(b"abc").value(b"def").await.unwrap();
 
         let abc = client.get(b"abc").await.unwrap().unwrap();
-        assert_eq!(b"def", abc.value());
+        assert_eq!(*b"def", **abc.value());
     }
 
     #[tokio::test]
