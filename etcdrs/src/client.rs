@@ -1,6 +1,6 @@
 use crate::{
     error::{Error, ErrorInner, ErrorKind},
-    record::{AsKey, Metadata, Record},
+    record::{AsKey, KeyWithMetadata, Metadata, Record},
     LeaseId, Result, Revision, Version,
 };
 use std::{
@@ -35,6 +35,10 @@ impl Client {
     pub fn put(&self, key: impl AsKey) -> Put<Self, ()> {
         Put::new(key).with_client(self.clone())
     }
+
+    pub fn list(&self) -> List<Self, Record> {
+        List::default().with_client(self.clone())
+    }
 }
 
 struct ClientInner {
@@ -60,14 +64,23 @@ impl<T> Future for BoxedFuture<T> {
     }
 }
 
-fn record_from_pb(r: crate::pb::mvccpb::KeyValue) -> Record {
-    let metadata = Metadata {
+fn metadata_from_pb(r: &crate::pb::mvccpb::KeyValue) -> Metadata {
+    Metadata {
         create_revision: Revision::new(r.create_revision).unwrap(),
         modified_revision: Revision::new(r.mod_revision).unwrap(),
         version: Version::new(r.version as u64),
         lease: LeaseId::new(r.lease),
-    };
+    }
+}
+
+fn record_from_pb(r: crate::pb::mvccpb::KeyValue) -> Record {
+    let metadata = metadata_from_pb(&r);
     Record::new(r.key, r.value, metadata)
+}
+
+fn key_with_metadata_from_pb(r: crate::pb::mvccpb::KeyValue) -> KeyWithMetadata {
+    let metadata = metadata_from_pb(&r);
+    KeyWithMetadata::new(r.key, metadata)
 }
 
 impl ClientInner {

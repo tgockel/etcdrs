@@ -48,6 +48,7 @@ pub enum ErrorKind {
     /// Specified arguments were invalid. The associated message might have more details about which arguments were
     /// invalid.
     InvalidArgument,
+    /// The system is currently unavailable.
     Unavailable,
     /// The key was not found.
     NotFound,

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+async-stream.workspace = true
+fallible-async-iterator.workspace = true
+futures-core.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 tonic.workspace = true
