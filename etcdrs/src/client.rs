@@ -1,16 +1,17 @@
 use crate::{
     error::{Error, ErrorInner, ErrorKind},
-    pb::{etcdserverpb, mvccpb},
-    record::{AsKey, AsValue, Metadata, Record},
+    record::{AsKey, Metadata, Record},
     LeaseId, Result, Revision, Version,
 };
 use std::{
-    future::{Future, IntoFuture},
-    marker::PhantomData,
+    future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
+
+mod ops;
+pub use ops::*;
 
 #[derive(Clone)]
 pub struct Client {
@@ -27,33 +28,12 @@ impl Client {
         })
     }
 
-    fn get_impl(&self, key: Vec<u8>) -> Get {
-        Get {
-            client: self.inner.clone(),
-            request: etcdserverpb::RangeRequest {
-                key,
-                ..Default::default()
-            },
-        }
+    pub fn get(&self, key: impl AsKey) -> Get<Self> {
+        Get::new(key).with_client(self.clone())
     }
 
-    pub fn get(&self, key: impl AsKey) -> Get {
-        self.get_impl(key.as_key().into())
-    }
-
-    fn put_impl(&self, key: Vec<u8>) -> Put<()> {
-        Put {
-            client: self.inner.clone(),
-            request: etcdserverpb::PutRequest {
-                key,
-                ..Default::default()
-            },
-            _return: Default::default(),
-        }
-    }
-
-    pub fn put(&self, key: impl AsKey) -> Put<()> {
-        self.put_impl(key.as_key().into())
+    pub fn put(&self, key: impl AsKey) -> Put<Self, ()> {
+        Put::new(key).with_client(self.clone())
     }
 }
 
@@ -80,119 +60,7 @@ impl<T> Future for BoxedFuture<T> {
     }
 }
 
-pub struct Get {
-    client: Arc<ClientInner>,
-    request: etcdserverpb::RangeRequest,
-}
-
-impl Get {
-    async fn call(self) -> Result<Option<Record>> {
-        let resp = self
-            .client
-            .wrap_unary_call(
-                etcdserverpb::kv_client::KvClient::new,
-                etcdserverpb::kv_client::KvClient::range,
-                self.request,
-            )
-            .await?;
-        if resp.more || resp.kvs.len() > 1 {
-            Err(ErrorInner::with_static_message(ErrorKind::TooMany, "call to get should have only 1 response").into())
-        } else if let Some(r) = resp.kvs.into_iter().next() {
-            Ok(Some(record_from_pb(r)))
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-impl IntoFuture for Get {
-    type Output = Result<Option<Record>>;
-    type IntoFuture = BoxedFuture<Self::Output>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        BoxedFuture::new(self.call())
-    }
-}
-
-pub struct GetPreviousValue;
-
-pub struct Put<R> {
-    client: Arc<ClientInner>,
-    request: etcdserverpb::PutRequest,
-    _return: PhantomData<R>,
-}
-
-impl<R> Put<R> {
-    async fn call(self) -> Result<Option<Record>> {
-        let resp = self
-            .client
-            .wrap_unary_call(
-                etcdserverpb::kv_client::KvClient::new,
-                etcdserverpb::kv_client::KvClient::put,
-                self.request,
-            )
-            .await?;
-        Ok(resp.prev_kv.map(record_from_pb))
-    }
-
-    /// Return the previous key-value.
-    pub fn get_previous(self) -> Put<GetPreviousValue> {
-        let mut request = self.request;
-        request.prev_kv = true;
-        Put {
-            client: self.client,
-            request,
-            _return: Default::default(),
-        }
-    }
-
-    /// Set the record to `value`.
-    pub fn value(mut self, value: impl AsValue) -> Self {
-        self.request.value = value.as_value().into();
-        self.request.ignore_value = false;
-        self
-    }
-
-    /// Update the key, leaving the current value in-place.
-    pub fn ignore_value(mut self) -> Self {
-        self.request.value.clear();
-        self.request.ignore_value = true;
-        self
-    }
-
-    pub fn lease(mut self, lease: LeaseId) -> Self {
-        self.request.lease = lease.get();
-        self.request.ignore_lease = false;
-        self
-    }
-
-    /// Update the key using its current lease. If the key does not exist, `NotFound` will be returned.
-    pub fn ignore_lease(mut self) -> Self {
-        self.request.lease = 0;
-        self.request.ignore_lease = true;
-        self
-    }
-}
-
-impl IntoFuture for Put<GetPreviousValue> {
-    type Output = Result<Option<Record>>;
-    type IntoFuture = BoxedFuture<Self::Output>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        BoxedFuture::new(self.call())
-    }
-}
-
-impl IntoFuture for Put<()> {
-    type Output = Result<()>;
-    type IntoFuture = BoxedFuture<Self::Output>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        BoxedFuture::new(async move { self.call().await.map(|_| ()) })
-    }
-}
-
-fn record_from_pb(r: mvccpb::KeyValue) -> Record {
+fn record_from_pb(r: crate::pb::mvccpb::KeyValue) -> Record {
     let metadata = Metadata {
         create_revision: Revision::new(r.create_revision).unwrap(),
         modified_revision: Revision::new(r.mod_revision).unwrap(),
