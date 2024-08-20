@@ -32,7 +32,7 @@ impl<K, V, M> Record<K, V, M> {
         &mut self.key
     }
 
-    pub fn into_key(self) -> K {
+    pub fn take_key(self) -> K {
         self.key
     }
 
@@ -58,6 +58,10 @@ impl<K, V, M> Record<K, V, M> {
 
     pub fn take_metadata(self) -> M {
         self.metadata
+    }
+
+    pub fn without_value(self) -> KeyWithMetadata<K, M> {
+        KeyWithMetadata::new(self.key, self.metadata)
     }
 
     /// Call `f` with the `value` and return a new `Record` with the result of the function call.
@@ -183,6 +187,109 @@ impl<K, V, M, E> Record<K, Result<V, E>, M> {
             key: self.key,
             value: self.value?,
         })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct KeyWithMetadata<K = Vec<u8>, M = Metadata> {
+    metadata: M,
+    key: K,
+}
+
+impl<K, M> KeyWithMetadata<K, M> {
+    pub fn new(key: K, metadata: M) -> Self {
+        Self { metadata, key }
+    }
+
+    /// Decompose this into its constituent parts.
+    pub fn into_parts(self) -> (M, K) {
+        (self.metadata, self.key)
+    }
+
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    pub fn key_mut(&mut self) -> &mut K {
+        &mut self.key
+    }
+
+    pub fn take_key(self) -> K {
+        self.key
+    }
+
+    pub fn metadata(&self) -> &M {
+        &self.metadata
+    }
+
+    pub fn metadata_mut(&mut self) -> &mut M {
+        &mut self.metadata
+    }
+
+    pub fn take_metadata(self) -> M {
+        self.metadata
+    }
+
+    /// Add the `value` to the metadata contents to make a [`Record`].
+    pub fn with_value<V>(self, value: V) -> Record<K, V, M> {
+        Record::new(self.key, value, self.metadata)
+    }
+
+    pub fn map_key<RK>(self, f: impl FnOnce(K) -> RK) -> KeyWithMetadata<RK, M> {
+        KeyWithMetadata {
+            metadata: self.metadata,
+            key: f(self.key),
+        }
+    }
+
+    pub fn map_key_checked<RK, E>(self, f: impl FnOnce(K) -> Result<RK, E>) -> Result<KeyWithMetadata<RK, M>, E> {
+        Ok(KeyWithMetadata {
+            metadata: self.metadata,
+            key: f(self.key)?,
+        })
+    }
+
+    pub fn map_metadata<RM>(self, f: impl FnOnce(M) -> RM) -> KeyWithMetadata<K, RM> {
+        KeyWithMetadata {
+            metadata: f(self.metadata),
+            key: self.key,
+        }
+    }
+
+    pub fn map_metadata_checked<RM, E>(self, f: impl FnOnce(M) -> Result<RM, E>) -> Result<KeyWithMetadata<K, RM>, E> {
+        Ok(KeyWithMetadata {
+            metadata: f(self.metadata)?,
+            key: self.key,
+        })
+    }
+
+    pub fn as_ref(&self) -> KeyWithMetadata<&K, &M> {
+        KeyWithMetadata {
+            metadata: &self.metadata,
+            key: &self.key,
+        }
+    }
+
+    pub fn as_mut(&mut self) -> KeyWithMetadata<&mut K, &mut M> {
+        KeyWithMetadata {
+            metadata: &mut self.metadata,
+            key: &mut self.key,
+        }
+    }
+
+    /// Call `f` with this instance, then return the original record. This is useful when doing method chaining.
+    ///
+    /// ```
+    /// # use etcdrs::record::KeyWithMetadata;
+    /// KeyWithMetadata::new("key-1", 5) // <- imagine you got this from a function
+    ///     .inspect(|r| println!("got {:?} metdata={}", r.key(), r.metadata()))
+    ///     // ... and so on ...
+    ///     ;
+    /// ```
+    #[inline]
+    pub fn inspect(self, f: impl FnOnce(&Self)) -> Self {
+        f(&self);
+        self
     }
 }
 

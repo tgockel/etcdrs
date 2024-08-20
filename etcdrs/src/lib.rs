@@ -7,8 +7,9 @@ mod pb;
 pub mod record;
 
 pub use client::Client;
+pub use error::{Error, ErrorKind};
 
-pub type Result<T, E = error::Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[repr(transparent)]
