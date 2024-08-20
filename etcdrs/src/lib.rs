@@ -8,6 +8,7 @@ pub mod record;
 
 pub use client::Client;
 pub use error::{Error, ErrorKind};
+pub use record::Record;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

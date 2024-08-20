@@ -3,7 +3,10 @@ etcDRS
 
 A drag reduction system for `etcd`.
 Really, an `etcd` client implementation written in Rust.
-It comes with an in-memory implementation for quickly writing unit tests without spinning up an external process.
+
+> **NOTE: Status and Quality**
+>
+> This library is alpha-quality and a work-in-progress.
 
 F.A.Q.
 ------

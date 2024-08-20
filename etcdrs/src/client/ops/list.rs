@@ -112,6 +112,11 @@ impl<R> List<Client, R> {
     fn stream_result_chunks(self) -> impl Stream<Item = Result<etcdserverpb::RangeResponse>> {
         async_stream::stream! {
             let mut request = self.request;
+            // if the user never set the range, fill it with 0
+            if request.key.is_empty() && request.range_end.is_empty() {
+                request.key = vec![0];
+                request.range_end = vec![0];
+            }
             let client_inner = self.client.inner;
 
             loop {
