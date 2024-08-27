@@ -106,6 +106,15 @@ impl<C, R> List<C, R> {
             _return: marker::PhantomData,
         }
     }
+
+    /// Set a per-request limit of returned values.
+    ///
+    /// This is not a limit on the overall number of responses, but a limit on how many records will be fetched per
+    /// request.
+    pub fn limit(mut self, limit: usize) -> Self {
+        self.request.limit = limit as i64;
+        self
+    }
 }
 
 impl<R> List<Client, R> {
@@ -220,6 +229,39 @@ impl<R> FallibleAsyncIterator for ListIterator<R> {
             Some(Ok(raw)) => Ok(Some(convert(raw))),
             Some(Err(err)) => Err(err),
         })
+    }
+}
+
+#[cfg(feature = "nightly-async-iterator")]
+impl<R> std::async_iter::AsyncIterator for ListIterator<R> {
+    type Item = Result<R, crate::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let convert = self.as_ref().convert;
+        let iter = unsafe { self.map_unchecked_mut(|s| s.iter.as_mut()) };
+        iter.poll_next(cx).map(|outer| match outer {
+            None => None,
+            Some(Ok(raw)) => Some(Ok(convert(raw))),
+            Some(Err(err)) => Some(Err(err)),
+        })
+    }
+}
+
+#[cfg(feature = "nightly-async-iterator")]
+impl<C, R> std::async_iter::IntoAsyncIterator for List<C, R>
+where
+    Self: fallible_async_iterator::IntoFallibleAsyncIterator<
+        Item = R,
+        Error = crate::Error,
+        IntoFallibleAsyncIter = ListIterator<R>,
+    >,
+{
+    type Item = Result<R, crate::Error>;
+    type IntoAsyncIter = ListIterator<R>;
+
+    fn into_async_iter(self) -> Self::IntoAsyncIter {
+        use fallible_async_iterator::IntoFallibleAsyncIterator;
+        self.into_fallible_async_iter()
     }
 }
 

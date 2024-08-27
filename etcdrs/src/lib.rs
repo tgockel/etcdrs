@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "nightly-async-iterator", feature(async_iterator))]
+
 use std::num::{NonZeroI64, NonZeroU64};
 
 pub mod client;
