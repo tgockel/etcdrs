@@ -1,7 +1,7 @@
 use crate::{
     error::{Error, ErrorInner, ErrorKind},
     record::{AsKey, KeyWithMetadata, Metadata, Record},
-    LeaseId, Result, Revision, Version,
+    ConnectionId, LeaseId, Result, Revision, Version,
 };
 use std::{
     future::Future,
@@ -10,6 +10,8 @@ use std::{
     task::{Context, Poll},
 };
 
+mod metrics;
+pub use metrics::{MetricsCollector, RequestCount, RequestCounter};
 mod ops;
 pub use ops::*;
 
@@ -19,14 +21,13 @@ pub struct Client {
 }
 
 impl Client {
+    pub fn builder() -> ClientBuilder {
+        ClientBuilder::default()
+    }
+
     /// Create a client which will connect to the specified `host`.
-    pub fn new(host: &str) -> Result<Self, String> {
-        let uri: tonic::transport::Uri = host.parse().map_err(|e| format!("{e:?}"))?;
-        let endpoint = tonic::transport::Channel::builder(uri);
-        let channel = endpoint.connect_lazy();
-        Ok(Self {
-            inner: Arc::new(ClientInner { channel }),
-        })
+    pub fn new(host: &str) -> Result<Self> {
+        Self::builder().add_connection(host)?.build()
     }
 
     /// Get the contents of `key` from the database.
@@ -82,8 +83,54 @@ impl Client {
     }
 }
 
+#[derive(Default)]
+pub struct ClientBuilder {
+    uri: Option<tonic::transport::Uri>,
+    metrics: Option<Box<dyn MetricsCollector>>,
+}
+
+impl ClientBuilder {
+    pub fn add_connection(mut self, host: impl AsRef<str>) -> Result<Self> {
+        if self.uri.is_some() {
+            return Err(ErrorInner::with_static_message(
+                ErrorKind::Unknown,
+                "only one connection is supported right now",
+            )
+            .into());
+        }
+
+        let uri = host
+            .as_ref()
+            .parse::<tonic::transport::Uri>()
+            .map_err(|err| Error::new(ErrorKind::InvalidArgument, err.to_string()))?;
+        self.uri = Some(uri);
+        Ok(self)
+    }
+
+    pub fn metrics(mut self, metrics: impl MetricsCollector + 'static) -> Self {
+        self.metrics = Some(Box::new(metrics));
+        self
+    }
+
+    pub fn build(self) -> Result<Client> {
+        let Some(uri) = self.uri else {
+            return Err(ErrorInner::with_static_message(ErrorKind::InvalidArgument, "no connection was added").into());
+        };
+
+        let endpoint = tonic::transport::Channel::builder(uri);
+        let channel = endpoint.connect_lazy();
+        Ok(Client {
+            inner: Arc::new(ClientInner {
+                channel,
+                metrics: self.metrics,
+            }),
+        })
+    }
+}
+
 struct ClientInner {
     channel: tonic::transport::Channel,
+    metrics: Option<Box<dyn MetricsCollector>>,
 }
 
 pub struct BoxedFuture<T> {
@@ -141,7 +188,9 @@ impl ClientInner {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             // TODO: Cycle channels if needed
-            let channel = self.channel.clone();
+            let (connection_id, channel) = self.get_connection()?;
+            let metric = metrics::MetricsSpan::new(connection_id, &self.metrics);
+
             let response = {
                 let mut client = create_client(channel);
                 // safety -- this transmute is only needed to give `'a` some sort of lifetime. It is needed because Rust
@@ -150,6 +199,7 @@ impl ClientInner {
                 let client_ref: &'a mut GrpcClient = unsafe { std::mem::transmute(&mut client) };
                 call(client_ref, request.clone()).await
             };
+            metric.complete(response.is_ok());
             match response {
                 Ok(r) => break Ok(r.into_inner()),
                 Err(e) => {
@@ -170,6 +220,11 @@ impl ClientInner {
             }
         }
     }
+
+    fn get_connection(&self) -> Result<(ConnectionId, tonic::transport::Channel)> {
+        // TODO: choose a channel based on some sort of criteria
+        Ok((ConnectionId::new(1).unwrap(), self.channel.clone()))
+    }
 }
 
 #[cfg(test)]
@@ -182,12 +237,13 @@ mod tests {
     async fn foo() {
         let mut joinset = JoinSet::new();
         let server = crate::fake::FakeServer::builder().build().unwrap();
-        let client = server.lazy_client();
+        let (client, metrics) = server.lazy_client();
         joinset.spawn(async move { server.run().await });
         tokio::task::yield_now().await;
 
         let abc = client.get(b"abc").await.unwrap();
         assert!(abc.is_none());
+        assert_eq!(1, metrics.get().succeeded());
 
         client.put(b"abc").value(b"def").await.unwrap();
 
@@ -199,9 +255,10 @@ mod tests {
     async fn get_with_dead_server() {
         // we make a server, but never start it
         let server = crate::fake::FakeServer::builder().build().unwrap();
-        let client = server.lazy_client();
+        let (client, metrics) = server.lazy_client();
 
         let err = client.get(b"abc").await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Unavailable);
+        assert!(1 <= metrics.get().failed());
     }
 }

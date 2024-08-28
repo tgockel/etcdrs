@@ -217,11 +217,9 @@ pub struct ListIterator<R> {
     convert: fn(mvccpb::KeyValue) -> R,
 }
 
-impl<R> FallibleAsyncIterator for ListIterator<R> {
-    type Item = R;
-    type Error = crate::Error;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Option<Self::Item>, Self::Error>> {
+impl<R> ListIterator<R> {
+    /// Underlying implementation of `poll_next` used by trait-specific implementations.
+    fn poll_next_impl(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Option<R>, crate::Error>> {
         let convert = self.as_ref().convert;
         let iter = unsafe { self.map_unchecked_mut(|s| s.iter.as_mut()) };
         iter.poll_next(cx).map(|item| match item {
@@ -232,18 +230,21 @@ impl<R> FallibleAsyncIterator for ListIterator<R> {
     }
 }
 
+impl<R> FallibleAsyncIterator for ListIterator<R> {
+    type Item = R;
+    type Error = crate::Error;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Option<Self::Item>, Self::Error>> {
+        self.poll_next_impl(cx)
+    }
+}
+
 #[cfg(feature = "nightly-async-iterator")]
 impl<R> std::async_iter::AsyncIterator for ListIterator<R> {
     type Item = Result<R, crate::Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let convert = self.as_ref().convert;
-        let iter = unsafe { self.map_unchecked_mut(|s| s.iter.as_mut()) };
-        iter.poll_next(cx).map(|outer| match outer {
-            None => None,
-            Some(Ok(raw)) => Some(Ok(convert(raw))),
-            Some(Err(err)) => Some(Err(err)),
-        })
+        self.poll_next_impl(cx).map(Result::transpose)
     }
 }
 

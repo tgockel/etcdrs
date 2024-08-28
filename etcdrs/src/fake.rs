@@ -1,4 +1,5 @@
 use crate::{
+    client::RequestCounter,
     pb::{
         etcdserverpb::{kv_server, PutRequest, PutResponse, RangeRequest, RangeResponse, ResponseHeader},
         mvccpb::KeyValue,
@@ -25,8 +26,15 @@ impl FakeServer {
         FakeServerBuilder::default()
     }
 
-    pub fn lazy_client(&self) -> Client {
-        Client::new(&format!("http://{}", self.host_addr)).unwrap()
+    pub fn lazy_client(&self) -> (Client, Arc<RequestCounter>) {
+        let request_counter = Arc::new(RequestCounter::default());
+        let client = Client::builder()
+            .add_connection(format!("http://{}", self.host_addr))
+            .unwrap()
+            .metrics(request_counter.clone())
+            .build()
+            .unwrap();
+        (client, request_counter)
     }
 
     pub async fn run(&self) {
