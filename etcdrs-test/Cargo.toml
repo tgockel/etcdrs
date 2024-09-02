@@ -1,0 +1,13 @@
+[package]
+name = "etcdrs-test"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+etcdrs.workspace = true
+fallible-async-iterator.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+tokio = { workspace = true, default-features = false, features = ["macros", "rt"] }
