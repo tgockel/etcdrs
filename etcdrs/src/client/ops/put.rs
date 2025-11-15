@@ -7,6 +7,24 @@ use crate::{
     Client, LeaseId, Result,
 };
 
+impl Client {
+    /// Put a new value for the `key`.
+    ///
+    /// ```no_run
+    /// # async {
+    /// let client: etcdrs::Client = todo!();
+    /// client
+    ///     .put("foo")
+    ///     .value("bar")
+    ///     .await
+    ///     .unwrap();
+    /// # };
+    /// ```
+    pub fn put(&self, key: impl AsKey) -> Put<Self, ()> {
+        Put::new(key).with_client(self.clone())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Put<C, R> {
     client: C,

@@ -1,6 +1,6 @@
 use crate::{
     error::{Error, ErrorInner, ErrorKind},
-    record::{AsKey, KeyWithMetadata, Metadata, Record},
+    record::{KeyWithMetadata, Metadata, Record},
     ConnectionId, LeaseId, Result, Revision, Version,
 };
 use std::{
@@ -28,58 +28,6 @@ impl Client {
     /// Create a client which will connect to the specified `host`.
     pub fn new(host: &str) -> Result<Self> {
         Self::builder().add_connection(host)?.build()
-    }
-
-    /// Get the contents of `key` from the database.
-    ///
-    /// ```no_run
-    /// # async {
-    /// let client: etcdrs::Client = todo!();
-    /// if let Some(entry) = client.get("path/to/foo").await.unwrap() {
-    ///     println!("found: {entry:?}");
-    /// } else {
-    ///     println!("not found");
-    /// }
-    /// # };
-    /// ```
-    pub fn get(&self, key: impl AsKey) -> Get<Self> {
-        Get::new(key).with_client(self.clone())
-    }
-
-    /// Put a new value for the `key`.
-    ///
-    /// ```no_run
-    /// # async {
-    /// let client: etcdrs::Client = todo!();
-    /// client
-    ///     .put("foo")
-    ///     .value("bar")
-    ///     .await
-    ///     .unwrap();
-    /// # };
-    /// ```
-    pub fn put(&self, key: impl AsKey) -> Put<Self, ()> {
-        Put::new(key).with_client(self.clone())
-    }
-
-    /// List the records associated with a query.
-    ///
-    /// By default, this lists all of the records in the database. Make sure to use [`range`][`List::range`] or
-    /// [`prefix`][`List::prefix`] to narrow the results down.
-    ///
-    /// ```no_run
-    /// use fallible_async_iterator::*;
-    /// # async {
-    /// let client: etcdrs::Client = todo!();
-    /// let iter = client
-    ///     .list()
-    ///     .range("a".."b") // from "a" up to but not including "b"
-    ///     .into_fallible_async_iter();
-    /// let keys: Vec<etcdrs::Record> = iter.collect().await.unwrap();
-    /// # };
-    /// ```
-    pub fn list(&self) -> List<Self, Record> {
-        List::default().with_client(self.clone())
     }
 }
 

@@ -16,6 +16,28 @@ use std::{
     task::{Context, Poll},
 };
 
+impl Client {
+    /// List the records associated with a query.
+    ///
+    /// By default, this lists all of the records in the database. Make sure to use [`range`][`List::range`] or
+    /// [`prefix`][`List::prefix`] to narrow the results down.
+    ///
+    /// ```no_run
+    /// use fallible_async_iterator::*;
+    /// # async {
+    /// let client: etcdrs::Client = todo!();
+    /// let iter = client
+    ///     .list()
+    ///     .range("a".."b") // from "a" up to but not including "b"
+    ///     .into_fallible_async_iter();
+    /// let keys: Vec<etcdrs::Record> = iter.collect().await.unwrap();
+    /// # };
+    /// ```
+    pub fn list(&self) -> List<Self, Record> {
+        List::default().with_client(self.clone())
+    }
+}
+
 pub struct List<C = (), R = Record> {
     client: C,
     request: etcdserverpb::RangeRequest,

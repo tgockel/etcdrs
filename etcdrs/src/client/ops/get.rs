@@ -8,6 +8,24 @@ use crate::{
     Client, ErrorKind, Result,
 };
 
+impl Client {
+    /// Get the contents of `key` from the database.
+    ///
+    /// ```no_run
+    /// # async {
+    /// let client: etcdrs::Client = todo!();
+    /// if let Some(entry) = client.get("path/to/foo").await.unwrap() {
+    ///     println!("found: {entry:?}");
+    /// } else {
+    ///     println!("not found");
+    /// }
+    /// # };
+    /// ```
+    pub fn get(&self, key: impl AsKey) -> Get<Self> {
+        Get::new(key).with_client(self.clone())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Get<C> {
     pub(crate) client: C,
