@@ -65,4 +65,27 @@ mod tests {
         assert_eq!(count, keys.len());
         assert_eq!(7, metrics.get().succeeded()); // NOTE: `.limit(2)` above takes 2 requests to list 4 records
     }
+
+    #[rstest]
+    #[tokio::test]
+    async fn create_delete_get(etcd_server: EtcdServer) {
+        let metrics = Arc::new(etcdrs::client::RequestCounter::default());
+        let client = etcdrs::Client::builder()
+            .add_connection(&etcd_server.connect_string())
+            .unwrap()
+            .metrics(metrics.clone())
+            .build()
+            .unwrap();
+
+        assert!(client.get("foo").await.unwrap().is_none());
+        client.put("foo").value("value").await.unwrap();
+        let fetched = client.get("foo").await.unwrap().unwrap();
+        assert_eq!(fetched.value(), b"value");
+        assert_eq!(fetched.metadata().version, Version::new(1));
+
+        let deleted = client.delete("foo").await.unwrap();
+        assert!(deleted);
+        let deleted = client.delete("foo").await.unwrap();
+        assert!(!deleted);
+    }
 }
