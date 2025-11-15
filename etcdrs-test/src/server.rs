@@ -15,8 +15,7 @@ impl EtcdServer {
 
     pub fn start(&mut self) -> io::Result<()> {
         if self.runner.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "server is already running -- you must stop() it first",
             ));
         }
@@ -48,10 +47,9 @@ impl EtcdServer {
 
         let mut etcd_process = command.spawn()?;
         if let Some(rc) = etcd_process.try_wait()? {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("etcd immediately exited with {rc} -- check the logs for issues in startup"),
-            ));
+            return Err(io::Error::other(format!(
+                "etcd immediately exited with {rc} -- check the logs for issues in startup"
+            )));
         }
 
         self.runner = Some(EtcdRunner { proc: etcd_process });
@@ -165,7 +163,6 @@ impl EtcdClusterConfig {
     pub fn with_generated_peers(count: usize) -> Self {
         let cluster_token = format!("cluster-{}", get_random_name(4));
         let mut configs: Vec<_> = (0..count)
-            .into_iter()
             .map(|_| {
                 let mut config = EtcdServerConfig::new_single_temporary();
                 config.cluster_token = Some(cluster_token.clone());

@@ -314,7 +314,7 @@ fn successor(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() + 1);
     input.clone_into(&mut out);
     out.push(0);
-    return out;
+    out
 }
 
 #[cfg(test)]
