@@ -5,19 +5,16 @@ use std::{borrow::Cow, collections::HashMap, env, ffi, io, net, path, process};
 /// A single instance of an etcd server.
 pub struct EtcdServer {
     config: EtcdServerConfig,
-    etcd_process: Option<process::Child>,
+    runner: Option<EtcdRunner>,
 }
 
 impl EtcdServer {
     pub fn with_config(config: EtcdServerConfig) -> Self {
-        Self {
-            config,
-            etcd_process: None,
-        }
+        Self { config, runner: None }
     }
 
     pub fn start(&mut self) -> io::Result<()> {
-        if self.etcd_process.is_some() {
+        if self.runner.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "server is already running -- you must stop() it first",
@@ -57,20 +54,21 @@ impl EtcdServer {
             ));
         }
 
-        self.etcd_process = Some(etcd_process);
+        self.runner = Some(EtcdRunner { proc: etcd_process });
 
         Ok(())
     }
 
     pub fn stop(&mut self) -> io::Result<bool> {
-        let Some(mut etcd_process) = self.etcd_process.take() else {
+        let Some(runner) = self.runner.take() else {
             return Ok(false);
         };
 
-        etcd_process.wait()?;
+        drop(runner);
         Ok(true)
     }
 
+    /// Get a client connection string for this server.
     pub fn connect_string(&self) -> String {
         format!("http://127.0.0.1:{}", self.config.client_port)
     }
@@ -247,4 +245,20 @@ fn get_etcd_program() -> Cow<'static, ffi::OsStr> {
                 .map(|path| Cow::Borrowed(path.as_os_str()))
         })
         .unwrap_or(Cow::Borrowed(ffi::OsStr::new("etcd")))
+}
+
+struct EtcdRunner {
+    proc: process::Child,
+}
+
+impl Drop for EtcdRunner {
+    fn drop(&mut self) {
+        if let Err(error) = self.proc.kill() {
+            eprintln!("Failed to kill etcd process: {error}");
+        }
+
+        if let Err(error) = self.proc.wait() {
+            eprintln!("Failed to wait for etcd process: {error}");
+        }
+    }
 }
