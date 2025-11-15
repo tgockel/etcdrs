@@ -11,6 +11,7 @@ edition = "2021"
 
 [workspace.dependencies]
 async-stream = "^0.3.5"
+etcd-bin-vendored = "^3.6.1"
 fallible-async-iterator = { git = "https://github.com/tgockel/fallible-async-iterator.git", rev = "8eea9c797680af46a5efed7925f1275e7baa9e76", features = ["futures-core"] }
 futures-core = "^0.3.30"
 prost = "^0.13.1"

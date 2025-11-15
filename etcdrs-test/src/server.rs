@@ -1,6 +1,6 @@
 //! Utilities for running an etcd server.
 
-use std::{collections::HashMap, env, ffi, io, net, path, process};
+use std::{borrow::Cow, collections::HashMap, env, ffi, io, net, path, process};
 
 /// A single instance of an etcd server.
 pub struct EtcdServer {
@@ -230,6 +230,21 @@ fn get_random_unused_tcp_port() -> io::Result<u16> {
     listener.local_addr().map(|a| a.port())
 }
 
-fn get_etcd_program() -> ffi::OsString {
-    env::var_os("ETCD_PROGRAM").unwrap_or_else(|| "etcd".into())
+/// Get the path to `etcd`.
+///
+/// Determining the program happens in the following order:
+///
+/// * If `ETCD` environment variable is set, it will be used.
+/// * Use `etcd-bin-vendored` to find the path of the binary (this should work in almost every case, but there might be
+///   some platforms that `etcd` supports but does not offer pre-built binaries for).
+/// * Just use `"etcd"` and hope it is in the user's `PATH`.
+fn get_etcd_program() -> Cow<'static, ffi::OsStr> {
+    env::var_os("ETCD")
+        .and_then(|name| if name.is_empty() { None } else { Some(Cow::Owned(name)) })
+        .or_else(|| {
+            etcd_bin_vendored::etcd_bin_path()
+                .ok()
+                .map(|path| Cow::Borrowed(path.as_os_str()))
+        })
+        .unwrap_or(Cow::Borrowed(ffi::OsStr::new("etcd")))
 }
