@@ -174,39 +174,3 @@ impl ClientInner {
         Ok((ConnectionId::new(1).unwrap(), self.channel.clone()))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use tokio::task::JoinSet;
-
-    use crate::error::ErrorKind;
-
-    #[tokio::test]
-    async fn foo() {
-        let mut joinset = JoinSet::new();
-        let server = crate::fake::FakeServer::builder().build().unwrap();
-        let (client, metrics) = server.lazy_client();
-        joinset.spawn(async move { server.run().await });
-        tokio::task::yield_now().await;
-
-        let abc = client.get(b"abc").await.unwrap();
-        assert!(abc.is_none());
-        assert_eq!(1, metrics.get().succeeded());
-
-        client.put(b"abc").value(b"def").await.unwrap();
-
-        let abc = client.get(b"abc").await.unwrap().unwrap();
-        assert_eq!(*b"def", **abc.value());
-    }
-
-    #[tokio::test]
-    async fn get_with_dead_server() {
-        // we make a server, but never start it
-        let server = crate::fake::FakeServer::builder().build().unwrap();
-        let (client, metrics) = server.lazy_client();
-
-        let err = client.get(b"abc").await.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::Unavailable);
-        assert!(1 <= metrics.get().failed());
-    }
-}

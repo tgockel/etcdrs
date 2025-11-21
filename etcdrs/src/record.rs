@@ -301,8 +301,7 @@ pub struct Metadata {
     /// The revision of the last time this key was modified.
     pub modified_revision: Revision,
 
-    /// The version of this record. Each modification to the record increments the version. It is reset to `0` only when
-    /// it has been deleted and created again.
+    /// The version of this record. Each modification to the record increments the version.
     pub version: Version,
 
     /// If the record has a lease, it will be automatically deleted when that lease expires. A value of `None` means the
