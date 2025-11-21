@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 etcdrs.workspace = true
 etcd-bin-vendored.workspace = true
-fallible-async-iterator.workspace = true
+futures = { workspace = true, default-features = true }
 rand.workspace = true
 
 [dev-dependencies]

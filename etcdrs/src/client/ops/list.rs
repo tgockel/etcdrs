@@ -1,4 +1,3 @@
-use fallible_async_iterator::FallibleAsyncIterator;
 use futures_core::Stream;
 
 use crate::{
@@ -23,14 +22,16 @@ impl Client {
     /// [`prefix`][`List::prefix`] to narrow the results down.
     ///
     /// ```no_run
-    /// use fallible_async_iterator::*;
+    /// use futures::StreamExt;
     /// # async {
     /// let client: etcdrs::Client = todo!();
-    /// let iter = client
+    /// let entries = client
     ///     .list()
     ///     .range("a".."b") // from "a" up to but not including "b"
-    ///     .into_fallible_async_iter();
-    /// let keys: Vec<etcdrs::Record> = iter.collect().await.unwrap();
+    ///     .into_stream()
+    ///     .map(Result::unwrap) // <- do real error handling here
+    ///     .collect::<Vec<etcdrs::Record>>()
+    ///     .await;
     /// # };
     /// ```
     pub fn list(&self) -> List<Self, Record> {
@@ -208,12 +209,8 @@ impl<R> List<Client, R> {
     }
 }
 
-impl fallible_async_iterator::IntoFallibleAsyncIterator for List<Client, Record> {
-    type Item = Record;
-    type Error = crate::Error;
-    type IntoFallibleAsyncIter = ListIterator<Record>;
-
-    fn into_fallible_async_iter(self) -> Self::IntoFallibleAsyncIter {
+impl List<Client, Record> {
+    pub fn into_stream(self) -> ListIterator<Record> {
         ListIterator {
             iter: Box::new(self.stream_results()),
             convert: record_from_pb,
@@ -221,12 +218,8 @@ impl fallible_async_iterator::IntoFallibleAsyncIterator for List<Client, Record>
     }
 }
 
-impl fallible_async_iterator::IntoFallibleAsyncIterator for List<Client, KeyWithMetadata> {
-    type Item = KeyWithMetadata;
-    type Error = crate::Error;
-    type IntoFallibleAsyncIter = ListIterator<KeyWithMetadata>;
-
-    fn into_fallible_async_iter(self) -> Self::IntoFallibleAsyncIter {
+impl List<Client, KeyWithMetadata> {
+    pub fn into_stream(self) -> ListIterator<KeyWithMetadata> {
         ListIterator {
             iter: Box::new(self.stream_results()),
             convert: key_with_metadata_from_pb,
@@ -252,12 +245,11 @@ impl<R> ListIterator<R> {
     }
 }
 
-impl<R> FallibleAsyncIterator for ListIterator<R> {
-    type Item = R;
-    type Error = crate::Error;
+impl<R> futures_core::Stream for ListIterator<R> {
+    type Item = Result<R, crate::Error>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Option<Self::Item>, Self::Error>> {
-        self.poll_next_impl(cx)
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.poll_next_impl(cx).map(Result::transpose)
     }
 }
 

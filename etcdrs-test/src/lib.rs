@@ -6,7 +6,7 @@ mod tests {
     use std::sync::Arc;
 
     use etcdrs::Version;
-    use fallible_async_iterator::{FallibleAsyncIterator, IntoFallibleAsyncIterator};
+    use futures::StreamExt;
     use rstest::{fixture, rstest};
 
     use crate::*;
@@ -38,7 +38,7 @@ mod tests {
     async fn list_basics(etcd_server: EtcdServer) {
         let metrics = Arc::new(etcdrs::client::RequestCounter::default());
         let client = etcdrs::Client::builder()
-            .add_connection(&etcd_server.connect_string())
+            .add_connection(etcd_server.connect_string())
             .unwrap()
             .metrics(metrics.clone())
             .build()
@@ -58,10 +58,10 @@ mod tests {
             .range("foo/a"..="foo/d")
             .keys_only()
             .limit(2)
-            .into_fallible_async_iter()
+            .into_stream()
+            .map(Result::unwrap)
             .collect::<Vec<_>>()
-            .await
-            .unwrap();
+            .await;
         assert_eq!(count, keys.len());
         assert_eq!(7, metrics.get().succeeded()); // NOTE: `.limit(2)` above takes 2 requests to list 4 records
     }
@@ -71,7 +71,7 @@ mod tests {
     async fn create_delete_get(etcd_server: EtcdServer) {
         let metrics = Arc::new(etcdrs::client::RequestCounter::default());
         let client = etcdrs::Client::builder()
-            .add_connection(&etcd_server.connect_string())
+            .add_connection(etcd_server.connect_string())
             .unwrap()
             .metrics(metrics.clone())
             .build()
