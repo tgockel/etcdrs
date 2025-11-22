@@ -314,6 +314,12 @@ pub trait AsKey {
     fn as_key(&self) -> &[u8];
 }
 
+impl<T: AsKey + ?Sized> AsKey for &'_ T {
+    fn as_key(&self) -> &[u8] {
+        T::as_key(self)
+    }
+}
+
 /// Convert the source into a database-encoded value.
 pub trait AsValue {
     fn as_value(&self) -> &[u8];

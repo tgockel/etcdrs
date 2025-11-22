@@ -31,7 +31,7 @@ impl Client {
 #[derive(Clone, Debug)]
 pub struct Delete<C, R, P = ()> {
     client: C,
-    request: etcdserverpb::DeleteRangeRequest,
+    pub(crate) request: etcdserverpb::DeleteRangeRequest,
     _return: PhantomData<[(R, P); 0]>,
 }
 

@@ -74,6 +74,10 @@ impl Revision {
     pub fn new(source: i64) -> Option<Self> {
         NonZeroI64::new(source).map(Self)
     }
+
+    pub fn get(&self) -> i64 {
+        self.0.get()
+    }
 }
 
 /// A monotonically increasing version number.

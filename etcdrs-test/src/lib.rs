@@ -2,7 +2,7 @@ mod server;
 pub use server::{EtcdCluster, EtcdServer};
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use etcdrs::Version;
@@ -17,7 +17,7 @@ mod tests {
     }
 
     #[fixture]
-    fn etcd_cluster() -> EtcdCluster {
+    pub(crate) fn etcd_cluster() -> EtcdCluster {
         server::EtcdClusterConfig::with_generated_peers(3).start().unwrap()
     }
 
@@ -88,3 +88,6 @@ mod tests {
         assert!(!deleted);
     }
 }
+
+#[cfg(test)]
+mod test_transaction;

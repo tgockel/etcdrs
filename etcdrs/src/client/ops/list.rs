@@ -56,7 +56,7 @@ impl Client {
 
 pub struct List<C = (), R = Record> {
     client: C,
-    request: etcdserverpb::RangeRequest,
+    pub(crate) request: etcdserverpb::RangeRequest,
     _return: marker::PhantomData<R>,
 }
 

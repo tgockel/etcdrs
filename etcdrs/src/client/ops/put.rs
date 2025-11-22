@@ -28,7 +28,7 @@ impl Client {
 #[derive(Clone, Debug)]
 pub struct Put<C, R> {
     client: C,
-    request: etcdserverpb::PutRequest,
+    pub(crate) request: etcdserverpb::PutRequest,
     _return: PhantomData<R>,
 }
 
