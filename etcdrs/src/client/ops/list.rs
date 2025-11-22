@@ -38,6 +38,7 @@ impl Client {
     /// let _ = client.list("a"..="b"); // <- from "a" up to and including "b"
     /// let _ = client.list(.."taco");  // <- everything up to "taco"
     /// let _ = client.list("taco"..);  // <- "taco" and everything after
+    /// let _ = client.list("apple");   // <- just "apple"
     /// ```
     ///
     /// You can specify a [prefix][crate::Prefix] query as well, but it is usually easier to use the

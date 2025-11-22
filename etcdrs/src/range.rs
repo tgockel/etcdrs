@@ -91,6 +91,13 @@ impl<T: AsKey + ?Sized> AsRange for Prefix<T> {
     }
 }
 
+impl<T: AsKey + ?Sized> private::Sealed for T {}
+impl<T: AsKey + ?Sized> AsRange for T {
+    fn as_boundaries(&self) -> (Vec<u8>, Vec<u8>) {
+        (self.as_key().to_owned(), Default::default())
+    }
+}
+
 /// Add one bit to the last element of `input`, carrying left on overflow.
 ///
 /// This is used in range queries to specify "include this `input`".
