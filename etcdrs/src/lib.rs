@@ -5,10 +5,12 @@ use std::num::{NonZeroI64, NonZeroU64, NonZeroUsize};
 pub mod client;
 pub mod error;
 pub(crate) mod pb;
+pub(crate) mod range;
 pub mod record;
 
 pub use client::Client;
 pub use error::{Error, ErrorKind};
+pub use range::{AsRange, Prefix};
 pub use record::Record;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

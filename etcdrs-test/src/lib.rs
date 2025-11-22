@@ -50,12 +50,11 @@ mod tests {
         }
         assert_eq!(4, metrics.get().succeeded());
 
-        let count = client.list().prefix("foo/").count_only().await.unwrap();
+        let count = client.list_prefix("foo/").count_only().await.unwrap();
         assert_eq!(count, things.len());
         assert_eq!(5, metrics.get().succeeded());
         let keys = client
-            .list()
-            .range("foo/a"..="foo/d")
+            .list("foo/a"..="foo/d")
             .keys_only()
             .limit(2)
             .into_stream()

@@ -1,0 +1,139 @@
+use std::ops::{Bound, RangeBounds};
+
+use crate::record::AsKey;
+
+mod private {
+    pub trait Sealed {}
+}
+
+/// Convert the source into a range query.
+///
+/// This trait converts range expressions like `"a"..`, `"a".."b"`, `..`, and so on into the database encoded boundaries
+/// for a [`list`][crate::Client::list] query. It is implemented for all range expressions that can be converted via
+/// [`AsKey`]. There is also a [`Prefix`] newtype that specifies a prefix query.
+pub trait AsRange: private::Sealed {
+    /// Convert the range into the database encoded boundaries.
+    ///
+    /// These are used in the `key` and `range_end` fields of a `RangeRequest` Protobuf message. For reference, this is
+    /// the documentation from the `.proto` files:
+    ///
+    /// **key**
+    /// > key is the first key for the range. If range_end is not given, the request only looks up key.
+    ///
+    /// **range_end**
+    /// > range_end is the upper bound on the requested range [key, range_end).
+    /// > If range_end is '\0', the range is all keys >= key.
+    /// > If range_end is key plus one (e.g., "aa"+1 == "ab", "a\xff"+1 == "b"),
+    /// > then the range request gets all keys prefixed with key.
+    /// > If both key and range_end are '\0', then the range request returns all keys.
+    #[doc(hidden)]
+    fn as_boundaries(&self) -> (Vec<u8>, Vec<u8>);
+}
+
+fn specify_boundaries(start_bound: Bound<&[u8]>, end_bound: Bound<&[u8]>) -> (Vec<u8>, Vec<u8>) {
+    let lower = match start_bound {
+        Bound::Included(val) => Vec::from(val.as_key()),
+        Bound::Excluded(val) => successor(val.as_key()),
+        Bound::Unbounded => vec![0],
+    };
+    let upper = match end_bound {
+        Bound::Included(val) => add_one(val.as_key()),
+        Bound::Excluded(val) => Vec::from(val.as_key()),
+        Bound::Unbounded => vec![0],
+    };
+    (lower, upper)
+}
+
+fn range_to_boundaries<R: RangeBounds<impl AsKey>>(range: &R) -> (Vec<u8>, Vec<u8>) {
+    specify_boundaries(
+        range.start_bound().map(AsKey::as_key),
+        range.end_bound().map(AsKey::as_key),
+    )
+}
+
+macro_rules! impl_as_range_for_range_type {
+    ($template:ident) => {
+        impl<T: AsKey> private::Sealed for std::ops::$template<T> {}
+        impl<T: AsKey> AsRange for std::ops::$template<T> {
+            fn as_boundaries(&self) -> (Vec<u8>, Vec<u8>) {
+                range_to_boundaries(self)
+            }
+        }
+    };
+    ($($template:ident),* $(,)?) => {
+        $(impl_as_range_for_range_type!($template);)*
+    }
+}
+
+impl_as_range_for_range_type! {
+    Range,
+    RangeInclusive,
+    RangeFrom,
+    RangeTo,
+    RangeToInclusive,
+}
+
+impl private::Sealed for std::ops::RangeFull {}
+impl AsRange for std::ops::RangeFull {
+    fn as_boundaries(&self) -> (Vec<u8>, Vec<u8>) {
+        (vec![0], vec![0])
+    }
+}
+
+/// Specifies a prefix query in [`AsRange`].
+#[derive(Debug, Clone, Copy)]
+pub struct Prefix<T: ?Sized>(pub T);
+
+impl<T: AsKey + ?Sized> private::Sealed for Prefix<T> {}
+impl<T: AsKey + ?Sized> AsRange for Prefix<T> {
+    fn as_boundaries(&self) -> (Vec<u8>, Vec<u8>) {
+        (self.0.as_key().to_owned(), add_one(self.0.as_key()))
+    }
+}
+
+/// Add one bit to the last element of `input`, carrying left on overflow.
+///
+/// This is used in range queries to specify "include this `input`".
+fn add_one(input: &[u8]) -> Vec<u8> {
+    let mut out = input.to_owned();
+    while let Some(last) = out.last_mut() {
+        if *last < u8::MAX {
+            *last += 1;
+            break;
+        } else {
+            out.pop();
+        }
+    }
+    // special case -- input was a string of 0xff, so put in a 0x00 which means to get until the end of the database
+    if out.is_empty() {
+        out.push(0);
+    }
+    out
+}
+
+/// Get the "next" key that follows `input`.
+pub(crate) fn successor(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() + 1);
+    input.clone_into(&mut out);
+    out.push(0);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add_one;
+
+    #[test]
+    fn test_add_one() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"aa", b"ab"),
+            (b"a\xff", b"b"),
+            (b"\xff", b"\0"),
+            (b"\xff\xff\xff", b"\0"),
+        ];
+        for (input, expected) in cases {
+            let output = add_one(input);
+            assert_eq!(*expected, output);
+        }
+    }
+}

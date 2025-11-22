@@ -5,37 +5,52 @@ use crate::{
     error::{ErrorInner, ErrorKind},
     pb::{etcdserverpb, mvccpb},
     record::{AsKey, KeyWithMetadata, Record},
-    Result,
+    AsRange, Prefix, Result,
 };
 use std::{
     future::IntoFuture,
     marker,
-    ops::{Bound, RangeBounds},
     pin::Pin,
     task::{Context, Poll},
 };
 
 impl Client {
-    /// List the records associated with a query.
-    ///
-    /// By default, this lists all of the records in the database. Make sure to use [`range`][`List::range`] or
-    /// [`prefix`][`List::prefix`] to narrow the results down.
+    /// List the records associated with a `query`.
     ///
     /// ```no_run
     /// use futures::StreamExt;
     /// # async {
     /// let client: etcdrs::Client = todo!();
     /// let entries = client
-    ///     .list()
-    ///     .range("a".."b") // from "a" up to but not including "b"
+    ///     .list("a".."b") // from "a" up to but not including "b"
     ///     .into_stream()
     ///     .map(Result::unwrap) // <- do real error handling here
     ///     .collect::<Vec<etcdrs::Record>>()
     ///     .await;
     /// # };
     /// ```
-    pub fn list(&self) -> List<Self, Record> {
-        List::default().with_client(self.clone())
+    ///
+    /// List ranges use the Rust range syntax:
+    ///
+    /// ```no_run
+    /// # let client: etcdrs::Client = todo!();
+    /// let _ = client.list(..);        // <- all records in the database
+    /// let _ = client.list("a"..="b"); // <- from "a" up to and including "b"
+    /// let _ = client.list(.."taco");  // <- everything up to "taco"
+    /// let _ = client.list("taco"..);  // <- "taco" and everything after
+    /// ```
+    ///
+    /// You can specify a [prefix][crate::Prefix] query as well, but it is usually easier to use the
+    /// [`list_prefix`][Self::list_prefix] method instead.
+    pub fn list(&self, query: impl AsRange) -> List<Self, Record> {
+        List::new(query).with_client(self.clone())
+    }
+
+    /// List the records associated with a prefix.
+    ///
+    /// This is the same as calling [`list`][Self::list] with a [`Prefix`] query.
+    pub fn list_prefix(&self, prefix: impl AsKey) -> List<Self, Record> {
+        self.list(Prefix(prefix))
     }
 }
 
@@ -43,6 +58,15 @@ pub struct List<C = (), R = Record> {
     client: C,
     request: etcdserverpb::RangeRequest,
     _return: marker::PhantomData<R>,
+}
+
+impl List<(), Record> {
+    /// Create a new list operation with the specified `query`.
+    ///
+    /// This is equivalent to calling [`default`][Self::default] and then [`range`][Self::range].
+    pub fn new(query: impl AsRange) -> Self {
+        Self::default().range(query)
+    }
 }
 
 impl Default for List<(), Record> {
@@ -79,9 +103,7 @@ impl<C, R> List<C, R> {
     /// List::default().prefix("foo/bar/");
     /// ```
     pub fn prefix(self, prefix: impl AsKey) -> Self {
-        let lower = prefix.as_key().to_owned();
-        let upper = add_one(&lower);
-        self._with_range(lower, upper)
+        self.range(Prefix(prefix))
     }
 
     /// Filter the query by the specified `range`. The range specifiers work on any range which can be converted into a
@@ -93,18 +115,10 @@ impl<C, R> List<C, R> {
     /// List::default().range("b"..="c"); // from "b" up to and including "c"
     /// List::default().range(.."taco");  // everything up to "taco"
     /// List::default().range("taco"..);  // "taco" and everything after
+    /// List::default().range(..);        // everything (which is the default)
     /// ```
-    pub fn range<Range: RangeBounds<impl AsKey>>(self, range: Range) -> Self {
-        let lower = match range.start_bound() {
-            Bound::Included(val) => Vec::from(val.as_key()),
-            Bound::Excluded(val) => successor(val.as_key()),
-            Bound::Unbounded => vec![0],
-        };
-        let upper = match range.end_bound() {
-            Bound::Included(val) => add_one(val.as_key()),
-            Bound::Excluded(val) => Vec::from(val.as_key()),
-            Bound::Unbounded => vec![0],
-        };
+    pub fn range(self, range: impl AsRange) -> Self {
+        let (lower, upper) = range.as_boundaries();
         self._with_range(lower, upper)
     }
 
@@ -182,7 +196,7 @@ impl<R> List<Client, R> {
                         ).into());
                         break;
                     };
-                    request.key = successor(&last_kv.key)
+                    request.key = crate::range::successor(&last_kv.key);
                 }
                 yield Ok(resp);
                 if !more {
@@ -300,52 +314,5 @@ impl IntoFuture for List<Client, usize> {
 
     fn into_future(self) -> Self::IntoFuture {
         BoxedFuture::new(self.call())
-    }
-}
-
-/// Add one bit to the last element of `input`, carrying left on overflow.
-///
-/// This is used in range queries to specify "include this `input`".
-fn add_one(input: &[u8]) -> Vec<u8> {
-    let mut out = input.to_owned();
-    while let Some(last) = out.last_mut() {
-        if *last < u8::MAX {
-            *last += 1;
-            break;
-        } else {
-            out.pop();
-        }
-    }
-    // special case -- input was a string of 0xff, so put in a 0x00 which means to get until the end of the database
-    if out.is_empty() {
-        out.push(0);
-    }
-    out
-}
-
-/// Get the "next" key that follows `input`.
-fn successor(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len() + 1);
-    input.clone_into(&mut out);
-    out.push(0);
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::add_one;
-
-    #[test]
-    fn test_add_one() {
-        let cases: &[(&[u8], &[u8])] = &[
-            (b"aa", b"ab"),
-            (b"a\xff", b"b"),
-            (b"\xff", b"\0"),
-            (b"\xff\xff\xff", b"\0"),
-        ];
-        for (input, expected) in cases {
-            let output = add_one(input);
-            assert_eq!(*expected, output);
-        }
     }
 }
