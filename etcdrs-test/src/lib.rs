@@ -90,4 +90,7 @@ pub(crate) mod tests {
 }
 
 #[cfg(test)]
+mod test_lease;
+
+#[cfg(test)]
 mod test_transaction;

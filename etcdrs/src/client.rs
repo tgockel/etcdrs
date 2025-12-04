@@ -161,6 +161,8 @@ impl ClientInner {
                             }
                         }
                         Code::InvalidArgument => Error::new(ErrorKind::InvalidArgument, e.message()),
+                        Code::FailedPrecondition => Error::new(ErrorKind::FailedPrecondition, e.message()),
+                        Code::NotFound => Error::new(ErrorKind::NotFound, e.message()),
                         _ => ErrorInner::from_unknown(e).into(),
                     };
                     return Err(err);

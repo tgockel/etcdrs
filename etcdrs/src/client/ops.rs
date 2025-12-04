@@ -4,6 +4,9 @@ pub use delete::*;
 mod get;
 pub use get::*;
 
+mod lease;
+pub use lease::*;
+
 mod list;
 pub use list::*;
 

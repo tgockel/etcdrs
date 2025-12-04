@@ -48,6 +48,7 @@ pub enum ErrorKind {
     /// Specified arguments were invalid. The associated message might have more details about which arguments were
     /// invalid.
     InvalidArgument,
+    FailedPrecondition,
     /// The system is currently unavailable.
     Unavailable,
     /// The key was not found.
@@ -62,6 +63,7 @@ impl ErrorKind {
             Self::Unknown => "unknown",
             Self::Canceled => "canceled",
             Self::InvalidArgument => "invalid argument",
+            Self::FailedPrecondition => "failed precondition",
             Self::Unavailable => "unavailable",
             Self::NotFound => "not found",
             Self::TooMany => "too many items",
