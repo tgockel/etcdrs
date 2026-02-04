@@ -16,7 +16,7 @@ impl Client {
     /// // Put a key using that lease
     /// client.put("foo")
     ///     .value("bar")
-    ///     .lease_id(lease_info.lease_id)
+    ///     .lease(lease_info.lease_id)
     ///     .await
     ///     .expect("failed to put key");
     ///
