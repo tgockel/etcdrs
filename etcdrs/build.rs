@@ -74,7 +74,19 @@ mod generate {
         var.to_str().unwrap() == "1"
     }
 
+    fn set_protoc_path() -> Result<()> {
+        println!("cargo:rerun-if-env-changed=PROTOC");
+
+        if env::var_os("PROTOC").is_none() {
+            env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
+        }
+
+        Ok(())
+    }
+
     pub fn run() -> Result<()> {
+        set_protoc_path().expect("could not set protoc path");
+
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("gen-src");
         let etc_source = etcd_proto_source()?;
 
@@ -83,20 +95,20 @@ mod generate {
         }
         fs::create_dir_all(&out_dir)?;
 
-        tonic_build::configure()
+        tonic_prost_build::configure()
             .emit_rerun_if_changed(true)
             .include_file("all.rs")
             .build_client(true)
             .use_arc_self(true)
             .generate_default_stubs(true)
             .out_dir(&out_dir)
-            .compile(
+            .compile_protos(
                 &[etc_source.join("etcd/api/etcdserverpb/rpc.proto")],
                 &[
-                    &etc_source,
-                    &etc_source.join("gogoproto"),
-                    &etc_source.join("googleapis"),
-                    &etc_source.join("grpc-gateway"),
+                    etc_source.clone(),
+                    etc_source.join("gogoproto"),
+                    etc_source.join("googleapis"),
+                    etc_source.join("grpc-gateway"),
                 ],
             )?;
 
