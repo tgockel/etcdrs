@@ -4,28 +4,26 @@ use std::{
     time::Duration,
 };
 
-use crate::ConnectionId;
-
 /// Attached to [`Client`][`crate::Client`]s to log metrics about requests.
 pub trait MetricsCollector: Send + Sync {
-    /// Called just before a request is about to be dispatched to the given connection.
-    fn request_start(&self, connection_id: ConnectionId);
+    /// Called just before a request is about to be dispatched.
+    fn request_start(&self);
 
     /// Called just after a request has completed, either in success or failure.
-    fn request_end(&self, connection_id: ConnectionId, duration: Duration, success: bool);
+    fn request_end(&self, duration: Duration, success: bool);
 }
 
 /// A bit of a hacky RAII mechanism to track metrics. If this ever gets exposed, it will need some clean up.
 pub(crate) struct MetricsSpan<'a, C: MetricsCollector> {
-    inner: Option<(ConnectionId, &'a C, std::time::Instant)>,
+    inner: Option<(&'a C, std::time::Instant)>,
 }
 
 impl<'a, C: MetricsCollector> MetricsSpan<'a, C> {
-    pub fn new(connection_id: ConnectionId, collector: &'a Option<C>) -> Self {
+    pub fn new(collector: &'a Option<C>) -> Self {
         if let Some(collector) = collector {
-            collector.request_start(connection_id);
+            collector.request_start();
             Self {
-                inner: Some((connection_id, collector, std::time::Instant::now())),
+                inner: Some((collector, std::time::Instant::now())),
             }
         } else {
             Self { inner: None }
@@ -38,9 +36,9 @@ impl<'a, C: MetricsCollector> MetricsSpan<'a, C> {
     }
 
     fn complete_impl(&mut self, success: bool) {
-        if let Some((id, collector, start)) = self.inner.take() {
+        if let Some((collector, start)) = self.inner.take() {
             let duration = std::time::Instant::now() - start;
-            collector.request_end(id, duration, success);
+            collector.request_end(duration, success);
         }
     }
 }
@@ -52,32 +50,32 @@ impl<'a, C: MetricsCollector> Drop for MetricsSpan<'a, C> {
 }
 
 impl<T: MetricsCollector> MetricsCollector for Box<T> {
-    fn request_start(&self, connection_id: ConnectionId) {
-        self.as_ref().request_start(connection_id)
+    fn request_start(&self) {
+        self.as_ref().request_start()
     }
 
-    fn request_end(&self, connection_id: ConnectionId, duration: Duration, success: bool) {
-        self.as_ref().request_end(connection_id, duration, success)
+    fn request_end(&self, duration: Duration, success: bool) {
+        self.as_ref().request_end(duration, success)
     }
 }
 
 impl MetricsCollector for Box<dyn MetricsCollector> {
-    fn request_start(&self, connection_id: ConnectionId) {
-        self.as_ref().request_start(connection_id)
+    fn request_start(&self) {
+        self.as_ref().request_start()
     }
 
-    fn request_end(&self, connection_id: ConnectionId, duration: Duration, success: bool) {
-        self.as_ref().request_end(connection_id, duration, success)
+    fn request_end(&self, duration: Duration, success: bool) {
+        self.as_ref().request_end(duration, success)
     }
 }
 
 impl<T: MetricsCollector> MetricsCollector for Arc<T> {
-    fn request_start(&self, connection_id: ConnectionId) {
-        self.as_ref().request_start(connection_id)
+    fn request_start(&self) {
+        self.as_ref().request_start()
     }
 
-    fn request_end(&self, connection_id: ConnectionId, duration: Duration, success: bool) {
-        self.as_ref().request_end(connection_id, duration, success)
+    fn request_end(&self, duration: Duration, success: bool) {
+        self.as_ref().request_end(duration, success)
     }
 }
 
@@ -90,11 +88,11 @@ pub struct RequestCounter {
 }
 
 impl MetricsCollector for RequestCounter {
-    fn request_start(&self, _connection_id: ConnectionId) {
+    fn request_start(&self) {
         self.requested.fetch_add(1, atomic::Ordering::Relaxed);
     }
 
-    fn request_end(&self, _connection_id: ConnectionId, _duration: Duration, success: bool) {
+    fn request_end(&self, _duration: Duration, success: bool) {
         let respond = if success {
             &self.respond_success
         } else {

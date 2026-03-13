@@ -1,7 +1,7 @@
 use crate::{
     error::{Error, ErrorInner, ErrorKind},
     record::{KeyWithMetadata, Metadata, Record},
-    ConnectionId, LeaseId, Result, Revision, Version,
+    LeaseId, Result, Revision, Version,
 };
 use std::{
     future::Future,
@@ -25,33 +25,46 @@ impl Client {
         ClientBuilder::default()
     }
 
-    /// Create a client which will connect to the specified `host`.
-    pub fn new(host: &str) -> Result<Self> {
-        Self::builder().add_connection(host)?.build()
+    /// Create a client from a connection string.
+    ///
+    /// The connection string is a comma-separated list of endpoint URIs, following the etcd
+    /// convention used by `etcdctl --endpoints`:
+    ///
+    /// ```text
+    /// http://host1:2379,http://host2:2379,http://host3:2379
+    /// ```
+    ///
+    /// A single URI is also accepted.
+    pub fn new(connection_string: &str) -> Result<Self> {
+        Self::builder().connection_string(connection_string)?.build()
     }
 }
 
 #[derive(Default)]
 pub struct ClientBuilder {
-    uri: Option<tonic::transport::Uri>,
+    uris: Vec<tonic::transport::Uri>,
     metrics: Option<Box<dyn MetricsCollector>>,
 }
 
 impl ClientBuilder {
-    pub fn add_connection(mut self, host: impl AsRef<str>) -> Result<Self> {
-        if self.uri.is_some() {
-            return Err(ErrorInner::with_static_message(
-                ErrorKind::Unknown,
-                "only one connection is supported right now",
-            )
-            .into());
+    /// Parse a comma-separated connection string and add all endpoints.
+    pub fn connection_string(mut self, connection_string: impl AsRef<str>) -> Result<Self> {
+        for host in connection_string.as_ref().split(',') {
+            let host = host.trim();
+            if !host.is_empty() {
+                self = self.add_connection(host)?;
+            }
         }
+        Ok(self)
+    }
 
+    /// Add a single endpoint.
+    pub fn add_connection(mut self, host: impl AsRef<str>) -> Result<Self> {
         let uri = host
             .as_ref()
             .parse::<tonic::transport::Uri>()
             .map_err(|err| Error::new(ErrorKind::InvalidArgument, err.to_string()))?;
-        self.uri = Some(uri);
+        self.uris.push(uri);
         Ok(self)
     }
 
@@ -61,12 +74,18 @@ impl ClientBuilder {
     }
 
     pub fn build(self) -> Result<Client> {
-        let Some(uri) = self.uri else {
+        if self.uris.is_empty() {
             return Err(ErrorInner::with_static_message(ErrorKind::InvalidArgument, "no connection was added").into());
+        }
+
+        let channel = if self.uris.len() == 1 {
+            let endpoint = tonic::transport::Channel::builder(self.uris.into_iter().next().unwrap());
+            endpoint.connect_lazy()
+        } else {
+            let endpoints = self.uris.into_iter().map(tonic::transport::Channel::builder);
+            tonic::transport::Channel::balance_list(endpoints)
         };
 
-        let endpoint = tonic::transport::Channel::builder(uri);
-        let channel = endpoint.connect_lazy();
         Ok(Client {
             inner: Arc::new(ClientInner {
                 channel,
@@ -135,12 +154,10 @@ impl ClientInner {
         // TODO: configurable
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            // TODO: Cycle channels if needed
-            let (connection_id, channel) = self.get_connection()?;
-            let metric = metrics::MetricsSpan::new(connection_id, &self.metrics);
+            let metric = metrics::MetricsSpan::new(&self.metrics);
 
             let response = {
-                let mut client = create_client(channel);
+                let mut client = create_client(self.channel.clone());
                 // safety -- this transmute is only needed to give `'a` some sort of lifetime. It is needed because Rust
                 // does not support async closures as of 2024, so the `&mut self` on an async function needs some sort
                 // of lifetime.
@@ -169,10 +186,5 @@ impl ClientInner {
                 }
             }
         }
-    }
-
-    fn get_connection(&self) -> Result<(ConnectionId, tonic::transport::Channel)> {
-        // TODO: choose a channel based on some sort of criteria
-        Ok((ConnectionId::new(1).unwrap(), self.channel.clone()))
     }
 }

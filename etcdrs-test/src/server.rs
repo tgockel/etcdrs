@@ -145,11 +145,12 @@ impl EtcdCluster {
     }
 
     pub fn connect_string(&self) -> String {
-        let Some(server) = self.servers.values().next() else {
-            panic!("Cluster {:?} is empty", self.cluster_token);
-        };
-        // TODO: more than one server
-        server.connect_string()
+        assert!(!self.servers.is_empty(), "Cluster {:?} is empty", self.cluster_token);
+        self.servers
+            .values()
+            .map(|s| s.connect_string())
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
