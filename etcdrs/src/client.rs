@@ -40,9 +40,19 @@ impl Client {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "this is only used in a Vec inside ClientBuilder"
+)]
+enum Remote {
+    Unconfigured(tonic::transport::Uri),
+    Preconfigured(tonic::transport::Endpoint),
+}
+
 #[derive(Default)]
 pub struct ClientBuilder {
-    uris: Vec<tonic::transport::Uri>,
+    remotes: Vec<Remote>,
+    configure_endpoint: Option<Box<dyn Fn(tonic::transport::Endpoint) -> Result<tonic::transport::Endpoint>>>,
     metrics: Option<Box<dyn MetricsCollector>>,
 }
 
@@ -58,14 +68,46 @@ impl ClientBuilder {
         Ok(self)
     }
 
-    /// Add a single endpoint.
+    /// Add a single endpoint by URI.
     pub fn add_connection(mut self, host: impl AsRef<str>) -> Result<Self> {
         let uri = host
             .as_ref()
             .parse::<tonic::transport::Uri>()
             .map_err(|err| Error::new(ErrorKind::InvalidArgument, err.to_string()))?;
-        self.uris.push(uri);
+        self.remotes.push(Remote::Unconfigured(uri));
         Ok(self)
+    }
+
+    /// Add a pre-configured [`tonic::transport::Endpoint`].
+    ///
+    /// Pre-configured endpoints bypass the [`configure_endpoint`][Self::configure_endpoint]
+    /// function and are connected to as-is.
+    pub fn add_endpoint(mut self, endpoint: tonic::transport::Endpoint) -> Self {
+        self.remotes.push(Remote::Preconfigured(endpoint));
+        self
+    }
+
+    /// Set a function to configure endpoints created from URIs.
+    ///
+    /// This function is applied to each endpoint added via
+    /// [`connection_string`][Self::connection_string] or [`add_connection`][Self::add_connection]
+    /// during [`build`][Self::build]. It is **not** applied to endpoints added via
+    /// [`add_endpoint`][Self::add_endpoint].
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    ///
+    /// let client = Client::builder()
+    ///     .connection_string("http://host1:2379,http://host2:2379")?
+    ///     .configure_endpoint(|ep| Ok(ep.connect_timeout(Duration::from_secs(5))))
+    ///     .build()?;
+    /// ```
+    pub fn configure_endpoint(
+        mut self,
+        f: impl Fn(tonic::transport::Endpoint) -> Result<tonic::transport::Endpoint> + 'static,
+    ) -> Self {
+        self.configure_endpoint = Some(Box::new(f));
+        self
     }
 
     pub fn metrics(mut self, metrics: impl MetricsCollector + 'static) -> Self {
@@ -74,23 +116,38 @@ impl ClientBuilder {
     }
 
     pub fn build(self) -> Result<Client> {
-        if self.uris.is_empty() {
+        let Self {
+            remotes,
+            configure_endpoint,
+            metrics,
+        } = self;
+
+        if remotes.is_empty() {
             return Err(ErrorInner::with_static_message(ErrorKind::InvalidArgument, "no connection was added").into());
         }
 
-        let channel = if self.uris.len() == 1 {
-            let endpoint = tonic::transport::Channel::builder(self.uris.into_iter().next().unwrap());
-            endpoint.connect_lazy()
+        let endpoints = remotes
+            .into_iter()
+            .map(|remote| match remote {
+                Remote::Unconfigured(uri) => {
+                    let ep = tonic::transport::Channel::builder(uri);
+                    match &configure_endpoint {
+                        Some(f) => f(ep),
+                        None => Ok(ep),
+                    }
+                }
+                Remote::Preconfigured(ep) => Ok(ep),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let channel = if endpoints.len() == 1 {
+            endpoints.into_iter().next().unwrap().connect_lazy()
         } else {
-            let endpoints = self.uris.into_iter().map(tonic::transport::Channel::builder);
-            tonic::transport::Channel::balance_list(endpoints)
+            tonic::transport::Channel::balance_list(endpoints.into_iter())
         };
 
         Ok(Client {
-            inner: Arc::new(ClientInner {
-                channel,
-                metrics: self.metrics,
-            }),
+            inner: Arc::new(ClientInner { channel, metrics }),
         })
     }
 }
