@@ -195,6 +195,17 @@ fn key_with_metadata_from_pb(r: crate::pb::mvccpb::KeyValue) -> KeyWithMetadata 
     KeyWithMetadata::new(r.key, metadata)
 }
 
+pub(crate) fn error_from_status(status: tonic::Status) -> Error {
+    use tonic::Code;
+    match status.code() {
+        Code::Unavailable => Error::new(ErrorKind::Unavailable, status.message()),
+        Code::InvalidArgument => Error::new(ErrorKind::InvalidArgument, status.message()),
+        Code::FailedPrecondition => Error::new(ErrorKind::FailedPrecondition, status.message()),
+        Code::NotFound => Error::new(ErrorKind::NotFound, status.message()),
+        _ => ErrorInner::from_unknown(status).into(),
+    }
+}
+
 impl ClientInner {
     async fn wrap_unary_call<
         'a,
@@ -225,21 +236,10 @@ impl ClientInner {
             match response {
                 Ok(r) => break Ok(r.into_inner()),
                 Err(e) => {
-                    use tonic::Code;
-                    let err = match e.code() {
-                        Code::Unavailable => {
-                            if std::time::Instant::now() > deadline {
-                                Error::new(ErrorKind::Unavailable, e.message())
-                            } else {
-                                continue;
-                            }
-                        }
-                        Code::InvalidArgument => Error::new(ErrorKind::InvalidArgument, e.message()),
-                        Code::FailedPrecondition => Error::new(ErrorKind::FailedPrecondition, e.message()),
-                        Code::NotFound => Error::new(ErrorKind::NotFound, e.message()),
-                        _ => ErrorInner::from_unknown(e).into(),
-                    };
-                    return Err(err);
+                    if e.code() == tonic::Code::Unavailable && std::time::Instant::now() <= deadline {
+                        continue;
+                    }
+                    return Err(error_from_status(e));
                 }
             }
         }

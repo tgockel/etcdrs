@@ -12,7 +12,7 @@ pub(crate) mod tests {
     use crate::*;
 
     #[fixture]
-    fn etcd_server() -> EtcdServer {
+    pub(crate) fn etcd_server() -> EtcdServer {
         server::EtcdServerConfig::new_single_temporary().start().unwrap()
     }
 
@@ -94,3 +94,6 @@ mod test_lease;
 
 #[cfg(test)]
 mod test_transaction;
+
+#[cfg(test)]
+mod test_watch;

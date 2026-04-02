@@ -26,4 +26,5 @@ tonic-prost = "^0.14.3"
 tonic-prost-build = "^0.14.3"
 url = "^2.5.2"
 
+# Local dependencies
 etcdrs = { path = "etcdrs" }

@@ -15,3 +15,6 @@ pub use put::*;
 
 mod transaction;
 pub use transaction::*;
+
+mod watch;
+pub use watch::*;

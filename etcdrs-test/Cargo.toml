@@ -11,4 +11,4 @@ rand.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true
-tokio = { workspace = true, default-features = false, features = ["macros", "rt"] }
+tokio = { workspace = true, default-features = false, features = ["macros", "rt", "time"] }

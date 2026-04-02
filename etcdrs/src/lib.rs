@@ -9,6 +9,7 @@ pub(crate) mod range;
 pub mod record;
 
 pub use client::Client;
+pub use client::WatchId;
 pub use error::{Error, ErrorKind};
 pub use range::{AsRange, Prefix};
 pub use record::Record;
