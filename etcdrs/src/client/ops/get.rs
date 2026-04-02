@@ -1,7 +1,11 @@
-use std::future::IntoFuture;
+use std::{
+    future::{Future, IntoFuture},
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use crate::{
-    client::{record_from_pb, BoxedFuture},
+    client::record_from_pb,
     error::ErrorInner,
     pb::etcdserverpb,
     record::{AsKey, Record},
@@ -77,11 +81,29 @@ impl Get<Client> {
     }
 }
 
-impl IntoFuture for Get<Client> {
-    type Output = Result<Option<Record>>;
-    type IntoFuture = BoxedFuture<Self::Output>;
+/// The [`Future`] type returned by awaiting a [`get`][`Client::get`].
+pub struct GetFuture(Pin<Box<dyn Future<Output = Result<Option<Record>>> + Send>>);
 
-    fn into_future(self) -> Self::IntoFuture {
-        BoxedFuture::new(self.call())
+impl Future for GetFuture {
+    type Output = Result<Option<Record>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
     }
 }
+
+impl IntoFuture for Get<Client> {
+    type Output = Result<Option<Record>>;
+    type IntoFuture = GetFuture;
+
+    fn into_future(self) -> Self::IntoFuture {
+        GetFuture(Box::pin(self.call()))
+    }
+}
+
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _check() {
+        _assert_send::<GetFuture>();
+    }
+};

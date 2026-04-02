@@ -8,11 +8,10 @@ pub(crate) mod pb;
 pub(crate) mod range;
 pub mod record;
 
-pub use client::Client;
-pub use client::WatchId;
+pub use client::{Client, WatchId};
 pub use error::{Error, ErrorKind};
 pub use range::{AsRange, Prefix};
-pub use record::Record;
+pub use record::{KeyWithMetadata, Metadata, Record};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

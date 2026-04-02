@@ -158,11 +158,11 @@ struct ClientInner {
 }
 
 pub struct BoxedFuture<T> {
-    inner: Box<dyn Future<Output = T>>,
+    inner: Box<dyn Future<Output = T> + Send>,
 }
 
 impl<T> BoxedFuture<T> {
-    fn new(src: impl Future<Output = T> + 'static) -> Self {
+    fn new(src: impl Future<Output = T> + Send + 'static) -> Self {
         Self { inner: Box::new(src) }
     }
 }
