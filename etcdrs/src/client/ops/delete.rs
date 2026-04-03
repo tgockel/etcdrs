@@ -80,7 +80,7 @@ impl IntoFuture for Delete<Client, bool, ()> {
                 .inner
                 .wrap_unary_call(
                     etcdserverpb::kv_client::KvClient::new,
-                    etcdserverpb::kv_client::KvClient::delete_range,
+                    async |c, r| c.delete_range(r).await,
                     self.request,
                 )
                 .await?;
@@ -100,7 +100,7 @@ impl IntoFuture for Delete<Client, bool, GetPreviousValue> {
                 .inner
                 .wrap_unary_call(
                     etcdserverpb::kv_client::KvClient::new,
-                    etcdserverpb::kv_client::KvClient::delete_range,
+                    async |c, r| c.delete_range(r).await,
                     self.request,
                 )
                 .await?;

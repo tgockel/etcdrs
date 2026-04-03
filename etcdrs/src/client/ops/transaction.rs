@@ -171,7 +171,7 @@ impl Transaction<Client> {
             .inner
             .wrap_unary_call(
                 etcdserverpb::kv_client::KvClient::new,
-                etcdserverpb::kv_client::KvClient::txn,
+                async |c, r| c.txn(r).await,
                 self.request,
             )
             .await

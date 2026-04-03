@@ -104,7 +104,7 @@ impl<R> Put<Client, R> {
             .inner
             .wrap_unary_call(
                 etcdserverpb::kv_client::KvClient::new,
-                etcdserverpb::kv_client::KvClient::put,
+                async |c, r| c.put(r).await,
                 self.request,
             )
             .await?;

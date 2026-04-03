@@ -67,7 +67,7 @@ impl Get<Client> {
             .inner
             .wrap_unary_call(
                 etcdserverpb::kv_client::KvClient::new,
-                etcdserverpb::kv_client::KvClient::range,
+                async |c, r| c.range(r).await,
                 self.request,
             )
             .await?;

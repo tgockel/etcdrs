@@ -169,7 +169,7 @@ impl<R> List<Client, R> {
             loop {
                 let resp = match client_inner.wrap_unary_call(
                     etcdserverpb::kv_client::KvClient::new,
-                    etcdserverpb::kv_client::KvClient::range,
+                    async |c, r| c.range(r).await,
                     request.clone()
                 ).await {
                     Ok(resp) => resp,
@@ -301,7 +301,7 @@ impl List<Client, usize> {
             .inner
             .wrap_unary_call(
                 etcdserverpb::kv_client::KvClient::new,
-                etcdserverpb::kv_client::KvClient::range,
+                async |c, r| c.range(r).await,
                 self.request,
             )
             .await

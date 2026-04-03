@@ -5,6 +5,7 @@ use crate::{
 };
 use std::{
     future::Future,
+    ops::AsyncFn,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -195,6 +196,12 @@ fn key_with_metadata_from_pb(r: crate::pb::mvccpb::KeyValue) -> KeyWithMetadata 
     KeyWithMetadata::new(r.key, metadata)
 }
 
+fn is_client_side_timeout(status: &tonic::Status) -> bool {
+    // Tonic does a client-side timeout if the server-side does not respond in time. This is the
+    // only way to check for that.
+    status.code() == tonic::Code::Cancelled && status.message() == "Timeout expired"
+}
+
 pub(crate) fn error_from_status(status: tonic::Status) -> Error {
     use tonic::Code;
     match status.code() {
@@ -207,41 +214,39 @@ pub(crate) fn error_from_status(status: tonic::Status) -> Error {
 }
 
 impl ClientInner {
-    async fn wrap_unary_call<
-        'a,
-        R,
-        F: Future<Output = Result<tonic::Response<R>, tonic::Status>>,
-        GrpcClient: 'a,
-        Request: Clone,
-    >(
+    async fn wrap_unary_call<R, GrpcClient, Request>(
         &self,
         create_client: impl Fn(tonic::transport::Channel) -> GrpcClient,
-        call: impl Fn(&'a mut GrpcClient, Request) -> F,
+        call: impl AsyncFn(&mut GrpcClient, tonic::Request<Request>) -> Result<tonic::Response<R>, tonic::Status>,
         request: Request,
-    ) -> Result<R, Error> {
+    ) -> Result<R, Error>
+    where
+        Request: Clone,
+    {
         // TODO: configurable
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut client = create_client(self.channel.clone());
         loop {
             let metric = metrics::MetricsSpan::new(&self.metrics);
-
-            let response = {
-                let mut client = create_client(self.channel.clone());
-                // safety -- this transmute is only needed to give `'a` some sort of lifetime. It is needed because Rust
-                // does not support async closures as of 2024, so the `&mut self` on an async function needs some sort
-                // of lifetime.
-                let client_ref: &'a mut GrpcClient = unsafe { std::mem::transmute(&mut client) };
-                call(client_ref, request.clone()).await
-            };
+            let mut call_request = tonic::Request::new(request.clone());
+            if let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+                call_request.set_timeout(remaining);
+            }
+            let response = call(&mut client, call_request).await;
             metric.complete(response.is_ok());
             match response {
                 Ok(r) => break Ok(r.into_inner()),
                 Err(e) => {
-                    if e.code() == tonic::Code::Unavailable && std::time::Instant::now() <= deadline {
+                    if Self::can_retry(&e) && std::time::Instant::now() <= deadline {
                         continue;
                     }
                     return Err(error_from_status(e));
                 }
             }
         }
+    }
+
+    fn can_retry(status: &tonic::Status) -> bool {
+        status.code() == tonic::Code::Unavailable || is_client_side_timeout(status)
     }
 }

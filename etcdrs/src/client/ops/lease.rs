@@ -42,7 +42,7 @@ impl Client {
         self.inner
             .wrap_unary_call(
                 etcdserverpb::lease_client::LeaseClient::new,
-                etcdserverpb::lease_client::LeaseClient::lease_revoke,
+                async |c, r| c.lease_revoke(r).await,
                 etcdserverpb::LeaseRevokeRequest { id: lease_id.get() },
             )
             .await
@@ -114,7 +114,7 @@ impl GrantLease<Client> {
             .inner
             .wrap_unary_call(
                 etcdserverpb::lease_client::LeaseClient::new,
-                etcdserverpb::lease_client::LeaseClient::lease_grant,
+                async |c, r| c.lease_grant(r).await,
                 self.request,
             )
             .await?;
