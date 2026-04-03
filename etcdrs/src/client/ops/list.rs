@@ -1,14 +1,14 @@
 use futures_core::Stream;
 
 use crate::{
-    client::{key_with_metadata_from_pb, record_from_pb, BoxedFuture, Client},
+    client::{key_with_metadata_from_pb, record_from_pb, Client},
     error::{ErrorInner, ErrorKind},
     pb::{etcdserverpb, mvccpb},
     record::{AsKey, KeyWithMetadata, Record},
     AsRange, Prefix, Result,
 };
 use std::{
-    future::IntoFuture,
+    future::{Future, IntoFuture},
     marker,
     pin::Pin,
     task::{Context, Poll},
@@ -316,11 +316,29 @@ impl List<Client, usize> {
     }
 }
 
-impl IntoFuture for List<Client, usize> {
-    type Output = Result<usize>;
-    type IntoFuture = BoxedFuture<Self::Output>;
+/// The [`Future`] type returned by awaiting [`list`][Client::list] operations.
+pub struct ListFuture<T>(Pin<Box<dyn Future<Output = T> + Send>>);
 
-    fn into_future(self) -> Self::IntoFuture {
-        BoxedFuture::new(self.call())
+impl<T> Future for ListFuture<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
     }
 }
+
+impl IntoFuture for List<Client, usize> {
+    type Output = Result<usize>;
+    type IntoFuture = ListFuture<Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        ListFuture(Box::pin(self.call()))
+    }
+}
+
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _check() {
+        _assert_send::<ListFuture<Result<usize>>>();
+    }
+};

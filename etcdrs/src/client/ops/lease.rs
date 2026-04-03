@@ -1,6 +1,11 @@
-use std::{future::IntoFuture, time::Duration};
+use std::{
+    future::{Future, IntoFuture},
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
-use crate::{client::BoxedFuture, pb::etcdserverpb, Client, LeaseId, Result};
+use crate::{pb::etcdserverpb, Client, LeaseId, Result};
 
 impl Client {
     /// Create a lease used to create ephemeral records.
@@ -127,11 +132,29 @@ impl GrantLease<Client> {
     }
 }
 
-impl IntoFuture for GrantLease<Client> {
-    type Output = Result<LeaseInfo>;
-    type IntoFuture = BoxedFuture<Self::Output>;
+/// The [`Future`] type returned by awaiting a [`grant_lease`][`Client::grant_lease`].
+pub struct GrantLeaseFuture(Pin<Box<dyn Future<Output = Result<LeaseInfo>> + Send>>);
 
-    fn into_future(self) -> Self::IntoFuture {
-        BoxedFuture::new(self.call())
+impl Future for GrantLeaseFuture {
+    type Output = Result<LeaseInfo>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
     }
 }
+
+impl IntoFuture for GrantLease<Client> {
+    type Output = Result<LeaseInfo>;
+    type IntoFuture = GrantLeaseFuture;
+
+    fn into_future(self) -> Self::IntoFuture {
+        GrantLeaseFuture(Box::pin(self.call()))
+    }
+}
+
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _check() {
+        _assert_send::<GrantLeaseFuture>();
+    }
+};

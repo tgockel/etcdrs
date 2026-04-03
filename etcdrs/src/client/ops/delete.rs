@@ -1,7 +1,12 @@
-use std::{future::IntoFuture, marker::PhantomData};
+use std::{
+    future::{Future, IntoFuture},
+    marker::PhantomData,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use crate::{
-    client::{record_from_pb, BoxedFuture, GetPreviousValue},
+    client::{record_from_pb, GetPreviousValue},
     pb::etcdserverpb,
     record::{AsKey, Record},
     AsRange, Client, Prefix, Result,
@@ -145,82 +150,77 @@ impl<C, R, P> Delete<C, R, P> {
     }
 }
 
+impl<R, P> Delete<Client, R, P> {
+    async fn call(self) -> Result<etcdserverpb::DeleteRangeResponse> {
+        self.client
+            .inner
+            .wrap_unary_call(
+                etcdserverpb::kv_client::KvClient::new,
+                async |c, r| c.delete_range(r).await,
+                self.request,
+            )
+            .await
+    }
+}
+
+/// The [`Future`] type returned by awaiting [`delete`][Client::delete] and
+/// [`delete_range`][Client::delete_range] operations.
+pub struct DeleteFuture<T>(Pin<Box<dyn Future<Output = T> + Send>>);
+
+impl<T> Future for DeleteFuture<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
 impl IntoFuture for Delete<Client, bool, ()> {
     type Output = Result<bool>;
-    type IntoFuture = BoxedFuture<Self::Output>;
+    type IntoFuture = DeleteFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
-        BoxedFuture::new(async move {
-            let resp = self
-                .client
-                .inner
-                .wrap_unary_call(
-                    etcdserverpb::kv_client::KvClient::new,
-                    async |c, r| c.delete_range(r).await,
-                    self.request,
-                )
-                .await?;
-            Ok(resp.deleted > 0)
-        })
+        DeleteFuture(Box::pin(async move { self.call().await.map(|r| r.deleted > 0) }))
     }
 }
 
 impl IntoFuture for Delete<Client, bool, GetPreviousValue> {
     type Output = Result<Option<Record>>;
-    type IntoFuture = BoxedFuture<Self::Output>;
+    type IntoFuture = DeleteFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
-        BoxedFuture::new(async move {
-            let resp = self
-                .client
-                .inner
-                .wrap_unary_call(
-                    etcdserverpb::kv_client::KvClient::new,
-                    async |c, r| c.delete_range(r).await,
-                    self.request,
-                )
-                .await?;
-            Ok(resp.prev_kvs.into_iter().next().map(record_from_pb))
-        })
+        DeleteFuture(Box::pin(async move {
+            self.call().await.map(|r| r.prev_kvs.into_iter().next().map(record_from_pb))
+        }))
     }
 }
 
 impl IntoFuture for Delete<Client, usize, ()> {
     type Output = Result<usize>;
-    type IntoFuture = BoxedFuture<Self::Output>;
+    type IntoFuture = DeleteFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
-        BoxedFuture::new(async move {
-            let resp = self
-                .client
-                .inner
-                .wrap_unary_call(
-                    etcdserverpb::kv_client::KvClient::new,
-                    async |c, r| c.delete_range(r).await,
-                    self.request,
-                )
-                .await?;
-            Ok(resp.deleted as usize)
-        })
+        DeleteFuture(Box::pin(async move { self.call().await.map(|r| r.deleted as usize) }))
     }
 }
 
 impl IntoFuture for Delete<Client, usize, GetPreviousValue> {
     type Output = Result<Vec<Record>>;
-    type IntoFuture = BoxedFuture<Self::Output>;
+    type IntoFuture = DeleteFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
-        BoxedFuture::new(async move {
-            let resp = self
-                .client
-                .inner
-                .wrap_unary_call(
-                    etcdserverpb::kv_client::KvClient::new,
-                    async |c, r| c.delete_range(r).await,
-                    self.request,
-                )
-                .await?;
-            Ok(resp.prev_kvs.into_iter().map(record_from_pb).collect())
-        })
+        DeleteFuture(Box::pin(async move {
+            self.call().await.map(|r| r.prev_kvs.into_iter().map(record_from_pb).collect())
+        }))
     }
 }
+
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _check() {
+        _assert_send::<DeleteFuture<Result<bool>>>();
+        _assert_send::<DeleteFuture<Result<Option<Record>>>>();
+        _assert_send::<DeleteFuture<Result<usize>>>();
+        _assert_send::<DeleteFuture<Result<Vec<Record>>>>();
+    }
+};

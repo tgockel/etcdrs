@@ -1,7 +1,12 @@
-use std::{future::IntoFuture, marker::PhantomData};
+use std::{
+    future::{Future, IntoFuture},
+    marker::PhantomData,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use crate::{
-    client::{record_from_pb, BoxedFuture},
+    client::record_from_pb,
     pb::etcdserverpb,
     record::{AsKey, AsValue, Record},
     Client, LeaseId, Result,
@@ -112,23 +117,42 @@ impl<R> Put<Client, R> {
     }
 }
 
+/// The [`Future`] type returned by awaiting [`put`][Client::put] operations.
+pub struct PutFuture<T>(Pin<Box<dyn Future<Output = T> + Send>>);
+
+impl<T> Future for PutFuture<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
 impl IntoFuture for Put<Client, GetPreviousValue> {
     type Output = Result<Option<Record>>;
-    type IntoFuture = BoxedFuture<Self::Output>;
+    type IntoFuture = PutFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
-        BoxedFuture::new(self.call())
+        PutFuture(Box::pin(self.call()))
     }
 }
 
 impl IntoFuture for Put<Client, ()> {
     type Output = Result<()>;
-    type IntoFuture = BoxedFuture<Self::Output>;
+    type IntoFuture = PutFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
-        BoxedFuture::new(async move { self.call().await.map(|_| ()) })
+        PutFuture(Box::pin(async move { self.call().await.map(|_| ()) }))
     }
 }
+
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _check() {
+        _assert_send::<PutFuture<Result<()>>>();
+        _assert_send::<PutFuture<Result<Option<Record>>>>();
+    }
+};
 
 /// Used in [`Put`]s to denote that the previous value should be returned.
 pub struct GetPreviousValue;

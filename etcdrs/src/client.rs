@@ -3,13 +3,7 @@ use crate::{
     record::{KeyWithMetadata, Metadata, Record},
     LeaseId, Result, Revision, Version,
 };
-use std::{
-    future::Future,
-    ops::AsyncFn,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-};
+use std::{ops::AsyncFn, sync::Arc};
 
 mod metrics;
 pub use metrics::{MetricsCollector, RequestCount, RequestCounter};
@@ -156,25 +150,6 @@ impl ClientBuilder {
 struct ClientInner {
     channel: tonic::transport::Channel,
     metrics: Option<Box<dyn MetricsCollector>>,
-}
-
-pub struct BoxedFuture<T> {
-    inner: Box<dyn Future<Output = T> + Send>,
-}
-
-impl<T> BoxedFuture<T> {
-    fn new(src: impl Future<Output = T> + Send + 'static) -> Self {
-        Self { inner: Box::new(src) }
-    }
-}
-
-impl<T> Future for BoxedFuture<T> {
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let pinner = unsafe { self.map_unchecked_mut(|this| this.inner.as_mut()) };
-        pinner.poll(cx)
-    }
 }
 
 fn metadata_from_pb(r: &crate::pb::mvccpb::KeyValue) -> Metadata {
