@@ -329,6 +329,28 @@ impl<C> From<Delete<C, bool, GetPreviousValue>> for TransactionOp {
     }
 }
 
+impl<C> From<Delete<C, usize>> for TransactionOp {
+    fn from(value: Delete<C, usize>) -> Self {
+        Self {
+            request: etcdserverpb::RequestOp {
+                request: Some(etcdserverpb::request_op::Request::RequestDeleteRange(value.request)),
+            },
+            kind: TransactionOpKind::DeleteRange,
+        }
+    }
+}
+
+impl<C> From<Delete<C, usize, GetPreviousValue>> for TransactionOp {
+    fn from(value: Delete<C, usize, GetPreviousValue>) -> Self {
+        Self {
+            request: etcdserverpb::RequestOp {
+                request: Some(etcdserverpb::request_op::Request::RequestDeleteRange(value.request)),
+            },
+            kind: TransactionOpKind::DeleteRangePrevious,
+        }
+    }
+}
+
 impl<C> From<Get<C>> for TransactionOp {
     fn from(value: Get<C>) -> Self {
         Self {
@@ -422,6 +444,12 @@ pub enum TransactionOpResponse {
     /// The result of a [`Delete`] where [`get_previous`][Delete::get_previous] was called. The previous value is
     /// returned if there was one or `None` if the key did not exist.
     DeletePrevious(Option<Record>),
+    /// The result of a [`Client::delete_range`] or [`Client::delete_prefix`]. The value is the number of keys that were
+    /// deleted.
+    DeleteRange(usize),
+    /// The result of a [`Client::delete_range`] or [`Client::delete_prefix`] where
+    /// [`get_previous`][Delete::get_previous] was called. The previous key-values are returned.
+    DeleteRangePrevious(Vec<Record>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -432,6 +460,8 @@ enum TransactionOpKind {
     PutPrevious,
     Delete,
     DeletePrevious,
+    DeleteRange,
+    DeleteRangePrevious,
 }
 
 impl TransactionOpResponse {
@@ -461,6 +491,10 @@ impl TransactionOpResponse {
                     TransactionOpKind::Delete => Self::Delete(response.deleted > 0),
                     TransactionOpKind::DeletePrevious => {
                         Self::DeletePrevious(response.prev_kvs.into_iter().next().map(record_from_pb))
+                    }
+                    TransactionOpKind::DeleteRange => Self::DeleteRange(response.deleted as usize),
+                    TransactionOpKind::DeleteRangePrevious => {
+                        Self::DeleteRangePrevious(response.prev_kvs.into_iter().map(record_from_pb).collect())
                     }
                     // TODO: Log?
                     _ => return None,

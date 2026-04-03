@@ -87,6 +87,60 @@ pub(crate) mod tests {
         let deleted = client.delete("foo").await.unwrap();
         assert!(!deleted);
     }
+
+    #[rstest]
+    #[tokio::test]
+    async fn delete_prefix(etcd_server: EtcdServer) {
+        let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+
+        for key in ["foo/a", "foo/b", "foo/c", "bar/a"] {
+            client.put(key).value(key).await.unwrap();
+        }
+
+        let count = client.delete_prefix("foo/").await.unwrap();
+        assert_eq!(count, 3);
+
+        // Verify the prefixed keys are gone
+        assert!(client.get("foo/a").await.unwrap().is_none());
+        assert!(client.get("foo/b").await.unwrap().is_none());
+        assert!(client.get("foo/c").await.unwrap().is_none());
+        // bar/a should still exist
+        assert!(client.get("bar/a").await.unwrap().is_some());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn delete_range(etcd_server: EtcdServer) {
+        let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+
+        for key in ["foo/a", "foo/b", "foo/c", "foo/d"] {
+            client.put(key).value(key).await.unwrap();
+        }
+
+        // "foo/a".."foo/c" should delete "foo/a" and "foo/b" (exclusive upper bound)
+        let count = client.delete_range("foo/a".."foo/c").await.unwrap();
+        assert_eq!(count, 2);
+
+        assert!(client.get("foo/a").await.unwrap().is_none());
+        assert!(client.get("foo/b").await.unwrap().is_none());
+        assert!(client.get("foo/c").await.unwrap().is_some());
+        assert!(client.get("foo/d").await.unwrap().is_some());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn delete_range_get_previous(etcd_server: EtcdServer) {
+        let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+
+        for key in ["foo/a", "foo/b", "foo/c"] {
+            client.put(key).value(key).await.unwrap();
+        }
+
+        let previous = client.delete_prefix("foo/").get_previous().await.unwrap();
+        assert_eq!(previous.len(), 3);
+        let keys: Vec<&[u8]> = previous.iter().map(|r| r.key().as_slice()).collect();
+        assert_eq!(keys, vec![b"foo/a", b"foo/b", b"foo/c"]);
+    }
 }
 
 #[cfg(test)]
