@@ -188,6 +188,13 @@ impl<R> List<Client, R> {
 
                 let more = resp.more;
                 if more {
+                    // Pin the revision from the first response so subsequent pages are consistent.
+                    if request.revision == 0 {
+                        if let Some(header) = &resp.header {
+                            request.revision = header.revision;
+                        }
+                    }
+
                     // if there are more results, advance request.key to one past the end for the next query
                     let Some(last_kv) = resp.kvs.last() else {
                         // this should be unreachable, but a bad server implementation could land us here

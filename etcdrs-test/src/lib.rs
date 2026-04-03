@@ -67,6 +67,32 @@ pub(crate) mod tests {
 
     #[rstest]
     #[tokio::test]
+    async fn list_pagination_consistent_revision(etcd_server: EtcdServer) {
+        let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+
+        for (key, value) in [("foo/a", "a"), ("foo/b", "b"), ("foo/c", "c"), ("foo/d", "d")] {
+            client.put(key).value(value).await.unwrap();
+        }
+
+        // Page size of 1 — each poll triggers a separate RangeRequest
+        let mut stream = client.list_prefix("foo/").limit(1).into_stream();
+
+        // Pull the first item — this pins the revision
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.key(), b"foo/a");
+        assert_eq!(first.value(), b"a");
+
+        // Modify a key that hasn't been returned yet
+        client.put("foo/c").value("modified").await.unwrap();
+
+        // Remaining pages should read from the pinned revision and see the old value
+        let remaining: Vec<_> = stream.map(Result::unwrap).collect().await;
+        let values: Vec<&[u8]> = remaining.iter().map(|r| r.value().as_slice()).collect();
+        assert_eq!(values, vec![b"b", b"c", b"d"]);
+    }
+
+    #[rstest]
+    #[tokio::test]
     async fn create_delete_get(etcd_server: EtcdServer) {
         let metrics = Arc::new(etcdrs::client::RequestCounter::default());
         let client = etcdrs::Client::builder()
