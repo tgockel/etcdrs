@@ -220,7 +220,7 @@ async fn watch_cancel(etcd_server: EtcdServer) {
         .await
         .expect("timed out")
         .expect("stream ended");
-    assert_eq!(result.unwrap_err().kind(), etcdrs::ErrorKind::Canceled);
+    assert_eq!(result.unwrap_err().kind(), etcdrs::WatchErrorKind::Canceled);
 
     client.put("wc/keep").value("still alive").await.unwrap();
     let events = next_events(&mut watcher, 1).await;

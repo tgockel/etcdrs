@@ -9,7 +9,7 @@ use crate::{
     client::{record_from_pb, GetPreviousValue},
     pb::etcdserverpb,
     record::{AsKey, Record},
-    AsRange, Client, Prefix, Result,
+    AsRange, Client, Prefix,
 };
 
 impl Client {
@@ -151,7 +151,7 @@ impl<C, R, P> Delete<C, R, P> {
 }
 
 impl<R, P> Delete<Client, R, P> {
-    async fn call(self) -> Result<etcdserverpb::DeleteRangeResponse> {
+    async fn call(self) -> Result<etcdserverpb::DeleteRangeResponse, DeleteError> {
         self.client
             .inner
             .wrap_unary_call(
@@ -160,6 +160,7 @@ impl<R, P> Delete<Client, R, P> {
                 self.request,
             )
             .await
+            .map_err(DeleteError::from_status)
     }
 }
 
@@ -176,7 +177,7 @@ impl<T> Future for DeleteFuture<T> {
 }
 
 impl IntoFuture for Delete<Client, bool, ()> {
-    type Output = Result<bool>;
+    type Output = Result<bool, DeleteError>;
     type IntoFuture = DeleteFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -185,7 +186,7 @@ impl IntoFuture for Delete<Client, bool, ()> {
 }
 
 impl IntoFuture for Delete<Client, bool, GetPreviousValue> {
-    type Output = Result<Option<Record>>;
+    type Output = Result<Option<Record>, DeleteError>;
     type IntoFuture = DeleteFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -196,7 +197,7 @@ impl IntoFuture for Delete<Client, bool, GetPreviousValue> {
 }
 
 impl IntoFuture for Delete<Client, usize, ()> {
-    type Output = Result<usize>;
+    type Output = Result<usize, DeleteError>;
     type IntoFuture = DeleteFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -205,7 +206,7 @@ impl IntoFuture for Delete<Client, usize, ()> {
 }
 
 impl IntoFuture for Delete<Client, usize, GetPreviousValue> {
-    type Output = Result<Vec<Record>>;
+    type Output = Result<Vec<Record>, DeleteError>;
     type IntoFuture = DeleteFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -215,12 +216,30 @@ impl IntoFuture for Delete<Client, usize, GetPreviousValue> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeleteErrorKind {
+    /// A gRPC transport or unexpected error.
+    Transport,
+}
+
+define_op_error! {
+    /// An error from a [`delete`][Client::delete] or [`delete_range`][Client::delete_range] operation.
+    pub struct DeleteError(DeleteErrorKind);
+}
+
+impl DeleteError {
+    pub(crate) fn from_status(status: tonic::Status) -> Self {
+        Self::new(DeleteErrorKind::Transport, "", Some(status))
+    }
+}
+
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _check() {
-        _assert_send::<DeleteFuture<Result<bool>>>();
-        _assert_send::<DeleteFuture<Result<Option<Record>>>>();
-        _assert_send::<DeleteFuture<Result<usize>>>();
-        _assert_send::<DeleteFuture<Result<Vec<Record>>>>();
+        _assert_send::<DeleteFuture<Result<bool, DeleteError>>>();
+        _assert_send::<DeleteFuture<Result<Option<Record>, DeleteError>>>();
+        _assert_send::<DeleteFuture<Result<usize, DeleteError>>>();
+        _assert_send::<DeleteFuture<Result<Vec<Record>, DeleteError>>>();
     }
 };

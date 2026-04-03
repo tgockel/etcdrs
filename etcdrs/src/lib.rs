@@ -2,18 +2,21 @@
 
 use std::num::{NonZeroI64, NonZeroU64};
 
-pub mod client;
+#[macro_use]
 pub mod error;
+pub mod client;
 pub(crate) mod pb;
 pub(crate) mod range;
 pub mod record;
 
-pub use client::{Client, WatchId};
-pub use error::{Error, ErrorKind};
+pub use client::{
+    BuildError, Client, DeleteError, DeleteErrorKind, GetError, GetErrorKind, GrantLeaseError, GrantLeaseErrorKind,
+    ListError, ListErrorKind, PutError, PutErrorKind, RevokeLeaseError, RevokeLeaseErrorKind, TransactionError,
+    TransactionErrorKind, WatchError, WatchErrorKind, WatchId,
+};
+pub use error::OperationError;
 pub use range::{AsRange, Prefix};
 pub use record::{KeyWithMetadata, Metadata, Record};
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[repr(transparent)]

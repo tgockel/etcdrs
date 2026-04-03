@@ -2,10 +2,9 @@ use futures_core::Stream;
 
 use crate::{
     client::{key_with_metadata_from_pb, record_from_pb, Client},
-    error::{ErrorInner, ErrorKind},
     pb::{etcdserverpb, mvccpb},
     record::{AsKey, KeyWithMetadata, Record},
-    AsRange, Prefix, Result,
+    AsRange, Prefix,
 };
 use std::{
     future::{Future, IntoFuture},
@@ -156,7 +155,7 @@ impl<C, R> List<C, R> {
 }
 
 impl<R> List<Client, R> {
-    fn stream_result_chunks(self) -> impl Stream<Item = Result<etcdserverpb::RangeResponse>> {
+    fn stream_result_chunks(self) -> impl Stream<Item = Result<etcdserverpb::RangeResponse, ListError>> {
         async_stream::stream! {
             let mut request = self.request;
             // if the user never set the range, fill it with 0
@@ -173,10 +172,10 @@ impl<R> List<Client, R> {
                     request.clone()
                 ).await {
                     Ok(resp) => resp,
-                    Err(err) => {
-                        let err_kind = err.kind();
-                        yield Err(err);
-                        if err_kind == ErrorKind::Unavailable {
+                    Err(status) => {
+                        let is_unavailable = status.code() == tonic::Code::Unavailable;
+                        yield Err(ListError::from_status(status));
+                        if is_unavailable {
                             // if we were unavailable, just try again
                             continue;
                         } else {
@@ -198,10 +197,11 @@ impl<R> List<Client, R> {
                     // if there are more results, advance request.key to one past the end for the next query
                     let Some(last_kv) = resp.kvs.last() else {
                         // this should be unreachable, but a bad server implementation could land us here
-                        yield Err(ErrorInner::with_static_message(
-                            ErrorKind::Unknown,
-                            "`range` call has no results, but `more = true`...is something wrong with the server?"
-                        ).into());
+                        yield Err(ListError::new(
+                            ListErrorKind::InvalidResponse,
+                            "`range` call has no results, but `more = true`...is something wrong with the server?",
+                            None,
+                        ));
                         break;
                     };
                     request.key = crate::range::successor(&last_kv.key);
@@ -214,7 +214,7 @@ impl<R> List<Client, R> {
         }
     }
 
-    fn stream_results(self) -> impl Stream<Item = Result<mvccpb::KeyValue>> {
+    fn stream_results(self) -> impl Stream<Item = Result<mvccpb::KeyValue, ListError>> {
         let chunk_stream = self.stream_result_chunks();
         async_stream::stream! {
             for await chunk in chunk_stream {
@@ -250,13 +250,13 @@ impl List<Client, KeyWithMetadata> {
 }
 
 pub struct ListIterator<R> {
-    iter: Box<dyn Stream<Item = Result<mvccpb::KeyValue>>>,
+    iter: Box<dyn Stream<Item = Result<mvccpb::KeyValue, ListError>>>,
     convert: fn(mvccpb::KeyValue) -> R,
 }
 
 impl<R> ListIterator<R> {
     /// Underlying implementation of `poll_next` used by trait-specific implementations.
-    fn poll_next_impl(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Option<R>, crate::Error>> {
+    fn poll_next_impl(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Option<R>, ListError>> {
         let convert = self.as_ref().convert;
         let iter = unsafe { self.map_unchecked_mut(|s| s.iter.as_mut()) };
         iter.poll_next(cx).map(|item| match item {
@@ -268,7 +268,7 @@ impl<R> ListIterator<R> {
 }
 
 impl<R> futures_core::Stream for ListIterator<R> {
-    type Item = Result<R, crate::Error>;
+    type Item = Result<R, ListError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll_next_impl(cx).map(Result::transpose)
@@ -277,7 +277,7 @@ impl<R> futures_core::Stream for ListIterator<R> {
 
 #[cfg(feature = "nightly-async-iterator")]
 impl<R> std::async_iter::AsyncIterator for ListIterator<R> {
-    type Item = Result<R, crate::Error>;
+    type Item = Result<R, ListError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll_next_impl(cx).map(Result::transpose)
@@ -289,11 +289,11 @@ impl<C, R> std::async_iter::IntoAsyncIterator for List<C, R>
 where
     Self: fallible_async_iterator::IntoFallibleAsyncIterator<
         Item = R,
-        Error = crate::Error,
+        Error = ListError,
         IntoFallibleAsyncIter = ListIterator<R>,
     >,
 {
-    type Item = Result<R, crate::Error>;
+    type Item = Result<R, ListError>;
     type IntoAsyncIter = ListIterator<R>;
 
     fn into_async_iter(self) -> Self::IntoAsyncIter {
@@ -303,7 +303,7 @@ where
 }
 
 impl List<Client, usize> {
-    async fn call(self) -> Result<usize> {
+    async fn call(self) -> Result<usize, ListError> {
         self.client
             .inner
             .wrap_unary_call(
@@ -313,6 +313,7 @@ impl List<Client, usize> {
             )
             .await
             .map(|r| r.count as usize)
+            .map_err(ListError::from_status)
     }
 }
 
@@ -328,7 +329,7 @@ impl<T> Future for ListFuture<T> {
 }
 
 impl IntoFuture for List<Client, usize> {
-    type Output = Result<usize>;
+    type Output = Result<usize, ListError>;
     type IntoFuture = ListFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -336,9 +337,29 @@ impl IntoFuture for List<Client, usize> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ListErrorKind {
+    /// The server returned an invalid or unexpected response.
+    InvalidResponse,
+    /// A gRPC transport or unexpected error.
+    Transport,
+}
+
+define_op_error! {
+    /// An error from a [`list`][Client::list] operation.
+    pub struct ListError(ListErrorKind);
+}
+
+impl ListError {
+    pub(crate) fn from_status(status: tonic::Status) -> Self {
+        Self::new(ListErrorKind::Transport, "", Some(status))
+    }
+}
+
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _check() {
-        _assert_send::<ListFuture<Result<usize>>>();
+        _assert_send::<ListFuture<Result<usize, ListError>>>();
     }
 };

@@ -6,10 +6,9 @@ use std::{
 
 use crate::{
     client::record_from_pb,
-    error::ErrorInner,
     pb::etcdserverpb,
     record::{AsKey, Record},
-    Client, ErrorKind, Result,
+    Client,
 };
 
 impl Client {
@@ -61,7 +60,7 @@ impl<C> Get<C> {
 }
 
 impl Get<Client> {
-    async fn call(self) -> Result<Option<Record>> {
+    async fn call(self) -> Result<Option<Record>, GetError> {
         let resp = self
             .client
             .inner
@@ -70,9 +69,14 @@ impl Get<Client> {
                 async |c, r| c.range(r).await,
                 self.request,
             )
-            .await?;
+            .await
+            .map_err(GetError::from_status)?;
         if resp.more || resp.kvs.len() > 1 {
-            Err(ErrorInner::with_static_message(ErrorKind::TooMany, "call to get should have only 1 response").into())
+            Err(GetError::new(
+                GetErrorKind::TooMany,
+                "call to get should have only 1 response",
+                None,
+            ))
         } else if let Some(r) = resp.kvs.into_iter().next() {
             Ok(Some(record_from_pb(r)))
         } else {
@@ -82,10 +86,10 @@ impl Get<Client> {
 }
 
 /// The [`Future`] type returned by awaiting a [`get`][`Client::get`].
-pub struct GetFuture(Pin<Box<dyn Future<Output = Result<Option<Record>>> + Send>>);
+pub struct GetFuture(Pin<Box<dyn Future<Output = Result<Option<Record>, GetError>> + Send>>);
 
 impl Future for GetFuture {
-    type Output = Result<Option<Record>>;
+    type Output = Result<Option<Record>, GetError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.get_mut().0.as_mut().poll(cx)
@@ -93,11 +97,31 @@ impl Future for GetFuture {
 }
 
 impl IntoFuture for Get<Client> {
-    type Output = Result<Option<Record>>;
+    type Output = Result<Option<Record>, GetError>;
     type IntoFuture = GetFuture;
 
     fn into_future(self) -> Self::IntoFuture {
         GetFuture(Box::pin(self.call()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GetErrorKind {
+    /// Too many results were returned for a single-key get.
+    TooMany,
+    /// A gRPC transport or unexpected error.
+    Transport,
+}
+
+define_op_error! {
+    /// An error from a [`get`][Client::get] operation.
+    pub struct GetError(GetErrorKind);
+}
+
+impl GetError {
+    pub(crate) fn from_status(status: tonic::Status) -> Self {
+        Self::new(GetErrorKind::Transport, "", Some(status))
     }
 }
 

@@ -1,9 +1,8 @@
 use crate::{
-    error::{Error, ErrorInner, ErrorKind},
     record::{KeyWithMetadata, Metadata, Record},
-    LeaseId, Result, Revision, Version,
+    LeaseId, Revision, Version,
 };
-use std::{ops::AsyncFn, sync::Arc};
+use std::{fmt, ops::AsyncFn, sync::Arc};
 
 mod metrics;
 pub use metrics::{MetricsCollector, RequestCount, RequestCounter};
@@ -30,7 +29,7 @@ impl Client {
     /// ```
     ///
     /// A single URI is also accepted.
-    pub fn new(connection_string: &str) -> Result<Self> {
+    pub fn new(connection_string: &str) -> Result<Self, BuildError> {
         Self::builder().connection_string(connection_string)?.build()
     }
 }
@@ -47,13 +46,14 @@ enum Remote {
 #[derive(Default)]
 pub struct ClientBuilder {
     remotes: Vec<Remote>,
-    configure_endpoint: Option<Box<dyn Fn(tonic::transport::Endpoint) -> Result<tonic::transport::Endpoint>>>,
+    configure_endpoint:
+        Option<Box<dyn Fn(tonic::transport::Endpoint) -> Result<tonic::transport::Endpoint, Box<dyn std::error::Error + Send + Sync>>>>,
     metrics: Option<Box<dyn MetricsCollector>>,
 }
 
 impl ClientBuilder {
     /// Parse a comma-separated connection string and add all endpoints.
-    pub fn connection_string(mut self, connection_string: impl AsRef<str>) -> Result<Self> {
+    pub fn connection_string(mut self, connection_string: impl AsRef<str>) -> Result<Self, BuildError> {
         for host in connection_string.as_ref().split(',') {
             let host = host.trim();
             if !host.is_empty() {
@@ -64,11 +64,11 @@ impl ClientBuilder {
     }
 
     /// Add a single endpoint by URI.
-    pub fn add_connection(mut self, host: impl AsRef<str>) -> Result<Self> {
+    pub fn add_connection(mut self, host: impl AsRef<str>) -> Result<Self, BuildError> {
         let uri = host
             .as_ref()
             .parse::<tonic::transport::Uri>()
-            .map_err(|err| Error::new(ErrorKind::InvalidArgument, err.to_string()))?;
+            .map_err(|err| BuildError::InvalidUri(Box::new(err)))?;
         self.remotes.push(Remote::Unconfigured(uri));
         Ok(self)
     }
@@ -99,7 +99,7 @@ impl ClientBuilder {
     /// ```
     pub fn configure_endpoint(
         mut self,
-        f: impl Fn(tonic::transport::Endpoint) -> Result<tonic::transport::Endpoint> + 'static,
+        f: impl Fn(tonic::transport::Endpoint) -> Result<tonic::transport::Endpoint, Box<dyn std::error::Error + Send + Sync>> + 'static,
     ) -> Self {
         self.configure_endpoint = Some(Box::new(f));
         self
@@ -110,7 +110,7 @@ impl ClientBuilder {
         self
     }
 
-    pub fn build(self) -> Result<Client> {
+    pub fn build(self) -> Result<Client, BuildError> {
         let Self {
             remotes,
             configure_endpoint,
@@ -118,7 +118,7 @@ impl ClientBuilder {
         } = self;
 
         if remotes.is_empty() {
-            return Err(ErrorInner::with_static_message(ErrorKind::InvalidArgument, "no connection was added").into());
+            return Err(BuildError::NoEndpoints);
         }
 
         let endpoints = remotes
@@ -127,13 +127,13 @@ impl ClientBuilder {
                 Remote::Unconfigured(uri) => {
                     let ep = tonic::transport::Channel::builder(uri);
                     match &configure_endpoint {
-                        Some(f) => f(ep),
+                        Some(f) => f(ep).map_err(BuildError::EndpointConfiguration),
                         None => Ok(ep),
                     }
                 }
                 Remote::Preconfigured(ep) => Ok(ep),
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
 
         let channel = if endpoints.len() == 1 {
             endpoints.into_iter().next().unwrap().connect_lazy()
@@ -144,6 +144,45 @@ impl ClientBuilder {
         Ok(Client {
             inner: Arc::new(ClientInner { channel, metrics }),
         })
+    }
+}
+
+/// An error from building a [`Client`].
+pub enum BuildError {
+    /// An invalid URI was provided.
+    InvalidUri(Box<dyn std::error::Error + Send + Sync>),
+    /// No endpoints were configured before calling [`build`][ClientBuilder::build].
+    NoEndpoints,
+    /// The [`configure_endpoint`][ClientBuilder::configure_endpoint] callback returned an error.
+    EndpointConfiguration(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl fmt::Debug for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidUri(err) => f.debug_tuple("InvalidUri").field(err).finish(),
+            Self::NoEndpoints => f.debug_tuple("NoEndpoints").finish(),
+            Self::EndpointConfiguration(err) => f.debug_tuple("EndpointConfiguration").field(err).finish(),
+        }
+    }
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidUri(err) => write!(f, "invalid URI: {err}"),
+            Self::NoEndpoints => write!(f, "no endpoints were configured"),
+            Self::EndpointConfiguration(err) => write!(f, "endpoint configuration failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for BuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidUri(err) | Self::EndpointConfiguration(err) => Some(&**err),
+            Self::NoEndpoints => None,
+        }
     }
 }
 
@@ -177,24 +216,17 @@ fn is_client_side_timeout(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::Cancelled && status.message() == "Timeout expired"
 }
 
-pub(crate) fn error_from_status(status: tonic::Status) -> Error {
-    use tonic::Code;
-    match status.code() {
-        Code::Unavailable => Error::new(ErrorKind::Unavailable, status.message()),
-        Code::InvalidArgument => Error::new(ErrorKind::InvalidArgument, status.message()),
-        Code::FailedPrecondition => Error::new(ErrorKind::FailedPrecondition, status.message()),
-        Code::NotFound => Error::new(ErrorKind::NotFound, status.message()),
-        _ => ErrorInner::from_unknown(status).into(),
-    }
-}
-
 impl ClientInner {
+    /// Execute a unary gRPC call with retry and timeout logic.
+    ///
+    /// Returns `Ok(response)` on success or `Err(tonic::Status)` on failure. Callers convert the
+    /// status into their operation-specific error type via `map_err`.
     async fn wrap_unary_call<R, GrpcClient, Request>(
         &self,
         create_client: impl Fn(tonic::transport::Channel) -> GrpcClient,
         call: impl AsyncFn(&mut GrpcClient, tonic::Request<Request>) -> Result<tonic::Response<R>, tonic::Status>,
         request: Request,
-    ) -> Result<R, Error>
+    ) -> Result<R, tonic::Status>
     where
         Request: Clone,
     {
@@ -215,7 +247,7 @@ impl ClientInner {
                     if Self::can_retry(&e) && std::time::Instant::now() <= deadline {
                         continue;
                     }
-                    return Err(error_from_status(e));
+                    return Err(e);
                 }
             }
         }

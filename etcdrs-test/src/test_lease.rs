@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use etcdrs::{Client, ErrorKind};
+use etcdrs::{Client, GrantLeaseErrorKind, RevokeLeaseErrorKind};
 use rstest::rstest;
 
 use crate::{tests::etcd_cluster, EtcdCluster};
@@ -21,7 +21,7 @@ async fn leases(etcd_cluster: EtcdCluster) {
         .lease_id(lease_info.lease_id)
         .await
         .expect_err("trying to use the same lease ID");
-    assert_eq!(retry_err.kind(), ErrorKind::FailedPrecondition);
+    assert_eq!(retry_err.kind(), GrantLeaseErrorKind::LeaseExists);
 
     client.put("foo").value("bar").lease(lease_info.lease_id).await.unwrap();
 
@@ -36,5 +36,5 @@ async fn leases(etcd_cluster: EtcdCluster) {
     }
 
     let revoke_err = client.revoke_lease(lease_info.lease_id).await.unwrap_err();
-    assert_eq!(revoke_err.kind(), ErrorKind::NotFound, "{revoke_err:?}");
+    assert_eq!(revoke_err.kind(), RevokeLeaseErrorKind::NotFound, "{revoke_err:?}");
 }

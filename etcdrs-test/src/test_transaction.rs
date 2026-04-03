@@ -1,6 +1,6 @@
 use etcdrs::{
     client::{Delete, Get, List, Put, TransactionCheck, TransactionOpResponse},
-    ErrorKind,
+    TransactionErrorKind,
 };
 use rstest::rstest;
 
@@ -74,5 +74,5 @@ async fn duplicate_key(etcd_cluster: EtcdCluster) {
         .commit()
         .await
         .unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+    assert_eq!(error.kind(), TransactionErrorKind::InvalidArgument);
 }

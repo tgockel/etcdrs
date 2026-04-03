@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{pb::etcdserverpb, Client, LeaseId, Result};
+use crate::{pb::etcdserverpb, Client, LeaseId};
 
 impl Client {
     /// Create a lease used to create ephemeral records.
@@ -38,12 +38,7 @@ impl Client {
     }
 
     /// Revoke an existing lease.
-    ///
-    /// ## TODO: Should this return a `bool`?
-    /// Calling this function on a `lease_id` that does not exist results in a `NotFound` error. This stands in contrast
-    /// to calling [`delete`][Self::delete] with a key that does not exist, which returns `Ok(false)`. The context of
-    /// calling delete vs revoke is a little bit different, so maybe their results should be different.
-    pub async fn revoke_lease(&self, lease_id: LeaseId) -> Result<()> {
+    pub async fn revoke_lease(&self, lease_id: LeaseId) -> Result<(), RevokeLeaseError> {
         self.inner
             .wrap_unary_call(
                 etcdserverpb::lease_client::LeaseClient::new,
@@ -52,6 +47,7 @@ impl Client {
             )
             .await
             .map(|_| ())
+            .map_err(RevokeLeaseError::from_status)
     }
 }
 
@@ -113,7 +109,7 @@ impl<C> GrantLease<C> {
 }
 
 impl GrantLease<Client> {
-    async fn call(self) -> Result<LeaseInfo> {
+    async fn call(self) -> Result<LeaseInfo, GrantLeaseError> {
         let resp = self
             .client
             .inner
@@ -122,9 +118,17 @@ impl GrantLease<Client> {
                 async |c, r| c.lease_grant(r).await,
                 self.request,
             )
-            .await?;
+            .await
+            .map_err(GrantLeaseError::from_status)?;
 
-        assert!(resp.error.is_empty(), "error == {:?}", resp.error);
+        if !resp.error.is_empty() {
+            return Err(GrantLeaseError::new(
+                GrantLeaseErrorKind::LeaseExists,
+                resp.error,
+                None,
+            ));
+        }
+
         let lease_id = LeaseId::new(resp.id).expect("etcd server should have returned a lease");
         let ttl = Duration::from_secs(resp.ttl as _);
 
@@ -133,10 +137,10 @@ impl GrantLease<Client> {
 }
 
 /// The [`Future`] type returned by awaiting a [`grant_lease`][`Client::grant_lease`].
-pub struct GrantLeaseFuture(Pin<Box<dyn Future<Output = Result<LeaseInfo>> + Send>>);
+pub struct GrantLeaseFuture(Pin<Box<dyn Future<Output = Result<LeaseInfo, GrantLeaseError>> + Send>>);
 
 impl Future for GrantLeaseFuture {
-    type Output = Result<LeaseInfo>;
+    type Output = Result<LeaseInfo, GrantLeaseError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.get_mut().0.as_mut().poll(cx)
@@ -144,11 +148,59 @@ impl Future for GrantLeaseFuture {
 }
 
 impl IntoFuture for GrantLease<Client> {
-    type Output = Result<LeaseInfo>;
+    type Output = Result<LeaseInfo, GrantLeaseError>;
     type IntoFuture = GrantLeaseFuture;
 
     fn into_future(self) -> Self::IntoFuture {
         GrantLeaseFuture(Box::pin(self.call()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GrantLeaseErrorKind {
+    /// The requested lease ID already exists.
+    LeaseExists,
+    /// A gRPC transport or unexpected error.
+    Transport,
+}
+
+define_op_error! {
+    /// An error from a [`grant_lease`][Client::grant_lease] operation.
+    pub struct GrantLeaseError(GrantLeaseErrorKind);
+}
+
+impl GrantLeaseError {
+    pub(crate) fn from_status(status: tonic::Status) -> Self {
+        let kind = match status.code() {
+            tonic::Code::FailedPrecondition => GrantLeaseErrorKind::LeaseExists,
+            _ => GrantLeaseErrorKind::Transport,
+        };
+        Self::new(kind, "", Some(status))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RevokeLeaseErrorKind {
+    /// The lease was not found.
+    NotFound,
+    /// A gRPC transport or unexpected error.
+    Transport,
+}
+
+define_op_error! {
+    /// An error from a [`revoke_lease`][Client::revoke_lease] operation.
+    pub struct RevokeLeaseError(RevokeLeaseErrorKind);
+}
+
+impl RevokeLeaseError {
+    pub(crate) fn from_status(status: tonic::Status) -> Self {
+        let kind = match status.code() {
+            tonic::Code::NotFound => RevokeLeaseErrorKind::NotFound,
+            _ => RevokeLeaseErrorKind::Transport,
+        };
+        Self::new(kind, "", Some(status))
     }
 }
 

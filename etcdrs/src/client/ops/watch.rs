@@ -1,4 +1,7 @@
 use std::{
+    backtrace::Backtrace,
+    borrow::Cow,
+    fmt,
     num::NonZeroI64,
     ops::{Deref, DerefMut},
     pin::Pin,
@@ -12,8 +15,7 @@ use std::{
 use futures_core::Stream;
 
 use crate::{
-    client::{error_from_status, record_from_pb, Client},
-    error::{ErrorInner, ErrorKind},
+    client::{record_from_pb, Client},
     pb::{
         etcdserverpb::{
             self, watch_create_request::FilterType as PbFilterType, watch_request::RequestUnion as PbRequestUnion,
@@ -21,7 +23,7 @@ use crate::{
         mvccpb::{self, event::EventType as PbEventType},
     },
     record::{AsKey, KeyWithMetadata, Metadata, Record},
-    AsRange, LeaseId, Prefix, Result, Revision, Version,
+    AsRange, LeaseId, Prefix, Revision, Version,
 };
 
 impl Client {
@@ -402,7 +404,7 @@ impl WatchBuilder<Client> {
                         continue;
                     }
                     Err(status) => {
-                        yield Err(error_from_status(status));
+                        yield Err(WatchError::from_status(status));
                         return;
                     }
                 }
@@ -420,7 +422,7 @@ impl WatchBuilder<Client> {
                     }
                     Ok(None) => break,
                     Err(status) => {
-                        yield Err(error_from_status(status));
+                        yield Err(WatchError::from_status(status));
                         break;
                     }
                 }
@@ -517,7 +519,7 @@ impl Watcher {
     /// This sends a cancellation request to the server. Because the server processes requests
     /// asynchronously, events for this watch may still arrive after `cancel` returns -- these are
     /// events that were already in-flight before the server processed the cancellation. The stream
-    /// will eventually yield an error with [`ErrorKind::Canceled`] for this watch, confirming the
+    /// will eventually yield an error with [`WatchErrorKind::Canceled`] for this watch, confirming the
     /// cancellation. Other watches on this watcher are unaffected.
     pub fn cancel(&self, watch_id: WatchId) {
         self.sender.cancel(watch_id);
@@ -548,7 +550,7 @@ impl DerefMut for Watcher {
 }
 
 impl Stream for Watcher {
-    type Item = Result<WatchEvent>;
+    type Item = Result<WatchEvent, WatchError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.stream).poll_next(cx)
@@ -557,7 +559,7 @@ impl Stream for Watcher {
 
 #[cfg(feature = "nightly-async-iterator")]
 impl std::async_iter::AsyncIterator for Watcher {
-    type Item = Result<WatchEvent>;
+    type Item = Result<WatchEvent, WatchError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.stream).poll_next(cx)
@@ -620,11 +622,11 @@ impl WatchSender {
 /// Obtained via [`Watcher::into_parts`]. Implements [`Stream`] — use
 /// [`StreamExt::next`][futures_core::Stream] or `for await` to consume events.
 pub struct WatchStream {
-    inner: Box<dyn Stream<Item = Result<WatchEvent>>>,
+    inner: Box<dyn Stream<Item = Result<WatchEvent, WatchError>>>,
 }
 
 impl WatchStream {
-    fn poll_next_impl(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Option<WatchEvent>>> {
+    fn poll_next_impl(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Option<WatchEvent>, WatchError>> {
         let inner = unsafe { self.map_unchecked_mut(|s| s.inner.as_mut()) };
         inner.poll_next(cx).map(|item| match item {
             None => Ok(None),
@@ -635,7 +637,7 @@ impl WatchStream {
 }
 
 impl Stream for WatchStream {
-    type Item = Result<WatchEvent>;
+    type Item = Result<WatchEvent, WatchError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll_next_impl(cx).map(Result::transpose)
@@ -644,7 +646,7 @@ impl Stream for WatchStream {
 
 #[cfg(feature = "nightly-async-iterator")]
 impl std::async_iter::AsyncIterator for WatchStream {
-    type Item = Result<WatchEvent>;
+    type Item = Result<WatchEvent, WatchError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll_next_impl(cx).map(Result::transpose)
@@ -661,6 +663,166 @@ impl Stream for ReceiverStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.inner.poll_recv(cx)
+    }
+}
+
+/// What went wrong with a watch operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WatchErrorKind {
+    /// The watch was compacted — the requested revision is older than the server's compacted
+    /// revision.
+    Compacted,
+    /// The watch was canceled.
+    Canceled,
+    /// The server returned an invalid or unexpected response.
+    InvalidResponse,
+    /// A gRPC transport or unexpected error.
+    Transport,
+}
+
+/// An error from a watch operation.
+pub struct WatchError(Box<WatchErrorRepr>);
+
+struct WatchErrorRepr {
+    kind: WatchErrorKind,
+    watch_id: Option<WatchId>,
+    compact_revision: Option<i64>,
+    message: Cow<'static, str>,
+    status: Option<tonic::Status>,
+    backtrace: Backtrace,
+}
+
+impl WatchError {
+    /// The operation-specific error kind.
+    pub fn kind(&self) -> WatchErrorKind {
+        self.0.kind
+    }
+
+    /// The watch ID associated with this error, if applicable.
+    pub fn watch_id(&self) -> Option<WatchId> {
+        self.0.watch_id
+    }
+
+    /// The compact revision, if this is a [`WatchErrorKind::Compacted`] error.
+    pub fn compact_revision(&self) -> Option<i64> {
+        self.0.compact_revision
+    }
+
+    /// The cancellation reason, if this is a [`WatchErrorKind::Canceled`] error.
+    pub fn cancel_reason(&self) -> Option<&str> {
+        if self.0.kind == WatchErrorKind::Canceled {
+            Some(&self.0.message)
+        } else {
+            None
+        }
+    }
+
+    /// The original gRPC status, if this error originated from a gRPC call.
+    pub fn grpc_status(&self) -> Option<&tonic::Status> {
+        self.0.status.as_ref()
+    }
+
+    /// Take ownership of the original gRPC status, if present.
+    pub fn take_grpc_status(self) -> Option<tonic::Status> {
+        self.0.status
+    }
+
+    /// The backtrace captured when this error was created.
+    pub fn backtrace(&self) -> &Backtrace {
+        &self.0.backtrace
+    }
+
+    pub(crate) fn from_status(status: tonic::Status) -> Self {
+        Self(Box::new(WatchErrorRepr {
+            kind: WatchErrorKind::Transport,
+            watch_id: None,
+            compact_revision: None,
+            message: Cow::Borrowed(""),
+            status: Some(status),
+            backtrace: Backtrace::capture(),
+        }))
+    }
+
+    fn compacted(watch_id: i64, compact_revision: i64) -> Self {
+        Self(Box::new(WatchErrorRepr {
+            kind: WatchErrorKind::Compacted,
+            watch_id: WatchId::new(watch_id),
+            compact_revision: Some(compact_revision),
+            message: Cow::Owned(format!("watch {watch_id} compacted at revision {compact_revision}")),
+            status: None,
+            backtrace: Backtrace::capture(),
+        }))
+    }
+
+    fn canceled(watch_id: i64, reason: String) -> Self {
+        Self(Box::new(WatchErrorRepr {
+            kind: WatchErrorKind::Canceled,
+            watch_id: WatchId::new(watch_id),
+            compact_revision: None,
+            message: if reason.is_empty() {
+                Cow::Borrowed("canceled")
+            } else {
+                Cow::Owned(reason)
+            },
+            status: None,
+            backtrace: Backtrace::capture(),
+        }))
+    }
+
+    fn invalid_response(message: &'static str) -> Self {
+        Self(Box::new(WatchErrorRepr {
+            kind: WatchErrorKind::InvalidResponse,
+            watch_id: None,
+            compact_revision: None,
+            message: Cow::Borrowed(message),
+            status: None,
+            backtrace: Backtrace::capture(),
+        }))
+    }
+}
+
+impl WatchError {
+    fn display_message(&self) -> &str {
+        if !self.0.message.is_empty() {
+            &self.0.message
+        } else if let Some(status) = &self.0.status {
+            status.message()
+        } else {
+            ""
+        }
+    }
+}
+
+impl fmt::Debug for WatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WatchError")
+            .field("kind", &self.0.kind)
+            .field("message", &self.display_message())
+            .field("watch_id", &self.0.watch_id)
+            .finish()
+    }
+}
+
+impl fmt::Display for WatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}: {}", self.0.kind, self.display_message())
+    }
+}
+
+impl std::error::Error for WatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.status.as_ref().map(|s| s as _)
+    }
+}
+
+impl crate::error::OperationError for WatchError {
+    fn grpc_status(&self) -> Option<&tonic::Status> {
+        self.0.status.as_ref()
+    }
+
+    fn backtrace(&self) -> &Backtrace {
+        &self.0.backtrace
     }
 }
 
@@ -689,20 +851,12 @@ fn watch_record_from_pb(kv: mvccpb::KeyValue) -> Record {
 }
 
 /// Convert a [`WatchResponse`] into an iterator of stream items.
-fn convert_response(resp: etcdserverpb::WatchResponse) -> Vec<Result<WatchEvent>> {
+fn convert_response(resp: etcdserverpb::WatchResponse) -> Vec<Result<WatchEvent, WatchError>> {
     if resp.canceled {
         let err = if resp.compact_revision != 0 {
-            crate::Error::new(
-                ErrorKind::FailedPrecondition,
-                format!(
-                    "watch {} compacted at revision {}",
-                    resp.watch_id, resp.compact_revision,
-                ),
-            )
-        } else if !resp.cancel_reason.is_empty() {
-            crate::Error::new(ErrorKind::Canceled, resp.cancel_reason)
+            WatchError::compacted(resp.watch_id, resp.compact_revision)
         } else {
-            ErrorKind::Canceled.into()
+            WatchError::canceled(resp.watch_id, resp.cancel_reason)
         };
         return vec![Err(err)];
     }
@@ -724,11 +878,9 @@ fn convert_response(resp: etcdserverpb::WatchResponse) -> Vec<Result<WatchEvent>
     resp.events
         .into_iter()
         .map(|event| {
-            let kv = event.kv.ok_or_else(|| {
-                let inner: crate::Error =
-                    ErrorInner::with_static_message(ErrorKind::Unknown, "watch event missing kv field").into();
-                inner
-            })?;
+            let kv = event
+                .kv
+                .ok_or_else(|| WatchError::invalid_response("watch event missing kv field"))?;
 
             let prev_record = event.prev_kv.map(record_from_pb);
 

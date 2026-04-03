@@ -9,7 +9,7 @@ use crate::{
     client::record_from_pb,
     pb::etcdserverpb,
     record::{AsKey, AsValue, Record},
-    Client, LeaseId, Result,
+    Client, LeaseId,
 };
 
 impl Client {
@@ -103,7 +103,7 @@ impl<C, R> Put<C, R> {
 }
 
 impl<R> Put<Client, R> {
-    async fn call(self) -> Result<Option<Record>> {
+    async fn call(self) -> Result<Option<Record>, PutError> {
         let resp = self
             .client
             .inner
@@ -112,7 +112,8 @@ impl<R> Put<Client, R> {
                 async |c, r| c.put(r).await,
                 self.request,
             )
-            .await?;
+            .await
+            .map_err(PutError::from_status)?;
         Ok(resp.prev_kv.map(record_from_pb))
     }
 }
@@ -129,7 +130,7 @@ impl<T> Future for PutFuture<T> {
 }
 
 impl IntoFuture for Put<Client, GetPreviousValue> {
-    type Output = Result<Option<Record>>;
+    type Output = Result<Option<Record>, PutError>;
     type IntoFuture = PutFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -138,7 +139,7 @@ impl IntoFuture for Put<Client, GetPreviousValue> {
 }
 
 impl IntoFuture for Put<Client, ()> {
-    type Output = Result<()>;
+    type Output = Result<(), PutError>;
     type IntoFuture = PutFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -146,13 +147,37 @@ impl IntoFuture for Put<Client, ()> {
     }
 }
 
+/// Used in [`Put`]s to denote that the previous value should be returned.
+pub struct GetPreviousValue;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PutErrorKind {
+    /// The arguments were invalid.
+    InvalidArgument,
+    /// A gRPC transport or unexpected error.
+    Transport,
+}
+
+define_op_error! {
+    /// An error from a [`put`][Client::put] operation.
+    pub struct PutError(PutErrorKind);
+}
+
+impl PutError {
+    pub(crate) fn from_status(status: tonic::Status) -> Self {
+        let kind = match status.code() {
+            tonic::Code::InvalidArgument => PutErrorKind::InvalidArgument,
+            _ => PutErrorKind::Transport,
+        };
+        Self::new(kind, "", Some(status))
+    }
+}
+
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _check() {
-        _assert_send::<PutFuture<Result<()>>>();
-        _assert_send::<PutFuture<Result<Option<Record>>>>();
+        _assert_send::<PutFuture<Result<(), PutError>>>();
+        _assert_send::<PutFuture<Result<Option<Record>, PutError>>>();
     }
 };
-
-/// Used in [`Put`]s to denote that the previous value should be returned.
-pub struct GetPreviousValue;
