@@ -1,10 +1,9 @@
 use std::time::Duration;
 
 use etcdrs::client::{Watch, WatchEvent};
+use etcdrs_test::{EtcdServer, etcd_server};
 use futures::StreamExt;
 use rstest::rstest;
-
-use crate::{EtcdServer, tests::etcd_server};
 
 /// Helper: collect the next `n` events from a watcher, with a timeout.
 async fn next_events(watcher: &mut etcdrs::client::Watcher, n: usize) -> Vec<WatchEvent> {

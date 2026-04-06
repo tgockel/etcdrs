@@ -2,9 +2,8 @@ use etcdrs::{
     TransactionErrorKind,
     client::{Delete, Get, List, Put, TransactionCheck, TransactionOpResponse},
 };
+use etcdrs_test::{EtcdCluster, etcd_cluster};
 use rstest::rstest;
-
-use crate::{EtcdCluster, tests::etcd_cluster};
 
 #[rstest]
 #[tokio::test]
