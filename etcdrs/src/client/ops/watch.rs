@@ -23,7 +23,7 @@ use crate::{
         mvccpb::{self, event::EventType as PbEventType},
     },
     record::{AsKey, KeyWithMetadata, Metadata, Record},
-    AsRange, LeaseId, Prefix, Revision, Version,
+    AsRange, LeaseId, Prefix, ResponseHeader, Revision, Version,
 };
 
 impl Client {
@@ -107,6 +107,7 @@ impl WatchId {
 pub enum WatchEvent {
     /// A key was created or updated.
     Put {
+        header: ResponseHeader,
         watch_id: WatchId,
         record: Record,
         prev_record: Option<Record>,
@@ -115,6 +116,7 @@ pub enum WatchEvent {
     },
     /// A key was deleted.
     Delete {
+        header: ResponseHeader,
         watch_id: WatchId,
         key: KeyWithMetadata,
         prev_record: Option<Record>,
@@ -125,6 +127,7 @@ pub enum WatchEvent {
     /// [`Watcher::request_progress`] call, or `Some` for per-watch progress notifications enabled
     /// via [`Watch::progress_notify`].
     Progress {
+        header: ResponseHeader,
         watch_id: Option<WatchId>,
         revision: Revision,
     },
@@ -861,19 +864,21 @@ fn convert_response(resp: etcdserverpb::WatchResponse) -> Vec<Result<WatchEvent,
         return vec![Err(err)];
     }
 
+    let header = resp.header.map(ResponseHeader::from_pb);
+
     // Progress notification: no events, not created, not canceled.
     if resp.events.is_empty() {
-        if let Some(header) = &resp.header {
-            if let Some(revision) = Revision::new(header.revision) {
-                return vec![Ok(WatchEvent::Progress {
-                    watch_id: WatchId::new(resp.watch_id),
-                    revision,
-                })];
-            }
+        if let Some(header) = header {
+            return vec![Ok(WatchEvent::Progress {
+                revision: header.revision(),
+                header,
+                watch_id: WatchId::new(resp.watch_id),
+            })];
         }
         return vec![];
     }
 
+    let header = header.expect("WatchResponse with events should have a valid header");
     let watch_id = WatchId::new(resp.watch_id).expect("server returned watch_id 0");
     resp.events
         .into_iter()
@@ -887,6 +892,7 @@ fn convert_response(resp: etcdserverpb::WatchResponse) -> Vec<Result<WatchEvent,
             if event.r#type == PbEventType::Delete as i32 {
                 let metadata = watch_metadata_from_pb(&kv);
                 Ok(WatchEvent::Delete {
+                    header,
                     watch_id,
                     key: KeyWithMetadata::new(kv.key, metadata),
                     prev_record,
@@ -895,6 +901,7 @@ fn convert_response(resp: etcdserverpb::WatchResponse) -> Vec<Result<WatchEvent,
                 let created = kv.create_revision == kv.mod_revision;
                 let record = watch_record_from_pb(kv);
                 Ok(WatchEvent::Put {
+                    header,
                     watch_id,
                     record,
                     prev_record,

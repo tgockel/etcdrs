@@ -1,11 +1,12 @@
 use std::{
     future::{Future, IntoFuture},
+    ops::Deref,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
 };
 
-use crate::{pb::etcdserverpb, Client, LeaseId};
+use crate::{pb::etcdserverpb, Client, LeaseId, ResponseHeader};
 
 impl Client {
     /// Create a lease used to create ephemeral records.
@@ -38,16 +39,18 @@ impl Client {
     }
 
     /// Revoke an existing lease.
-    pub async fn revoke_lease(&self, lease_id: LeaseId) -> Result<(), RevokeLeaseError> {
-        self.inner
+    pub async fn revoke_lease(&self, lease_id: LeaseId) -> Result<RevokeLeaseResponse, RevokeLeaseError> {
+        let resp = self
+            .inner
             .wrap_unary_call(
                 etcdserverpb::lease_client::LeaseClient::new,
                 async |c, r| c.lease_revoke(r).await,
                 etcdserverpb::LeaseRevokeRequest { id: lease_id.get() },
             )
             .await
-            .map(|_| ())
-            .map_err(RevokeLeaseError::from_status)
+            .map_err(RevokeLeaseError::from_status)?;
+        let header = ResponseHeader::from_pb(resp.header.expect("LeaseRevokeResponse should have a valid header"));
+        Ok(RevokeLeaseResponse { header })
     }
 }
 
@@ -109,7 +112,7 @@ impl<C> GrantLease<C> {
 }
 
 impl GrantLease<Client> {
-    async fn call(self) -> Result<LeaseInfo, GrantLeaseError> {
+    async fn call(self) -> Result<GrantLeaseResponse, GrantLeaseError> {
         let resp = self
             .client
             .inner
@@ -129,18 +132,67 @@ impl GrantLease<Client> {
             ));
         }
 
+        let header = ResponseHeader::from_pb(resp.header.expect("LeaseGrantResponse should have a valid header"));
         let lease_id = LeaseId::new(resp.id).expect("etcd server should have returned a lease");
         let ttl = Duration::from_secs(resp.ttl as _);
 
-        Ok(LeaseInfo { lease_id, ttl })
+        Ok(GrantLeaseResponse {
+            header,
+            info: LeaseInfo { lease_id, ttl },
+        })
+    }
+}
+
+/// The response from a [`grant_lease`][Client::grant_lease] operation.
+#[derive(Clone, Copy, Debug)]
+pub struct GrantLeaseResponse {
+    header: ResponseHeader,
+    info: LeaseInfo,
+}
+
+impl GrantLeaseResponse {
+    /// The response header containing cluster metadata and the store revision.
+    pub fn header(&self) -> &ResponseHeader {
+        &self.header
+    }
+
+    /// The lease information, including the assigned ID and granted TTL.
+    pub fn info(&self) -> &LeaseInfo {
+        &self.info
+    }
+
+    /// Consume the response and return the [`LeaseInfo`].
+    pub fn into_info(self) -> LeaseInfo {
+        self.info
+    }
+}
+
+impl Deref for GrantLeaseResponse {
+    type Target = LeaseInfo;
+
+    fn deref(&self) -> &LeaseInfo {
+        &self.info
+    }
+}
+
+/// The response from a [`revoke_lease`][Client::revoke_lease] operation.
+#[derive(Clone, Copy, Debug)]
+pub struct RevokeLeaseResponse {
+    header: ResponseHeader,
+}
+
+impl RevokeLeaseResponse {
+    /// The response header containing cluster metadata and the store revision.
+    pub fn header(&self) -> &ResponseHeader {
+        &self.header
     }
 }
 
 /// The [`Future`] type returned by awaiting a [`grant_lease`][`Client::grant_lease`].
-pub struct GrantLeaseFuture(Pin<Box<dyn Future<Output = Result<LeaseInfo, GrantLeaseError>> + Send>>);
+pub struct GrantLeaseFuture(Pin<Box<dyn Future<Output = Result<GrantLeaseResponse, GrantLeaseError>> + Send>>);
 
 impl Future for GrantLeaseFuture {
-    type Output = Result<LeaseInfo, GrantLeaseError>;
+    type Output = Result<GrantLeaseResponse, GrantLeaseError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.get_mut().0.as_mut().poll(cx)
@@ -148,7 +200,7 @@ impl Future for GrantLeaseFuture {
 }
 
 impl IntoFuture for GrantLease<Client> {
-    type Output = Result<LeaseInfo, GrantLeaseError>;
+    type Output = Result<GrantLeaseResponse, GrantLeaseError>;
     type IntoFuture = GrantLeaseFuture;
 
     fn into_future(self) -> Self::IntoFuture {

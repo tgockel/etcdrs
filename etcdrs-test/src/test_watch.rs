@@ -22,7 +22,7 @@ async fn next_events(watcher: &mut etcdrs::client::Watcher, n: usize) -> Vec<Wat
 
 /// Helper: get the modified_revision of a key.
 async fn revision_of(client: &etcdrs::Client, key: &str) -> etcdrs::Revision {
-    client.get(key).await.unwrap().unwrap().metadata().modified_revision
+    client.get(key).await.unwrap().into_record().unwrap().metadata().modified_revision
 }
 
 #[rstest]

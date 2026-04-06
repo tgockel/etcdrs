@@ -9,7 +9,7 @@ use crate::{
     client::{record_from_pb, GetPreviousValue},
     pb::etcdserverpb,
     record::{AsKey, Record},
-    AsRange, Client, Prefix,
+    AsRange, Client, Prefix, ResponseHeader,
 };
 
 impl Client {
@@ -151,8 +151,9 @@ impl<C, R, P> Delete<C, R, P> {
 }
 
 impl<R, P> Delete<Client, R, P> {
-    async fn call(self) -> Result<etcdserverpb::DeleteRangeResponse, DeleteError> {
-        self.client
+    async fn call(self) -> Result<(ResponseHeader, etcdserverpb::DeleteRangeResponse), DeleteError> {
+        let resp = self
+            .client
             .inner
             .wrap_unary_call(
                 etcdserverpb::kv_client::KvClient::new,
@@ -160,7 +161,64 @@ impl<R, P> Delete<Client, R, P> {
                 self.request,
             )
             .await
-            .map_err(DeleteError::from_status)
+            .map_err(DeleteError::from_status)?;
+        let header = ResponseHeader::from_pb(resp.header.expect("DeleteRangeResponse should have a valid header"));
+        Ok((header, resp))
+    }
+}
+
+/// The response from a [`delete`][Client::delete] or [`delete_range`][Client::delete_range]
+/// operation.
+#[derive(Clone, Debug)]
+pub struct DeleteResponse<R, P = ()> {
+    header: ResponseHeader,
+    deleted: usize,
+    previous: Vec<Record>,
+    _marker: PhantomData<fn() -> (R, P)>,
+}
+
+impl<R, P> DeleteResponse<R, P> {
+    /// The response header containing cluster metadata and the store revision.
+    pub fn header(&self) -> &ResponseHeader {
+        &self.header
+    }
+}
+
+impl<P> DeleteResponse<bool, P> {
+    /// Returns `true` if the key was deleted, `false` if it did not exist.
+    pub fn deleted(&self) -> bool {
+        self.deleted > 0
+    }
+}
+
+impl<P> DeleteResponse<usize, P> {
+    /// The number of keys that were deleted.
+    pub fn deleted(&self) -> usize {
+        self.deleted
+    }
+}
+
+impl DeleteResponse<bool, Record> {
+    /// The previous value of the key, or `None` if it did not exist.
+    pub fn previous(&self) -> Option<&Record> {
+        self.previous.first()
+    }
+
+    /// Consume the response and return the previous value.
+    pub fn into_previous(self) -> Option<Record> {
+        self.previous.into_iter().next()
+    }
+}
+
+impl DeleteResponse<usize, Record> {
+    /// The previous values of the deleted keys.
+    pub fn previous(&self) -> &[Record] {
+        &self.previous
+    }
+
+    /// Consume the response and return the previous values.
+    pub fn into_previous(self) -> Vec<Record> {
+        self.previous
     }
 }
 
@@ -177,41 +235,59 @@ impl<T> Future for DeleteFuture<T> {
 }
 
 impl IntoFuture for Delete<Client, bool, ()> {
-    type Output = Result<bool, DeleteError>;
-    type IntoFuture = DeleteFuture<Self::Output>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        DeleteFuture(Box::pin(async move { self.call().await.map(|r| r.deleted > 0) }))
-    }
-}
-
-impl IntoFuture for Delete<Client, bool, GetPreviousValue> {
-    type Output = Result<Option<Record>, DeleteError>;
+    type Output = Result<DeleteResponse<bool>, DeleteError>;
     type IntoFuture = DeleteFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         DeleteFuture(Box::pin(async move {
-            self.call().await.map(|r| r.prev_kvs.into_iter().next().map(record_from_pb))
+            let (header, resp) = self.call().await?;
+            Ok(DeleteResponse { header, deleted: resp.deleted as usize, previous: Vec::new(), _marker: PhantomData })
+        }))
+    }
+}
+
+impl IntoFuture for Delete<Client, bool, GetPreviousValue> {
+    type Output = Result<DeleteResponse<bool, Record>, DeleteError>;
+    type IntoFuture = DeleteFuture<Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        DeleteFuture(Box::pin(async move {
+            let (header, resp) = self.call().await?;
+            Ok(DeleteResponse {
+                header,
+                deleted: resp.deleted as usize,
+                previous: resp.prev_kvs.into_iter().map(record_from_pb).collect(),
+                _marker: PhantomData,
+            })
         }))
     }
 }
 
 impl IntoFuture for Delete<Client, usize, ()> {
-    type Output = Result<usize, DeleteError>;
-    type IntoFuture = DeleteFuture<Self::Output>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        DeleteFuture(Box::pin(async move { self.call().await.map(|r| r.deleted as usize) }))
-    }
-}
-
-impl IntoFuture for Delete<Client, usize, GetPreviousValue> {
-    type Output = Result<Vec<Record>, DeleteError>;
+    type Output = Result<DeleteResponse<usize>, DeleteError>;
     type IntoFuture = DeleteFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         DeleteFuture(Box::pin(async move {
-            self.call().await.map(|r| r.prev_kvs.into_iter().map(record_from_pb).collect())
+            let (header, resp) = self.call().await?;
+            Ok(DeleteResponse { header, deleted: resp.deleted as usize, previous: Vec::new(), _marker: PhantomData })
+        }))
+    }
+}
+
+impl IntoFuture for Delete<Client, usize, GetPreviousValue> {
+    type Output = Result<DeleteResponse<usize, Record>, DeleteError>;
+    type IntoFuture = DeleteFuture<Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        DeleteFuture(Box::pin(async move {
+            let (header, resp) = self.call().await?;
+            Ok(DeleteResponse {
+                header,
+                deleted: resp.deleted as usize,
+                previous: resp.prev_kvs.into_iter().map(record_from_pb).collect(),
+                _marker: PhantomData,
+            })
         }))
     }
 }
@@ -237,9 +313,9 @@ impl DeleteError {
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _check() {
-        _assert_send::<DeleteFuture<Result<bool, DeleteError>>>();
-        _assert_send::<DeleteFuture<Result<Option<Record>, DeleteError>>>();
-        _assert_send::<DeleteFuture<Result<usize, DeleteError>>>();
-        _assert_send::<DeleteFuture<Result<Vec<Record>, DeleteError>>>();
+        _assert_send::<DeleteFuture<Result<DeleteResponse<bool>, DeleteError>>>();
+        _assert_send::<DeleteFuture<Result<DeleteResponse<bool, Record>, DeleteError>>>();
+        _assert_send::<DeleteFuture<Result<DeleteResponse<usize>, DeleteError>>>();
+        _assert_send::<DeleteFuture<Result<DeleteResponse<usize, Record>, DeleteError>>>();
     }
 };

@@ -25,10 +25,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn get_put_get(etcd_cluster: EtcdCluster) {
         let client = etcdrs::Client::new(&etcd_cluster.connect_string()).unwrap();
-        assert!(client.get("foo").await.unwrap().is_none());
+        assert!(client.get("foo").await.unwrap().into_record().is_none());
 
         client.put("foo").value("value").await.unwrap();
-        let fetched = client.get("foo").await.unwrap().unwrap();
+        let fetched = client.get("foo").await.unwrap().into_record().unwrap();
         assert_eq!(fetched.value(), b"value");
         assert_eq!(fetched.metadata().version, Version::new(1));
     }
@@ -50,7 +50,7 @@ pub(crate) mod tests {
         }
         assert_eq!(4, metrics.get().succeeded());
 
-        let count = client.list_prefix("foo/").count_only().await.unwrap();
+        let count = client.list_prefix("foo/").count_only().await.unwrap().count();
         assert_eq!(count, things.len());
         assert_eq!(5, metrics.get().succeeded());
         let keys = client
@@ -102,16 +102,14 @@ pub(crate) mod tests {
             .build()
             .unwrap();
 
-        assert!(client.get("foo").await.unwrap().is_none());
+        assert!(client.get("foo").await.unwrap().into_record().is_none());
         client.put("foo").value("value").await.unwrap();
-        let fetched = client.get("foo").await.unwrap().unwrap();
+        let fetched = client.get("foo").await.unwrap().into_record().unwrap();
         assert_eq!(fetched.value(), b"value");
         assert_eq!(fetched.metadata().version, Version::new(1));
 
-        let deleted = client.delete("foo").await.unwrap();
-        assert!(deleted);
-        let deleted = client.delete("foo").await.unwrap();
-        assert!(!deleted);
+        assert!(client.delete("foo").await.unwrap().deleted());
+        assert!(!client.delete("foo").await.unwrap().deleted());
     }
 
     #[rstest]
@@ -123,15 +121,14 @@ pub(crate) mod tests {
             client.put(key).value(key).await.unwrap();
         }
 
-        let count = client.delete_prefix("foo/").await.unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(client.delete_prefix("foo/").await.unwrap().deleted(), 3);
 
         // Verify the prefixed keys are gone
-        assert!(client.get("foo/a").await.unwrap().is_none());
-        assert!(client.get("foo/b").await.unwrap().is_none());
-        assert!(client.get("foo/c").await.unwrap().is_none());
+        assert!(client.get("foo/a").await.unwrap().record().is_none());
+        assert!(client.get("foo/b").await.unwrap().record().is_none());
+        assert!(client.get("foo/c").await.unwrap().record().is_none());
         // bar/a should still exist
-        assert!(client.get("bar/a").await.unwrap().is_some());
+        assert!(client.get("bar/a").await.unwrap().record().is_some());
     }
 
     #[rstest]
@@ -144,13 +141,12 @@ pub(crate) mod tests {
         }
 
         // "foo/a".."foo/c" should delete "foo/a" and "foo/b" (exclusive upper bound)
-        let count = client.delete_range("foo/a".."foo/c").await.unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(client.delete_range("foo/a".."foo/c").await.unwrap().deleted(), 2);
 
-        assert!(client.get("foo/a").await.unwrap().is_none());
-        assert!(client.get("foo/b").await.unwrap().is_none());
-        assert!(client.get("foo/c").await.unwrap().is_some());
-        assert!(client.get("foo/d").await.unwrap().is_some());
+        assert!(client.get("foo/a").await.unwrap().record().is_none());
+        assert!(client.get("foo/b").await.unwrap().record().is_none());
+        assert!(client.get("foo/c").await.unwrap().record().is_some());
+        assert!(client.get("foo/d").await.unwrap().record().is_some());
     }
 
     #[rstest]
@@ -162,7 +158,8 @@ pub(crate) mod tests {
             client.put(key).value(key).await.unwrap();
         }
 
-        let previous = client.delete_prefix("foo/").get_previous().await.unwrap();
+        let response = client.delete_prefix("foo/").get_previous().await.unwrap();
+        let previous = response.previous();
         assert_eq!(previous.len(), 3);
         let keys: Vec<&[u8]> = previous.iter().map(|r| r.key().as_slice()).collect();
         assert_eq!(keys, vec![b"foo/a", b"foo/b", b"foo/c"]);

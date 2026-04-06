@@ -2,7 +2,7 @@ use crate::{
     client::{record_from_pb, Delete, Get, GetPreviousValue, List, Put},
     pb::etcdserverpb,
     record::{AsKey, AsValue},
-    Client, LeaseId, Record, Revision,
+    Client, LeaseId, Record, ResponseHeader, Revision,
 };
 
 impl Client {
@@ -377,14 +377,22 @@ impl<C> From<List<C, usize>> for TransactionOp {
 #[derive(Clone, Debug)]
 #[must_use = "TransactionResponse should be checked for success"]
 pub struct TransactionResponse {
-    revision: Revision,
+    header: ResponseHeader,
     succeeded: bool,
     responses: Vec<TransactionOpResponse>,
 }
 
 impl TransactionResponse {
+    /// The response header containing cluster metadata and the store revision.
+    pub fn header(&self) -> &ResponseHeader {
+        &self.header
+    }
+
+    /// Key-value store revision when the transaction was applied.
+    ///
+    /// This is a convenience for `self.header().revision()`.
     pub fn revision(&self) -> Revision {
-        self.revision
+        self.header.revision()
     }
 
     pub fn succeeded(&self) -> bool {
@@ -409,10 +417,10 @@ impl TransactionResponse {
         success_kinds: &[TransactionOpKind],
         failure_kinds: &[TransactionOpKind],
     ) -> Self {
-        let header = response.header.expect("TxnResponse should have a valid header");
+        let header = ResponseHeader::from_pb(response.header.expect("TxnResponse should have a valid header"));
 
         Self {
-            revision: Revision::new(header.revision).expect("revision should be non-zero"),
+            header,
             succeeded: response.succeeded,
             responses: response
                 .responses

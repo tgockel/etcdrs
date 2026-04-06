@@ -1,10 +1,12 @@
 use futures_core::Stream;
 
+use std::sync::{Arc, Mutex};
+
 use crate::{
     client::{key_with_metadata_from_pb, record_from_pb, Client},
     pb::{etcdserverpb, mvccpb},
     record::{AsKey, KeyWithMetadata, Record},
-    AsRange, Prefix,
+    AsRange, Prefix, ResponseHeader,
 };
 use std::{
     future::{Future, IntoFuture},
@@ -155,7 +157,10 @@ impl<C, R> List<C, R> {
 }
 
 impl<R> List<Client, R> {
-    fn stream_result_chunks(self) -> impl Stream<Item = Result<etcdserverpb::RangeResponse, ListError>> {
+    fn stream_result_chunks(
+        self,
+        shared_header: Arc<Mutex<Option<ResponseHeader>>>,
+    ) -> impl Stream<Item = Result<etcdserverpb::RangeResponse, ListError>> {
         async_stream::stream! {
             let mut request = self.request;
             // if the user never set the range, fill it with 0
@@ -184,6 +189,10 @@ impl<R> List<Client, R> {
                         }
                     }
                 };
+
+                if let Some(pb_header) = &resp.header {
+                    *shared_header.lock().unwrap() = Some(ResponseHeader::from_pb(*pb_header));
+                }
 
                 let more = resp.more;
                 if more {
@@ -214,8 +223,11 @@ impl<R> List<Client, R> {
         }
     }
 
-    fn stream_results(self) -> impl Stream<Item = Result<mvccpb::KeyValue, ListError>> {
-        let chunk_stream = self.stream_result_chunks();
+    fn stream_results(
+        self,
+        shared_header: Arc<Mutex<Option<ResponseHeader>>>,
+    ) -> impl Stream<Item = Result<mvccpb::KeyValue, ListError>> {
+        let chunk_stream = self.stream_result_chunks(shared_header);
         async_stream::stream! {
             for await chunk in chunk_stream {
                 match chunk {
@@ -233,8 +245,10 @@ impl<R> List<Client, R> {
 
 impl List<Client, Record> {
     pub fn into_stream(self) -> ListIterator<Record> {
+        let shared_header = Arc::new(Mutex::new(None));
         ListIterator {
-            iter: Box::new(self.stream_results()),
+            header: Arc::clone(&shared_header),
+            iter: Box::new(self.stream_results(shared_header)),
             convert: record_from_pb,
         }
     }
@@ -242,19 +256,29 @@ impl List<Client, Record> {
 
 impl List<Client, KeyWithMetadata> {
     pub fn into_stream(self) -> ListIterator<KeyWithMetadata> {
+        let shared_header = Arc::new(Mutex::new(None));
         ListIterator {
-            iter: Box::new(self.stream_results()),
+            header: Arc::clone(&shared_header),
+            iter: Box::new(self.stream_results(shared_header)),
             convert: key_with_metadata_from_pb,
         }
     }
 }
 
 pub struct ListIterator<R> {
+    header: Arc<Mutex<Option<ResponseHeader>>>,
     iter: Box<dyn Stream<Item = Result<mvccpb::KeyValue, ListError>>>,
     convert: fn(mvccpb::KeyValue) -> R,
 }
 
 impl<R> ListIterator<R> {
+    /// Returns the [`ResponseHeader`] from the most recently fetched page.
+    ///
+    /// Returns `None` if no page has been fetched yet (the stream has not been polled).
+    pub fn header(&self) -> Option<ResponseHeader> {
+        *self.header.lock().unwrap()
+    }
+
     /// Underlying implementation of `poll_next` used by trait-specific implementations.
     fn poll_next_impl(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Option<R>, ListError>> {
         let convert = self.as_ref().convert;
@@ -303,8 +327,9 @@ where
 }
 
 impl List<Client, usize> {
-    async fn call(self) -> Result<usize, ListError> {
-        self.client
+    async fn call(self) -> Result<CountResponse, ListError> {
+        let resp = self
+            .client
             .inner
             .wrap_unary_call(
                 etcdserverpb::kv_client::KvClient::new,
@@ -312,8 +337,28 @@ impl List<Client, usize> {
                 self.request,
             )
             .await
-            .map(|r| r.count as usize)
-            .map_err(ListError::from_status)
+            .map_err(ListError::from_status)?;
+        let header = ResponseHeader::from_pb(resp.header.expect("RangeResponse should have a valid header"));
+        Ok(CountResponse { header, count: resp.count as usize })
+    }
+}
+
+/// The response from a [`list`][Client::list] operation with [`count_only`][List::count_only].
+#[derive(Clone, Copy, Debug)]
+pub struct CountResponse {
+    header: ResponseHeader,
+    count: usize,
+}
+
+impl CountResponse {
+    /// The response header containing cluster metadata and the store revision.
+    pub fn header(&self) -> &ResponseHeader {
+        &self.header
+    }
+
+    /// The number of keys matching the query.
+    pub fn count(&self) -> usize {
+        self.count
     }
 }
 
@@ -329,7 +374,7 @@ impl<T> Future for ListFuture<T> {
 }
 
 impl IntoFuture for List<Client, usize> {
-    type Output = Result<usize, ListError>;
+    type Output = Result<CountResponse, ListError>;
     type IntoFuture = ListFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -360,6 +405,6 @@ impl ListError {
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _check() {
-        _assert_send::<ListFuture<Result<usize, ListError>>>();
+        _assert_send::<ListFuture<Result<CountResponse, ListError>>>();
     }
 };

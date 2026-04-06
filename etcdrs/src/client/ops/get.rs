@@ -8,7 +8,7 @@ use crate::{
     client::record_from_pb,
     pb::etcdserverpb,
     record::{AsKey, Record},
-    Client,
+    Client, ResponseHeader,
 };
 
 impl Client {
@@ -17,7 +17,8 @@ impl Client {
     /// ```no_run
     /// # async {
     /// let client: etcdrs::Client = todo!();
-    /// if let Some(entry) = client.get("path/to/foo").await.unwrap() {
+    /// let response = client.get("path/to/foo").await.unwrap();
+    /// if let Some(entry) = response.record() {
     ///     println!("found: {entry:?}");
     /// } else {
     ///     println!("not found");
@@ -60,7 +61,7 @@ impl<C> Get<C> {
 }
 
 impl Get<Client> {
-    async fn call(self) -> Result<Option<Record>, GetError> {
+    async fn call(self) -> Result<GetResponse, GetError> {
         let resp = self
             .client
             .inner
@@ -71,6 +72,7 @@ impl Get<Client> {
             )
             .await
             .map_err(GetError::from_status)?;
+        let header = ResponseHeader::from_pb(resp.header.expect("RangeResponse should have a valid header"));
         if resp.more || resp.kvs.len() > 1 {
             Err(GetError::new(
                 GetErrorKind::TooMany,
@@ -78,18 +80,42 @@ impl Get<Client> {
                 None,
             ))
         } else if let Some(r) = resp.kvs.into_iter().next() {
-            Ok(Some(record_from_pb(r)))
+            Ok(GetResponse { header, record: Some(record_from_pb(r)) })
         } else {
-            Ok(None)
+            Ok(GetResponse { header, record: None })
         }
     }
 }
 
+/// The response from a [`get`][Client::get] operation.
+#[derive(Clone, Debug)]
+pub struct GetResponse {
+    header: ResponseHeader,
+    record: Option<Record>,
+}
+
+impl GetResponse {
+    /// The response header containing cluster metadata and the store revision.
+    pub fn header(&self) -> &ResponseHeader {
+        &self.header
+    }
+
+    /// The record associated with the key, or `None` if the key does not exist.
+    pub fn record(&self) -> Option<&Record> {
+        self.record.as_ref()
+    }
+
+    /// Consume the response and return the record, or `None` if the key does not exist.
+    pub fn into_record(self) -> Option<Record> {
+        self.record
+    }
+}
+
 /// The [`Future`] type returned by awaiting a [`get`][`Client::get`].
-pub struct GetFuture(Pin<Box<dyn Future<Output = Result<Option<Record>, GetError>> + Send>>);
+pub struct GetFuture(Pin<Box<dyn Future<Output = Result<GetResponse, GetError>> + Send>>);
 
 impl Future for GetFuture {
-    type Output = Result<Option<Record>, GetError>;
+    type Output = Result<GetResponse, GetError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.get_mut().0.as_mut().poll(cx)
@@ -97,7 +123,7 @@ impl Future for GetFuture {
 }
 
 impl IntoFuture for Get<Client> {
-    type Output = Result<Option<Record>, GetError>;
+    type Output = Result<GetResponse, GetError>;
     type IntoFuture = GetFuture;
 
     fn into_future(self) -> Self::IntoFuture {
