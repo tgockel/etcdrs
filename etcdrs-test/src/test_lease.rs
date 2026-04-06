@@ -3,7 +3,7 @@ use std::time::Duration;
 use etcdrs::{Client, GrantLeaseErrorKind, RevokeLeaseErrorKind};
 use rstest::rstest;
 
-use crate::{tests::etcd_cluster, EtcdCluster};
+use crate::{EtcdCluster, tests::etcd_cluster};
 
 #[rstest]
 #[tokio::test]

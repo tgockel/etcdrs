@@ -1,6 +1,6 @@
 use std::{
     fmt,
-    sync::{atomic, Arc},
+    sync::{Arc, atomic},
     time::Duration,
 };
 

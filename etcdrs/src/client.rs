@@ -1,6 +1,6 @@
 use crate::{
-    record::{KeyWithMetadata, Metadata, Record},
     LeaseId, Revision, Version,
+    record::{KeyWithMetadata, Metadata, Record},
 };
 use std::{fmt, ops::AsyncFn, sync::Arc};
 
@@ -43,11 +43,13 @@ enum Remote {
     Preconfigured(tonic::transport::Endpoint),
 }
 
+type ConfigureEndpointFn =
+    dyn Fn(tonic::transport::Endpoint) -> Result<tonic::transport::Endpoint, Box<dyn std::error::Error + Send + Sync>>;
+
 #[derive(Default)]
 pub struct ClientBuilder {
     remotes: Vec<Remote>,
-    configure_endpoint:
-        Option<Box<dyn Fn(tonic::transport::Endpoint) -> Result<tonic::transport::Endpoint, Box<dyn std::error::Error + Send + Sync>>>>,
+    configure_endpoint: Option<Box<ConfigureEndpointFn>>,
     metrics: Option<Box<dyn MetricsCollector>>,
 }
 
@@ -99,7 +101,10 @@ impl ClientBuilder {
     /// ```
     pub fn configure_endpoint(
         mut self,
-        f: impl Fn(tonic::transport::Endpoint) -> Result<tonic::transport::Endpoint, Box<dyn std::error::Error + Send + Sync>> + 'static,
+        f: impl Fn(
+            tonic::transport::Endpoint,
+        ) -> Result<tonic::transport::Endpoint, Box<dyn std::error::Error + Send + Sync>>
+        + 'static,
     ) -> Self {
         self.configure_endpoint = Some(Box::new(f));
         self

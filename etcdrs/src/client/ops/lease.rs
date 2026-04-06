@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{pb::etcdserverpb, Client, LeaseId, ResponseHeader};
+use crate::{Client, LeaseId, ResponseHeader, pb::etcdserverpb};
 
 impl Client {
     /// Create a lease used to create ephemeral records.
@@ -125,11 +125,7 @@ impl GrantLease<Client> {
             .map_err(GrantLeaseError::from_status)?;
 
         if !resp.error.is_empty() {
-            return Err(GrantLeaseError::new(
-                GrantLeaseErrorKind::LeaseExists,
-                resp.error,
-                None,
-            ));
+            return Err(GrantLeaseError::new(GrantLeaseErrorKind::LeaseExists, resp.error, None));
         }
 
         let header = ResponseHeader::from_pb(resp.header.expect("LeaseGrantResponse should have a valid header"));

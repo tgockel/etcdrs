@@ -1,8 +1,10 @@
+use bytes::Bytes;
+
 use crate::{
-    client::{record_from_pb, Delete, Get, GetPreviousValue, List, Put},
+    Client, LeaseId, Record, ResponseHeader, Revision,
+    client::{Delete, Get, GetPreviousValue, List, Put, record_from_pb},
     pb::etcdserverpb,
     record::{AsKey, AsValue},
-    Client, LeaseId, Record, ResponseHeader, Revision,
 };
 
 impl Client {
@@ -197,7 +199,7 @@ impl TransactionCheck {
             request: etcdserverpb::Compare {
                 result: operator.as_pb() as _,
                 target: target as _,
-                key: key.to_owned(),
+                key: Bytes::copy_from_slice(key),
                 range_end: Default::default(),
                 target_union: Some(target_union),
             },
@@ -247,7 +249,7 @@ impl TransactionCheck {
             key.as_key(),
             operator,
             etcdserverpb::compare::CompareTarget::Value,
-            etcdserverpb::compare::TargetUnion::Value(value.as_value().to_owned()),
+            etcdserverpb::compare::TargetUnion::Value(Bytes::copy_from_slice(value.as_value())),
         )
     }
 

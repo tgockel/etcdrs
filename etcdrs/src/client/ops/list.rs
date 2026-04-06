@@ -1,12 +1,13 @@
+use bytes::Bytes;
 use futures_core::Stream;
 
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    client::{key_with_metadata_from_pb, record_from_pb, Client},
+    AsRange, Prefix, ResponseHeader,
+    client::{Client, key_with_metadata_from_pb, record_from_pb},
     pb::{etcdserverpb, mvccpb},
     record::{AsKey, KeyWithMetadata, Record},
-    AsRange, Prefix, ResponseHeader,
 };
 use std::{
     future::{Future, IntoFuture},
@@ -93,7 +94,7 @@ impl<C, R> List<C, R> {
         }
     }
 
-    fn _with_range(mut self, lower: Vec<u8>, upper: Vec<u8>) -> Self {
+    fn _with_range(mut self, lower: Bytes, upper: Bytes) -> Self {
         self.request.key = lower;
         self.request.range_end = upper;
         self
@@ -165,8 +166,8 @@ impl<R> List<Client, R> {
             let mut request = self.request;
             // if the user never set the range, fill it with 0
             if request.key.is_empty() && request.range_end.is_empty() {
-                request.key = vec![0];
-                request.range_end = vec![0];
+                request.key = Bytes::from_static(&[0]);
+                request.range_end = Bytes::from_static(&[0]);
             }
             let client_inner = self.client.inner;
 
@@ -197,10 +198,10 @@ impl<R> List<Client, R> {
                 let more = resp.more;
                 if more {
                     // Pin the revision from the first response so subsequent pages are consistent.
-                    if request.revision == 0 {
-                        if let Some(header) = &resp.header {
-                            request.revision = header.revision;
-                        }
+                    if request.revision == 0
+                        && let Some(header) = &resp.header
+                    {
+                        request.revision = header.revision;
                     }
 
                     // if there are more results, advance request.key to one past the end for the next query
@@ -213,7 +214,7 @@ impl<R> List<Client, R> {
                         ));
                         break;
                     };
-                    request.key = crate::range::successor(&last_kv.key);
+                    request.key = crate::range::successor(&last_kv.key).into();
                 }
                 yield Ok(resp);
                 if !more {
@@ -312,10 +313,10 @@ impl<R> std::async_iter::AsyncIterator for ListIterator<R> {
 impl<C, R> std::async_iter::IntoAsyncIterator for List<C, R>
 where
     Self: fallible_async_iterator::IntoFallibleAsyncIterator<
-        Item = R,
-        Error = ListError,
-        IntoFallibleAsyncIter = ListIterator<R>,
-    >,
+            Item = R,
+            Error = ListError,
+            IntoFallibleAsyncIter = ListIterator<R>,
+        >,
 {
     type Item = Result<R, ListError>;
     type IntoAsyncIter = ListIterator<R>;
@@ -339,7 +340,10 @@ impl List<Client, usize> {
             .await
             .map_err(ListError::from_status)?;
         let header = ResponseHeader::from_pb(resp.header.expect("RangeResponse should have a valid header"));
-        Ok(CountResponse { header, count: resp.count as usize })
+        Ok(CountResponse {
+            header,
+            count: resp.count as usize,
+        })
     }
 }
 

@@ -5,11 +5,13 @@ use std::{
     task::{Context, Poll},
 };
 
+use bytes::Bytes;
+
 use crate::{
+    Client, LeaseId, ResponseHeader,
     client::record_from_pb,
     pb::etcdserverpb,
     record::{AsKey, AsValue, Record},
-    Client, LeaseId, ResponseHeader,
 };
 
 impl Client {
@@ -42,7 +44,7 @@ impl Put<(), ()> {
         Self {
             client: (),
             request: etcdserverpb::PutRequest {
-                key: key.as_key().to_owned(),
+                key: Bytes::copy_from_slice(key.as_key()),
                 ..Default::default()
             },
             _return: PhantomData,
@@ -76,7 +78,7 @@ impl<C, R> Put<C, R> {
 
     /// Set the record to `value`.
     pub fn value(mut self, value: impl AsValue) -> Self {
-        self.request.value = value.as_value().into();
+        self.request.value = Bytes::copy_from_slice(value.as_value());
         self.request.ignore_value = false;
         self
     }
@@ -164,7 +166,11 @@ impl IntoFuture for Put<Client, GetPreviousValue> {
     fn into_future(self) -> Self::IntoFuture {
         PutFuture(Box::pin(async move {
             let (header, previous) = self.call().await?;
-            Ok(PutResponse { header, previous, _marker: PhantomData })
+            Ok(PutResponse {
+                header,
+                previous,
+                _marker: PhantomData,
+            })
         }))
     }
 }
@@ -176,7 +182,11 @@ impl IntoFuture for Put<Client, ()> {
     fn into_future(self) -> Self::IntoFuture {
         PutFuture(Box::pin(async move {
             let (header, _) = self.call().await?;
-            Ok(PutResponse { header, previous: None, _marker: PhantomData })
+            Ok(PutResponse {
+                header,
+                previous: None,
+                _marker: PhantomData,
+            })
         }))
     }
 }

@@ -78,7 +78,10 @@ mod generate {
         println!("cargo:rerun-if-env-changed=PROTOC");
 
         if env::var_os("PROTOC").is_none() {
-            env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
+            // SAFETY: We are the only thread in the program.
+            unsafe {
+                env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
+            }
         }
 
         Ok(())
@@ -96,6 +99,7 @@ mod generate {
         fs::create_dir_all(&out_dir)?;
 
         tonic_prost_build::configure()
+            .bytes(".")
             .emit_rerun_if_changed(true)
             .include_file("all.rs")
             .build_client(true)

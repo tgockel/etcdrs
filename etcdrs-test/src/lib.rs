@@ -29,7 +29,7 @@ pub(crate) mod tests {
 
         client.put("foo").value("value").await.unwrap();
         let fetched = client.get("foo").await.unwrap().into_record().unwrap();
-        assert_eq!(fetched.value(), b"value");
+        assert_eq!(fetched.value(), &b"value"[..]);
         assert_eq!(fetched.metadata().version, Version::new(1));
     }
 
@@ -79,15 +79,15 @@ pub(crate) mod tests {
 
         // Pull the first item — this pins the revision
         let first = stream.next().await.unwrap().unwrap();
-        assert_eq!(first.key(), b"foo/a");
-        assert_eq!(first.value(), b"a");
+        assert_eq!(first.key(), &b"foo/a"[..]);
+        assert_eq!(first.value(), &b"a"[..]);
 
         // Modify a key that hasn't been returned yet
         client.put("foo/c").value("modified").await.unwrap();
 
         // Remaining pages should read from the pinned revision and see the old value
         let remaining: Vec<_> = stream.map(Result::unwrap).collect().await;
-        let values: Vec<&[u8]> = remaining.iter().map(|r| r.value().as_slice()).collect();
+        let values: Vec<&[u8]> = remaining.iter().map(|r| &r.value()[..]).collect();
         assert_eq!(values, vec![b"b", b"c", b"d"]);
     }
 
@@ -105,7 +105,7 @@ pub(crate) mod tests {
         assert!(client.get("foo").await.unwrap().into_record().is_none());
         client.put("foo").value("value").await.unwrap();
         let fetched = client.get("foo").await.unwrap().into_record().unwrap();
-        assert_eq!(fetched.value(), b"value");
+        assert_eq!(fetched.value(), &b"value"[..]);
         assert_eq!(fetched.metadata().version, Version::new(1));
 
         assert!(client.delete("foo").await.unwrap().deleted());
@@ -161,7 +161,7 @@ pub(crate) mod tests {
         let response = client.delete_prefix("foo/").get_previous().await.unwrap();
         let previous = response.previous();
         assert_eq!(previous.len(), 3);
-        let keys: Vec<&[u8]> = previous.iter().map(|r| r.key().as_slice()).collect();
+        let keys: Vec<&[u8]> = previous.iter().map(|r| &r.key()[..]).collect();
         assert_eq!(keys, vec![b"foo/a", b"foo/b", b"foo/c"]);
     }
 }

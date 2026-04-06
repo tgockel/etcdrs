@@ -1,10 +1,10 @@
 use etcdrs::{
-    client::{Delete, Get, List, Put, TransactionCheck, TransactionOpResponse},
     TransactionErrorKind,
+    client::{Delete, Get, List, Put, TransactionCheck, TransactionOpResponse},
 };
 use rstest::rstest;
 
-use crate::{tests::etcd_cluster, EtcdCluster};
+use crate::{EtcdCluster, tests::etcd_cluster};
 
 #[rstest]
 #[tokio::test]
@@ -57,7 +57,7 @@ async fn big_transaction(etcd_cluster: EtcdCluster) {
     let TransactionOpResponse::Get(Some(record)) = &result.responses()[0] else {
         unreachable!()
     };
-    assert_eq!(record.value(), b"bar");
+    assert_eq!(record.value(), &b"bar"[..]);
 }
 
 #[rstest]

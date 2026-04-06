@@ -5,11 +5,13 @@ use std::{
     task::{Context, Poll},
 };
 
+use bytes::Bytes;
+
 use crate::{
-    client::{record_from_pb, GetPreviousValue},
+    AsRange, Client, Prefix, ResponseHeader,
+    client::{GetPreviousValue, record_from_pb},
     pb::etcdserverpb,
     record::{AsKey, Record},
-    AsRange, Client, Prefix, ResponseHeader,
 };
 
 impl Client {
@@ -24,7 +26,8 @@ impl Client {
     /// let deleted = client
     ///     .delete("foo")
     ///     .await
-    ///     .unwrap();
+    ///     .unwrap()
+    ///     .deleted();
     /// println!("deleted? {deleted}");
     /// # };
     /// ```
@@ -40,7 +43,7 @@ impl Client {
     /// # async {
     /// # let client: etcdrs::Client = todo!();
     /// // Delete a range of keys
-    /// let count = client.delete_range("foo/a".."foo/z").await.unwrap();
+    /// let count = client.delete_range("foo/a".."foo/z").await.unwrap().deleted();
     /// println!("deleted {count} keys");
     ///
     /// // Delete ranges use the Rust range syntax:
@@ -64,7 +67,7 @@ impl Client {
     /// ```no_run
     /// # async {
     /// # let client: etcdrs::Client = todo!();
-    /// let count = client.delete_prefix("foo/").await.unwrap();
+    /// let count = client.delete_prefix("foo/").await.unwrap().deleted();
     /// println!("deleted {count} keys");
     /// # };
     /// ```
@@ -85,7 +88,7 @@ impl Delete<(), bool> {
         Self {
             client: (),
             request: etcdserverpb::DeleteRangeRequest {
-                key: key.as_key().to_owned(),
+                key: Bytes::copy_from_slice(key.as_key()),
                 ..Default::default()
             },
             _return: PhantomData,
@@ -241,7 +244,12 @@ impl IntoFuture for Delete<Client, bool, ()> {
     fn into_future(self) -> Self::IntoFuture {
         DeleteFuture(Box::pin(async move {
             let (header, resp) = self.call().await?;
-            Ok(DeleteResponse { header, deleted: resp.deleted as usize, previous: Vec::new(), _marker: PhantomData })
+            Ok(DeleteResponse {
+                header,
+                deleted: resp.deleted as usize,
+                previous: Vec::new(),
+                _marker: PhantomData,
+            })
         }))
     }
 }
@@ -270,7 +278,12 @@ impl IntoFuture for Delete<Client, usize, ()> {
     fn into_future(self) -> Self::IntoFuture {
         DeleteFuture(Box::pin(async move {
             let (header, resp) = self.call().await?;
-            Ok(DeleteResponse { header, deleted: resp.deleted as usize, previous: Vec::new(), _marker: PhantomData })
+            Ok(DeleteResponse {
+                header,
+                deleted: resp.deleted as usize,
+                previous: Vec::new(),
+                _marker: PhantomData,
+            })
         }))
     }
 }

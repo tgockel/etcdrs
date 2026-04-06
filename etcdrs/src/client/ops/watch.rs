@@ -6,16 +6,18 @@ use std::{
     ops::{Deref, DerefMut},
     pin::Pin,
     sync::{
-        atomic::{AtomicI64, Ordering},
         Arc,
+        atomic::{AtomicI64, Ordering},
     },
     task::{Context, Poll},
 };
 
+use bytes::Bytes;
 use futures_core::Stream;
 
 use crate::{
-    client::{record_from_pb, Client},
+    AsRange, LeaseId, Prefix, ResponseHeader, Revision, Version,
+    client::{Client, record_from_pb},
     pb::{
         etcdserverpb::{
             self, watch_create_request::FilterType as PbFilterType, watch_request::RequestUnion as PbRequestUnion,
@@ -23,7 +25,6 @@ use crate::{
         mvccpb::{self, event::EventType as PbEventType},
     },
     record::{AsKey, KeyWithMetadata, Metadata, Record},
-    AsRange, LeaseId, Prefix, ResponseHeader, Revision, Version,
 };
 
 impl Client {
@@ -175,7 +176,7 @@ impl<C> WatchBuilder<C> {
         self
     }
 
-    fn _new_watch(self, lower: Vec<u8>, upper: Vec<u8>) -> Watch<Self> {
+    fn _new_watch(self, lower: Bytes, upper: Bytes) -> Watch<Self> {
         Watch {
             watcher: self,
             current: etcdserverpb::WatchCreateRequest {
@@ -189,8 +190,8 @@ impl<C> WatchBuilder<C> {
 
     /// Watch a single key.
     pub fn key(self, key: impl AsKey) -> Watch<Self> {
-        let key = key.as_key().to_owned();
-        self._new_watch(key, Vec::new())
+        let key = Bytes::copy_from_slice(key.as_key());
+        self._new_watch(key, Bytes::new())
     }
 
     /// Watch all keys with a given prefix.
@@ -305,7 +306,7 @@ impl<W> Watch<W> {
 
 /// Chaining methods — only available when `W` is a `WatchBuilder<C>`.
 impl<C> Watch<WatchBuilder<C>> {
-    fn _finalize_and_new(self, lower: Vec<u8>, upper: Vec<u8>) -> Self {
+    fn _finalize_and_new(self, lower: Bytes, upper: Bytes) -> Self {
         let Watch { mut watcher, current } = self;
         watcher.specs.push(current);
         Watch {
@@ -321,8 +322,8 @@ impl<C> Watch<WatchBuilder<C>> {
 
     /// Finalize the current target and add another watch for a single key.
     pub fn key(self, key: impl AsKey) -> Self {
-        let key = key.as_key().to_owned();
-        self._finalize_and_new(key, Vec::new())
+        let key = Bytes::copy_from_slice(key.as_key());
+        self._finalize_and_new(key, Bytes::new())
     }
 
     /// Finalize the current target and add another watch for a prefix.

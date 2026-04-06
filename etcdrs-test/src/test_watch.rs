@@ -4,7 +4,7 @@ use etcdrs::client::{Watch, WatchEvent};
 use futures::StreamExt;
 use rstest::rstest;
 
-use crate::{tests::etcd_server, EtcdServer};
+use crate::{EtcdServer, tests::etcd_server};
 
 /// Helper: collect the next `n` events from a watcher, with a timeout.
 async fn next_events(watcher: &mut etcdrs::client::Watcher, n: usize) -> Vec<WatchEvent> {
@@ -22,7 +22,14 @@ async fn next_events(watcher: &mut etcdrs::client::Watcher, n: usize) -> Vec<Wat
 
 /// Helper: get the modified_revision of a key.
 async fn revision_of(client: &etcdrs::Client, key: &str) -> etcdrs::Revision {
-    client.get(key).await.unwrap().into_record().unwrap().metadata().modified_revision
+    client
+        .get(key)
+        .await
+        .unwrap()
+        .into_record()
+        .unwrap()
+        .metadata()
+        .modified_revision
 }
 
 #[rstest]
@@ -39,8 +46,8 @@ async fn watch_put(etcd_server: EtcdServer) {
     let WatchEvent::Put { record, .. } = &events[0] else {
         panic!("expected Put, got {:?}", events[0]);
     };
-    assert_eq!(record.key(), b"watch-put");
-    assert_eq!(record.value(), b"hello");
+    assert_eq!(record.key(), &b"watch-put"[..]);
+    assert_eq!(record.value(), &b"hello"[..]);
 }
 
 #[rstest]
@@ -60,7 +67,7 @@ async fn watch_delete(etcd_server: EtcdServer) {
     let WatchEvent::Delete { key, .. } = &events[1] else {
         panic!("expected Delete, got {:?}", events[1]);
     };
-    assert_eq!(key.key(), b"watch-del");
+    assert_eq!(key.key(), &b"watch-del"[..]);
 }
 
 #[rstest]
@@ -80,7 +87,7 @@ async fn watch_prefix(etcd_server: EtcdServer) {
     let keys: Vec<&[u8]> = events
         .iter()
         .map(|e| match e {
-            WatchEvent::Put { record, .. } => record.key().as_slice(),
+            WatchEvent::Put { record, .. } => &record.key()[..],
             other => panic!("expected Put, got {other:?}"),
         })
         .collect();
@@ -116,7 +123,7 @@ async fn watch_get_previous(etcd_server: EtcdServer) {
     let WatchEvent::Put { prev_record: prev1, .. } = &events[1] else {
         panic!("expected Put");
     };
-    assert_eq!(prev1.as_ref().expect("expected prev_record").value(), b"v1");
+    assert_eq!(prev1.as_ref().expect("expected prev_record").value(), &b"v1"[..]);
 }
 
 #[rstest]
@@ -133,7 +140,7 @@ async fn watch_start_revision(etcd_server: EtcdServer) {
     let WatchEvent::Put { record, .. } = &events[0] else {
         panic!("expected Put");
     };
-    assert_eq!(record.value(), b"before");
+    assert_eq!(record.value(), &b"before"[..]);
 }
 
 #[rstest]
@@ -170,8 +177,8 @@ async fn watch_multiple_targets(etcd_server: EtcdServer) {
     else {
         panic!("expected two Puts, got {:?}", events);
     };
-    assert_eq!(r0.key(), b"wm/a");
-    assert_eq!(r1.key(), b"wm/b");
+    assert_eq!(r0.key(), &b"wm/a"[..]);
+    assert_eq!(r1.key(), &b"wm/b"[..]);
     assert_ne!(id0, id1);
 }
 
@@ -186,7 +193,7 @@ async fn watch_add_dynamic(etcd_server: EtcdServer) {
     let mut watcher = client.watch().key("wd/initial").start_revision(rev).start();
 
     let events = next_events(&mut watcher, 1).await;
-    assert!(matches!(&events[0], WatchEvent::Put { record, .. } if record.key() == b"wd/initial"));
+    assert!(matches!(&events[0], WatchEvent::Put { record, .. } if record.key() == &b"wd/initial"[..]));
 
     client.put("wd/dynamic").value("2").await.unwrap();
     let dyn_rev = revision_of(&client, "wd/dynamic").await;
@@ -196,7 +203,7 @@ async fn watch_add_dynamic(etcd_server: EtcdServer) {
     let WatchEvent::Put { record, watch_id, .. } = &events[0] else {
         panic!("expected Put");
     };
-    assert_eq!(record.key(), b"wd/dynamic");
+    assert_eq!(record.key(), &b"wd/dynamic"[..]);
     assert_eq!(*watch_id, dynamic_id);
 }
 
@@ -227,8 +234,8 @@ async fn watch_cancel(etcd_server: EtcdServer) {
     let WatchEvent::Put { record, .. } = &events[0] else {
         panic!("expected Put");
     };
-    assert_eq!(record.key(), b"wc/keep");
-    assert_eq!(record.value(), b"still alive");
+    assert_eq!(record.key(), &b"wc/keep"[..]);
+    assert_eq!(record.value(), &b"still alive"[..]);
 }
 
 #[rstest]

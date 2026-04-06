@@ -210,7 +210,7 @@ impl ServerName {
 }
 
 fn get_random_name(length: usize) -> String {
-    use rand::{distributions::Slice, Rng};
+    use rand::{Rng, distributions::Slice};
 
     let dist = Slice::new(b"abcdefghijklmnopqrstuvwxyz").unwrap();
     rand::thread_rng()

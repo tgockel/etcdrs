@@ -6,10 +6,10 @@ pub(crate) struct UserAddOptions {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub(crate) struct User {
-    #[prost(bytes = "vec", tag = "1")]
-    pub(crate) name: ::prost::alloc::vec::Vec<u8>,
-    #[prost(bytes = "vec", tag = "2")]
-    pub(crate) password: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub(crate) name: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub(crate) password: ::prost::bytes::Bytes,
     #[prost(string, repeated, tag = "3")]
     pub(crate) roles: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "4")]
@@ -19,10 +19,10 @@ pub(crate) struct User {
 pub(crate) struct Permission {
     #[prost(enumeration = "permission::Type", tag = "1")]
     pub(crate) perm_type: i32,
-    #[prost(bytes = "vec", tag = "2")]
-    pub(crate) key: ::prost::alloc::vec::Vec<u8>,
-    #[prost(bytes = "vec", tag = "3")]
-    pub(crate) range_end: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub(crate) key: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub(crate) range_end: ::prost::bytes::Bytes,
 }
 pub(crate) mod permission {
     #[derive(
@@ -62,8 +62,8 @@ pub(crate) mod permission {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub(crate) struct Role {
-    #[prost(bytes = "vec", tag = "1")]
-    pub(crate) name: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub(crate) name: ::prost::bytes::Bytes,
     #[prost(message, repeated, tag = "2")]
     pub(crate) key_permission: ::prost::alloc::vec::Vec<Permission>,
 }

@@ -8,7 +8,7 @@ use crate::{LeaseId, Revision, Version};
 /// transforms the value). Functions which transform the key and metadata elements have `_key` and `_metadata` in their
 /// names (for example, [`Self::map_key`] and [`Self::map_metadata`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct Record<K = Vec<u8>, V = Vec<u8>, M = Metadata> {
+pub struct Record<K = ::bytes::Bytes, V = ::bytes::Bytes, M = Metadata> {
     metadata: M,
     key: K,
     value: V,
@@ -191,7 +191,7 @@ impl<K, V, M, E> Record<K, Result<V, E>, M> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct KeyWithMetadata<K = Vec<u8>, M = Metadata> {
+pub struct KeyWithMetadata<K = ::bytes::Bytes, M = Metadata> {
     metadata: M,
     key: K,
 }
@@ -354,6 +354,12 @@ macro_rules! impl_basic_as {
         impl $trait_name for Vec<u8> {
             fn $fn_name(&self) -> &[u8] {
                 &self
+            }
+        }
+
+        impl $trait_name for ::bytes::Bytes {
+            fn $fn_name(&self) -> &[u8] {
+                self
             }
         }
 

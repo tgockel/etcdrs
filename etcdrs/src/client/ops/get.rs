@@ -4,11 +4,13 @@ use std::{
     task::{Context, Poll},
 };
 
+use bytes::Bytes;
+
 use crate::{
+    Client, ResponseHeader,
     client::record_from_pb,
     pb::etcdserverpb,
     record::{AsKey, Record},
-    Client, ResponseHeader,
 };
 
 impl Client {
@@ -41,7 +43,7 @@ impl Get<()> {
         Self {
             client: (),
             request: etcdserverpb::RangeRequest {
-                key: key.as_key().to_owned(),
+                key: Bytes::copy_from_slice(key.as_key()),
                 ..Default::default()
             },
         }
@@ -80,7 +82,10 @@ impl Get<Client> {
                 None,
             ))
         } else if let Some(r) = resp.kvs.into_iter().next() {
-            Ok(GetResponse { header, record: Some(record_from_pb(r)) })
+            Ok(GetResponse {
+                header,
+                record: Some(record_from_pb(r)),
+            })
         } else {
             Ok(GetResponse { header, record: None })
         }

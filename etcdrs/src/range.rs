@@ -1,5 +1,7 @@
 use std::ops::{Bound, RangeBounds};
 
+use bytes::Bytes;
+
 use crate::record::AsKey;
 
 mod private {
@@ -27,24 +29,24 @@ pub trait AsRange: private::Sealed {
     /// > then the range request gets all keys prefixed with key.
     /// > If both key and range_end are '\0', then the range request returns all keys.
     #[doc(hidden)]
-    fn as_boundaries(&self) -> (Vec<u8>, Vec<u8>);
+    fn as_boundaries(&self) -> (Bytes, Bytes);
 }
 
-fn specify_boundaries(start_bound: Bound<&[u8]>, end_bound: Bound<&[u8]>) -> (Vec<u8>, Vec<u8>) {
+fn specify_boundaries(start_bound: Bound<&[u8]>, end_bound: Bound<&[u8]>) -> (Bytes, Bytes) {
     let lower = match start_bound {
-        Bound::Included(val) => Vec::from(val.as_key()),
-        Bound::Excluded(val) => successor(val.as_key()),
-        Bound::Unbounded => vec![0],
+        Bound::Included(val) => Bytes::copy_from_slice(val.as_key()),
+        Bound::Excluded(val) => successor(val.as_key()).into(),
+        Bound::Unbounded => Bytes::from_static(&[0]),
     };
     let upper = match end_bound {
-        Bound::Included(val) => add_one(val.as_key()),
-        Bound::Excluded(val) => Vec::from(val.as_key()),
-        Bound::Unbounded => vec![0],
+        Bound::Included(val) => add_one(val.as_key()).into(),
+        Bound::Excluded(val) => Bytes::copy_from_slice(val.as_key()),
+        Bound::Unbounded => Bytes::from_static(&[0]),
     };
     (lower, upper)
 }
 
-fn range_to_boundaries<R: RangeBounds<impl AsKey>>(range: &R) -> (Vec<u8>, Vec<u8>) {
+fn range_to_boundaries<R: RangeBounds<impl AsKey>>(range: &R) -> (Bytes, Bytes) {
     specify_boundaries(
         range.start_bound().map(AsKey::as_key),
         range.end_bound().map(AsKey::as_key),
@@ -55,7 +57,7 @@ macro_rules! impl_as_range_for_range_type {
     ($template:ident) => {
         impl<T: AsKey> private::Sealed for std::ops::$template<T> {}
         impl<T: AsKey> AsRange for std::ops::$template<T> {
-            fn as_boundaries(&self) -> (Vec<u8>, Vec<u8>) {
+            fn as_boundaries(&self) -> (Bytes, Bytes) {
                 range_to_boundaries(self)
             }
         }
@@ -75,8 +77,8 @@ impl_as_range_for_range_type! {
 
 impl private::Sealed for std::ops::RangeFull {}
 impl AsRange for std::ops::RangeFull {
-    fn as_boundaries(&self) -> (Vec<u8>, Vec<u8>) {
-        (vec![0], vec![0])
+    fn as_boundaries(&self) -> (Bytes, Bytes) {
+        (Bytes::from_static(&[0]), Bytes::from_static(&[0]))
     }
 }
 
@@ -86,15 +88,15 @@ pub struct Prefix<T: ?Sized>(pub T);
 
 impl<T: AsKey + ?Sized> private::Sealed for Prefix<T> {}
 impl<T: AsKey + ?Sized> AsRange for Prefix<T> {
-    fn as_boundaries(&self) -> (Vec<u8>, Vec<u8>) {
-        (self.0.as_key().to_owned(), add_one(self.0.as_key()))
+    fn as_boundaries(&self) -> (Bytes, Bytes) {
+        (Bytes::copy_from_slice(self.0.as_key()), add_one(self.0.as_key()).into())
     }
 }
 
 impl<T: AsKey + ?Sized> private::Sealed for T {}
 impl<T: AsKey + ?Sized> AsRange for T {
-    fn as_boundaries(&self) -> (Vec<u8>, Vec<u8>) {
-        (self.as_key().to_owned(), Default::default())
+    fn as_boundaries(&self) -> (Bytes, Bytes) {
+        (Bytes::copy_from_slice(self.as_key()), Bytes::new())
     }
 }
 

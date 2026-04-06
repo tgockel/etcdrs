@@ -12,10 +12,10 @@ pub(crate) struct ResponseHeader {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub(crate) struct RangeRequest {
-    #[prost(bytes = "vec", tag = "1")]
-    pub(crate) key: ::prost::alloc::vec::Vec<u8>,
-    #[prost(bytes = "vec", tag = "2")]
-    pub(crate) range_end: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub(crate) key: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub(crate) range_end: ::prost::bytes::Bytes,
     #[prost(int64, tag = "3")]
     pub(crate) limit: i64,
     #[prost(int64, tag = "4")]
@@ -128,10 +128,10 @@ pub(crate) struct RangeResponse {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub(crate) struct PutRequest {
-    #[prost(bytes = "vec", tag = "1")]
-    pub(crate) key: ::prost::alloc::vec::Vec<u8>,
-    #[prost(bytes = "vec", tag = "2")]
-    pub(crate) value: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub(crate) key: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub(crate) value: ::prost::bytes::Bytes,
     #[prost(int64, tag = "3")]
     pub(crate) lease: i64,
     #[prost(bool, tag = "4")]
@@ -150,10 +150,10 @@ pub(crate) struct PutResponse {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub(crate) struct DeleteRangeRequest {
-    #[prost(bytes = "vec", tag = "1")]
-    pub(crate) key: ::prost::alloc::vec::Vec<u8>,
-    #[prost(bytes = "vec", tag = "2")]
-    pub(crate) range_end: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub(crate) key: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub(crate) range_end: ::prost::bytes::Bytes,
     #[prost(bool, tag = "3")]
     pub(crate) prev_kv: bool,
 }
@@ -208,10 +208,10 @@ pub(crate) struct Compare {
     pub(crate) result: i32,
     #[prost(enumeration = "compare::CompareTarget", tag = "2")]
     pub(crate) target: i32,
-    #[prost(bytes = "vec", tag = "3")]
-    pub(crate) key: ::prost::alloc::vec::Vec<u8>,
-    #[prost(bytes = "vec", tag = "64")]
-    pub(crate) range_end: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub(crate) key: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "64")]
+    pub(crate) range_end: ::prost::bytes::Bytes,
     #[prost(oneof = "compare::TargetUnion", tags = "4, 5, 6, 7, 8")]
     pub(crate) target_union: ::core::option::Option<compare::TargetUnion>,
 }
@@ -302,7 +302,7 @@ pub(crate) mod compare {
         #[prost(int64, tag = "6")]
         ModRevision(i64),
         #[prost(bytes, tag = "7")]
-        Value(::prost::alloc::vec::Vec<u8>),
+        Value(::prost::bytes::Bytes),
         #[prost(int64, tag = "8")]
         Lease(i64),
     }
@@ -370,8 +370,8 @@ pub(crate) struct SnapshotResponse {
     pub(crate) header: ::core::option::Option<ResponseHeader>,
     #[prost(uint64, tag = "2")]
     pub(crate) remaining_bytes: u64,
-    #[prost(bytes = "vec", tag = "3")]
-    pub(crate) blob: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub(crate) blob: ::prost::bytes::Bytes,
     #[prost(string, tag = "4")]
     pub(crate) version: ::prost::alloc::string::String,
 }
@@ -393,10 +393,10 @@ pub(crate) mod watch_request {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub(crate) struct WatchCreateRequest {
-    #[prost(bytes = "vec", tag = "1")]
-    pub(crate) key: ::prost::alloc::vec::Vec<u8>,
-    #[prost(bytes = "vec", tag = "2")]
-    pub(crate) range_end: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub(crate) key: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub(crate) range_end: ::prost::bytes::Bytes,
     #[prost(int64, tag = "3")]
     pub(crate) start_revision: i64,
     #[prost(bool, tag = "4")]
@@ -550,8 +550,8 @@ pub(crate) struct LeaseTimeToLiveResponse {
     pub(crate) ttl: i64,
     #[prost(int64, tag = "4")]
     pub(crate) granted_ttl: i64,
-    #[prost(bytes = "vec", repeated, tag = "5")]
-    pub(crate) keys: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "bytes", repeated, tag = "5")]
+    pub(crate) keys: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub(crate) struct LeaseLeasesRequest {}
@@ -902,10 +902,10 @@ pub(crate) struct AuthRoleGrantPermissionRequest {
 pub(crate) struct AuthRoleRevokePermissionRequest {
     #[prost(string, tag = "1")]
     pub(crate) role: ::prost::alloc::string::String,
-    #[prost(bytes = "vec", tag = "2")]
-    pub(crate) key: ::prost::alloc::vec::Vec<u8>,
-    #[prost(bytes = "vec", tag = "3")]
-    pub(crate) range_end: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub(crate) key: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub(crate) range_end: ::prost::bytes::Bytes,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub(crate) struct AuthEnableResponse {
