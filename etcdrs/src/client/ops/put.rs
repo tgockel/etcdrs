@@ -36,7 +36,7 @@ impl Client {
 pub struct Put<C, R> {
     client: C,
     pub(crate) request: etcdserverpb::PutRequest,
-    _return: PhantomData<R>,
+    _return: PhantomData<fn() -> R>,
 }
 
 impl Put<(), ()> {
@@ -63,6 +63,18 @@ impl<C, R> Put<C, R> {
             request: self.request,
             _return: PhantomData,
         }
+    }
+
+    /// Decompose this operation into its client and a detached `Put<(), R>`.
+    pub(crate) fn into_parts(self) -> (C, Put<(), R>) {
+        (
+            self.client,
+            Put {
+                client: (),
+                request: self.request,
+                _return: PhantomData,
+            },
+        )
     }
 
     /// Return the previous key-value.
@@ -104,23 +116,6 @@ impl<C, R> Put<C, R> {
     }
 }
 
-impl<R> Put<Client, R> {
-    async fn call(self) -> Result<(ResponseHeader, Option<Record>), PutError> {
-        let resp = self
-            .client
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::kv_client::KvClient::new,
-                async |c, r| c.put(r).await,
-                self.request,
-            )
-            .await
-            .map_err(PutError::from_status)?;
-        let header = ResponseHeader::from_pb(resp.header.expect("PutResponse should have a valid header"));
-        Ok((header, resp.prev_kv.map(record_from_pb)))
-    }
-}
-
 /// The response from a [`put`][Client::put] operation.
 #[derive(Clone, Debug)]
 pub struct PutResponse<R = ()> {
@@ -130,13 +125,22 @@ pub struct PutResponse<R = ()> {
 }
 
 impl<R> PutResponse<R> {
+    /// Construct a new `PutResponse`.
+    pub fn new(header: ResponseHeader, previous: Option<Record>) -> Self {
+        Self {
+            header,
+            previous,
+            _marker: PhantomData,
+        }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ResponseHeader {
         &self.header
     }
 }
 
-impl PutResponse<Record> {
+impl PutResponse<GetPreviousValue> {
     /// The previous value of the key, or `None` if the key did not exist before the put.
     pub fn previous(&self) -> Option<&Record> {
         self.previous.as_ref()
@@ -159,35 +163,39 @@ impl<T> Future for PutFuture<T> {
     }
 }
 
-impl IntoFuture for Put<Client, GetPreviousValue> {
-    type Output = Result<PutResponse<Record>, PutError>;
-    type IntoFuture = PutFuture<Self::Output>;
+impl crate::driver::PutDriver for Client {
+    type PutFuture<R> = PutFuture<Result<PutResponse<R>, PutError>>;
 
-    fn into_future(self) -> Self::IntoFuture {
+    fn execute_put<R>(self, put: Put<(), R>) -> Self::PutFuture<R> {
+        let request = put.request;
         PutFuture(Box::pin(async move {
-            let (header, previous) = self.call().await?;
-            Ok(PutResponse {
-                header,
-                previous,
-                _marker: PhantomData,
-            })
+            let resp = self
+                .inner
+                .wrap_unary_call(
+                    etcdserverpb::kv_client::KvClient::new,
+                    async |c, r| c.put(r).await,
+                    request,
+                )
+                .await
+                .map_err(PutError::from_status)?;
+            let header = ResponseHeader::from_pb(resp.header.expect("PutResponse should have a valid header"));
+            let previous = resp.prev_kv.map(record_from_pb);
+            Ok(PutResponse::new(header, previous))
         }))
     }
 }
 
-impl IntoFuture for Put<Client, ()> {
-    type Output = Result<PutResponse, PutError>;
+impl<C, R> IntoFuture for Put<C, R>
+where
+    C: crate::driver::PutDriver + Send + 'static,
+    R: Send + 'static,
+{
+    type Output = Result<PutResponse<R>, PutError>;
     type IntoFuture = PutFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
-        PutFuture(Box::pin(async move {
-            let (header, _) = self.call().await?;
-            Ok(PutResponse {
-                header,
-                previous: None,
-                _marker: PhantomData,
-            })
-        }))
+        let (client, detached) = self.into_parts();
+        PutFuture(Box::pin(async move { client.execute_put(detached).await }))
     }
 }
 
@@ -269,6 +277,6 @@ const _: () = {
     fn _assert_send<T: Send>() {}
     fn _check() {
         _assert_send::<PutFuture<Result<PutResponse, PutError>>>();
-        _assert_send::<PutFuture<Result<PutResponse<Record>, PutError>>>();
+        _assert_send::<PutFuture<Result<PutResponse<GetPreviousValue>, PutError>>>();
     }
 };

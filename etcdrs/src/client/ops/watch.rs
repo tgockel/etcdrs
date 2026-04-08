@@ -111,6 +111,8 @@ pub enum WatchEvent {
         header: ResponseHeader,
         watch_id: WatchId,
         record: Record,
+        /// The record as it existed before the event's mutation. This will always be `None` if
+        /// [`get_previous`][Watch::get_previous] was not called on the watch.
         prev_record: Option<Record>,
         /// `true` if the key was newly created (as opposed to updated).
         created: bool,
@@ -120,6 +122,8 @@ pub enum WatchEvent {
         header: ResponseHeader,
         watch_id: WatchId,
         key: KeyWithMetadata,
+        /// The record as it existed before it was deleted. This will always be `None` if
+        /// [`get_previous`][Watch::get_previous] was not called on the watch.
         prev_record: Option<Record>,
     },
     /// A progress notification from the server.
@@ -258,8 +262,8 @@ impl<W> Watch<W> {
 
     /// Include the previous key-value in each event.
     ///
-    /// When enabled, [`WatchEvent::prev_record`] will contain the record as it existed before the
-    /// event's mutation.
+    /// When enabled, [`WatchEvent::Put::prev_record`] and [`WatchEvent::Delete::prev_record`] will
+    /// contain the record as it existed before the event's mutation.
     pub fn get_previous(mut self) -> Self {
         self.current.prev_kv = true;
         self
@@ -626,7 +630,7 @@ impl WatchSender {
 /// Obtained via [`Watcher::into_parts`]. Implements [`Stream`] — use
 /// [`StreamExt::next`][futures_core::Stream] or `for await` to consume events.
 pub struct WatchStream {
-    inner: Box<dyn Stream<Item = Result<WatchEvent, WatchError>>>,
+    inner: Box<dyn Stream<Item = Result<WatchEvent, WatchError>> + Send>,
 }
 
 impl WatchStream {

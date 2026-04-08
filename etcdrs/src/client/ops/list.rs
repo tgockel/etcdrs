@@ -7,6 +7,7 @@ use crate::{
     pb::{etcdserverpb, mvccpb},
     record::{AsKey, KeyWithMetadata, Record},
 };
+
 use std::{
     future::{Future, IntoFuture},
     marker,
@@ -66,7 +67,7 @@ impl Client {
 pub struct List<C = (), R = Record> {
     client: C,
     pub(crate) request: etcdserverpb::RangeRequest,
-    _return: marker::PhantomData<R>,
+    _return: marker::PhantomData<fn() -> R>,
 }
 
 impl List<(), Record> {
@@ -98,6 +99,18 @@ impl<C, R> List<C, R> {
             request: self.request,
             _return: marker::PhantomData,
         }
+    }
+
+    /// Decompose this operation into its client and a detached `List<(), R>`.
+    pub(crate) fn into_parts(self) -> (C, List<(), R>) {
+        (
+            self.client,
+            List {
+                client: (),
+                request: self.request,
+                _return: marker::PhantomData,
+            },
+        )
     }
 
     fn _with_range(mut self, lower: Bytes, upper: Bytes) -> Self {
@@ -285,7 +298,7 @@ impl<R> ListView<R> {
     pub fn into_stream(self) -> ListIterator<R> {
         let first_kvs = self.first_batch_kvs;
 
-        let iter: Box<dyn Stream<Item = Result<mvccpb::KeyValue, GetError>>> = match self.continuation {
+        let iter: Box<dyn Stream<Item = Result<mvccpb::KeyValue, GetError>> + Send> = match self.continuation {
             None => Box::new(async_stream::stream! {
                 for kv in first_kvs {
                     yield Ok(kv);
@@ -318,42 +331,20 @@ impl<R> ListView<R> {
     }
 }
 
-impl IntoFuture for List<Client, Record> {
-    type Output = Result<ListView<Record>, GetError>;
-    type IntoFuture = ListFuture<Self::Output>;
+impl<R> crate::driver::ListView<R> for ListView<R> {
+    type Stream = ListIterator<R>;
 
-    fn into_future(self) -> Self::IntoFuture {
-        ListFuture(Box::pin(async move {
-            let (header, first_batch_kvs, continuation) = self.fetch_first_batch().await?;
-            Ok(ListView {
-                header,
-                first_batch_kvs,
-                continuation,
-                convert: record_from_pb,
-            })
-        }))
+    fn header(&self) -> &ResponseHeader {
+        &self.header
     }
-}
 
-impl IntoFuture for List<Client, KeyWithMetadata> {
-    type Output = Result<ListView<KeyWithMetadata>, GetError>;
-    type IntoFuture = ListFuture<Self::Output>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        ListFuture(Box::pin(async move {
-            let (header, first_batch_kvs, continuation) = self.fetch_first_batch().await?;
-            Ok(ListView {
-                header,
-                first_batch_kvs,
-                continuation,
-                convert: key_with_metadata_from_pb,
-            })
-        }))
+    fn into_stream(self) -> ListIterator<R> {
+        self.into_stream()
     }
 }
 
 pub struct ListIterator<R> {
-    iter: Box<dyn Stream<Item = Result<mvccpb::KeyValue, GetError>>>,
+    iter: Box<dyn Stream<Item = Result<mvccpb::KeyValue, GetError>> + Send>,
     convert: fn(mvccpb::KeyValue) -> R,
 }
 
@@ -378,7 +369,7 @@ impl<R> futures_core::Stream for ListIterator<R> {
 }
 
 #[cfg(feature = "nightly-async-iterator")]
-impl<R> std::async_iter::AsyncIterator for ListIterator<R> {
+impl<R, S: Stream<Item = Result<R, ListError>> + Unpin> std::async_iter::AsyncIterator for ListIterator<R, S> {
     type Item = Result<R, GetError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -427,6 +418,11 @@ pub struct CountResponse {
 }
 
 impl CountResponse {
+    /// Construct a new `CountResponse`.
+    pub fn new(header: ResponseHeader, count: usize) -> Self {
+        Self { header, count }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ResponseHeader {
         &self.header
@@ -449,12 +445,69 @@ impl<T> Future for ListFuture<T> {
     }
 }
 
-impl IntoFuture for List<Client, usize> {
-    type Output = Result<CountResponse, GetError>;
-    type IntoFuture = ListFuture<Self::Output>;
+impl Client {
+    fn execute_list_impl<R: Send + 'static>(
+        self,
+        list: List<(), R>,
+        convert: fn(mvccpb::KeyValue) -> R,
+    ) -> ListFuture<Result<ListView<R>, GetError>> {
+        ListFuture(Box::pin(async move {
+            let (header, first_batch_kvs, continuation) = list.with_client(self).fetch_first_batch().await?;
+            Ok(ListView {
+                header,
+                first_batch_kvs,
+                continuation,
+                convert,
+            })
+        }))
+    }
+}
 
-    fn into_future(self) -> Self::IntoFuture {
-        ListFuture(Box::pin(self.call()))
+impl crate::driver::ListDriver for Client {
+    type ListView<R> = ListView<R>;
+    type ListViewFuture<R> = ListFuture<Result<Self::ListView<R>, GetError>>;
+    type CountFuture = ListFuture<Result<CountResponse, GetError>>;
+
+    fn execute_list_records(self, list: List<(), Record>) -> Self::ListViewFuture<Record> {
+        self.execute_list_impl(list, record_from_pb)
+    }
+
+    fn execute_list_keys(self, list: List<(), KeyWithMetadata>) -> Self::ListViewFuture<KeyWithMetadata> {
+        self.execute_list_impl(list, key_with_metadata_from_pb)
+    }
+
+    fn execute_count(self, list: List<(), usize>) -> Self::CountFuture {
+        ListFuture(Box::pin(list.with_client(self).call()))
+    }
+}
+
+impl<C: crate::driver::ListDriver> IntoFuture for List<C, usize> {
+    type Output = Result<CountResponse, GetError>;
+    type IntoFuture = C::CountFuture;
+
+    fn into_future(self) -> C::CountFuture {
+        let (client, detached) = self.into_parts();
+        client.execute_count(detached)
+    }
+}
+
+impl<C: crate::driver::ListDriver> IntoFuture for List<C, Record> {
+    type Output = Result<C::ListView<Record>, GetError>;
+    type IntoFuture = C::ListViewFuture<Record>;
+
+    fn into_future(self) -> C::ListViewFuture<Record> {
+        let (client, detached) = self.into_parts();
+        client.execute_list_records(detached)
+    }
+}
+
+impl<C: crate::driver::ListDriver> IntoFuture for List<C, KeyWithMetadata> {
+    type Output = Result<C::ListView<KeyWithMetadata>, GetError>;
+    type IntoFuture = C::ListViewFuture<KeyWithMetadata>;
+
+    fn into_future(self) -> C::ListViewFuture<KeyWithMetadata> {
+        let (client, detached) = self.into_parts();
+        client.execute_list_keys(detached)
     }
 }
 

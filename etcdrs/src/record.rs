@@ -1,3 +1,5 @@
+//! Key-value record types.
+
 use std::ops::{Deref, DerefMut};
 
 use crate::{LeaseId, Revision, Version};

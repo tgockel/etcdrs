@@ -1,3 +1,5 @@
+#![doc = include_str!("client/README.md")]
+
 use crate::{
     LeaseId, Revision, Version,
     record::{KeyWithMetadata, Metadata, Record},

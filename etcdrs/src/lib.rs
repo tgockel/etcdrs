@@ -1,10 +1,12 @@
 #![cfg_attr(feature = "nightly-async-iterator", feature(async_iterator))]
+#![doc = include_str!("../README.md")]
 
 use std::num::{NonZeroI64, NonZeroU64};
 
 #[macro_use]
-pub mod error;
+pub(crate) mod error;
 pub mod client;
+pub mod driver;
 pub(crate) mod pb;
 pub(crate) mod range;
 pub mod record;
@@ -107,6 +109,16 @@ pub struct ResponseHeader {
 }
 
 impl ResponseHeader {
+    /// Construct a new `ResponseHeader`.
+    pub fn new(cluster_id: ClusterId, member_id: MemberId, revision: Revision, raft_term: Term) -> Self {
+        Self {
+            cluster_id,
+            member_id,
+            revision,
+            raft_term,
+        }
+    }
+
     pub(crate) fn from_pb(pb: crate::pb::etcdserverpb::ResponseHeader) -> Self {
         Self {
             cluster_id: ClusterId::new(pb.cluster_id).expect("cluster_id should be non-zero"),

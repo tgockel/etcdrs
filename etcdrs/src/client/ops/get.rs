@@ -60,6 +60,17 @@ impl<C> Get<C> {
             request: self.request,
         }
     }
+
+    /// Decompose this operation into its client and a detached `Get<()>`.
+    pub(crate) fn into_parts(self) -> (C, Get<()>) {
+        (
+            self.client,
+            Get {
+                client: (),
+                request: self.request,
+            },
+        )
+    }
 }
 
 impl Get<Client> {
@@ -100,6 +111,11 @@ pub struct GetResponse {
 }
 
 impl GetResponse {
+    /// Construct a new `GetResponse`.
+    pub fn new(header: ResponseHeader, record: Option<Record>) -> Self {
+        Self { header, record }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ResponseHeader {
         &self.header
@@ -127,12 +143,21 @@ impl Future for GetFuture {
     }
 }
 
-impl IntoFuture for Get<Client> {
-    type Output = Result<GetResponse, GetError>;
-    type IntoFuture = GetFuture;
+impl crate::driver::GetDriver for Client {
+    type GetFuture = GetFuture;
 
-    fn into_future(self) -> Self::IntoFuture {
-        GetFuture(Box::pin(self.call()))
+    fn execute_get(self, get: Get<()>) -> GetFuture {
+        GetFuture(Box::pin(get.with_client(self).call()))
+    }
+}
+
+impl<C: crate::driver::GetDriver> IntoFuture for Get<C> {
+    type Output = Result<GetResponse, GetError>;
+    type IntoFuture = C::GetFuture;
+
+    fn into_future(self) -> C::GetFuture {
+        let (client, detached) = self.into_parts();
+        client.execute_get(detached)
     }
 }
 

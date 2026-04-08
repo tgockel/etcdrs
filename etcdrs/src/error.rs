@@ -52,7 +52,8 @@ macro_rules! define_op_error {
         $vis struct $name(Box<$crate::error::ErrorRepr<$kind>>);
 
         impl $name {
-            pub(crate) fn new(
+            /// Construct a new error of this kind with an optional message and gRPC status.
+            pub fn new(
                 kind: $kind,
                 message: impl Into<std::borrow::Cow<'static, str>>,
                 status: Option<tonic::Status>,
