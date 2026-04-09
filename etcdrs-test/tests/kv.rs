@@ -41,6 +41,8 @@ async fn list_basics(etcd_server: EtcdServer) {
         .list("foo/a"..="foo/d")
         .keys_only()
         .limit(2)
+        .await
+        .unwrap()
         .into_stream()
         .map(Result::unwrap)
         .collect::<Vec<_>>()
@@ -59,7 +61,7 @@ async fn list_pagination_consistent_revision(etcd_server: EtcdServer) {
     }
 
     // Page size of 1 — each poll triggers a separate RangeRequest
-    let mut stream = client.list_prefix("foo/").limit(1).into_stream();
+    let mut stream = client.list_prefix("foo/").limit(1).await.unwrap().into_stream();
 
     // Pull the first item — this pins the revision
     let first = stream.next().await.unwrap().unwrap();
