@@ -672,7 +672,6 @@ impl Stream for ReceiverStream {
 
 /// What went wrong with a watch operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum WatchErrorKind {
     /// The watch was compacted — the requested revision is older than the server's compacted
     /// revision.
@@ -682,7 +681,7 @@ pub enum WatchErrorKind {
     /// The server returned an invalid or unexpected response.
     InvalidResponse,
     /// A gRPC transport or unexpected error.
-    Transport,
+    Unknown,
 }
 
 /// An error from a watch operation.
@@ -739,7 +738,7 @@ impl WatchError {
 
     pub(crate) fn from_status(status: tonic::Status) -> Self {
         Self(Box::new(WatchErrorRepr {
-            kind: WatchErrorKind::Transport,
+            kind: WatchErrorKind::Unknown,
             watch_id: None,
             compact_revision: None,
             message: Cow::Borrowed(""),

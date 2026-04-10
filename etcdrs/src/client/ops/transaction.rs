@@ -517,13 +517,53 @@ impl TransactionOpResponse {
     }
 }
 
+/// An enumeration of the [`kind`][TransactionError::kind]s of errors that can occur from a
+/// [`transaction`][Client::transaction] commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum TransactionErrorKind {
-    /// The arguments were invalid (e.g., duplicate keys in operations).
+    /// The request structure is invalid.
+    ///
+    /// This comes from the gRPC API as `INVALID_ARGUMENT`. Common causes include too many operations, duplicate keys
+    /// in the same branch, or invalid sub-operation arguments.
     InvalidArgument,
-    /// A gRPC transport or unexpected error.
-    Transport,
+    /// A sub-operation requested a revision older than the server has.
+    ///
+    /// This comes from the gRPC API as `OUT_OF_RANGE`.
+    CompactedRevision,
+    /// A sub-operation requested a revision newer than the server has.
+    ///
+    /// This comes from the gRPC API as `OUT_OF_RANGE`.
+    FutureRevision,
+    /// A sub-put references a lease that does not exist.
+    ///
+    /// This comes from the gRPC API as `NOT_FOUND`.
+    LeaseNotFound,
+    /// There is an authentication or authorization error.
+    ///
+    /// This comes from the gRPC API as `UNAUTHENTICATED` or `PERMISSION_DENIED`.
+    Authentication,
+    /// The server or transport is resource-exhausted.
+    ///
+    /// This comes from the gRPC API as `RESOURCE_EXHAUSTED`.
+    Exhausted,
+    /// The server has lost data.
+    ///
+    /// This comes from the gRPC API as `DATA_LOSS`.
+    DataLoss,
+    /// The server is not ready to serve that request.
+    ///
+    /// This comes from the gRPC API as `UNAVAILABLE`.
+    Unavailable,
+    /// The request timed out.
+    ///
+    /// This comes from the gRPC API as `CANCELLED` or `DEADLINE_EXCEEDED`. We do not distinguish between the two, as
+    /// the source of the timeout is usually not important.
+    Timeout,
+    /// An error that is not covered by any other error kind.
+    ///
+    /// All uncovered gRPC errors are mapped to this kind of error. They should not happen unless the etcd server has
+    /// changed its error codes.
+    Unknown,
 }
 
 define_op_error! {
@@ -535,7 +575,24 @@ impl TransactionError {
     pub(crate) fn from_status(status: tonic::Status) -> Self {
         let kind = match status.code() {
             tonic::Code::InvalidArgument => TransactionErrorKind::InvalidArgument,
-            _ => TransactionErrorKind::Transport,
+            tonic::Code::NotFound => TransactionErrorKind::LeaseNotFound,
+            tonic::Code::Unauthenticated => TransactionErrorKind::Authentication,
+            tonic::Code::PermissionDenied => TransactionErrorKind::Authentication,
+            tonic::Code::OutOfRange => {
+                if status.message().contains("compacted") {
+                    TransactionErrorKind::CompactedRevision
+                } else if status.message().contains("future") {
+                    TransactionErrorKind::FutureRevision
+                } else {
+                    TransactionErrorKind::Unknown
+                }
+            }
+            tonic::Code::ResourceExhausted => TransactionErrorKind::Exhausted,
+            tonic::Code::DataLoss => TransactionErrorKind::DataLoss,
+            tonic::Code::Unavailable => TransactionErrorKind::Unavailable,
+            // Don't care who timed us out
+            tonic::Code::Cancelled | tonic::Code::DeadlineExceeded => TransactionErrorKind::Timeout,
+            _ => TransactionErrorKind::Unknown,
         };
         Self::new(kind, "", Some(status))
     }

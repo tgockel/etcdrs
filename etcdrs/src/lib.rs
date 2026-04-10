@@ -11,8 +11,8 @@ pub mod record;
 
 pub use client::{
     BuildError, Client, DeleteError, DeleteErrorKind, GetError, GetErrorKind, GrantLeaseError, GrantLeaseErrorKind,
-    ListError, ListErrorKind, PutError, PutErrorKind, RevokeLeaseError, RevokeLeaseErrorKind, TransactionError,
-    TransactionErrorKind, WatchError, WatchErrorKind, WatchId,
+    PutError, PutErrorKind, RevokeLeaseError, RevokeLeaseErrorKind, TransactionError, TransactionErrorKind, WatchError,
+    WatchErrorKind, WatchId,
 };
 pub use error::OperationError;
 pub use range::{AsRange, Prefix};

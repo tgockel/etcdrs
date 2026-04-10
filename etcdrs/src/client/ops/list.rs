@@ -2,7 +2,7 @@ use bytes::Bytes;
 use futures_core::Stream;
 
 use crate::{
-    AsRange, Prefix, ResponseHeader, Revision,
+    AsRange, GetError, GetErrorKind, Prefix, ResponseHeader, Revision,
     client::{Client, key_with_metadata_from_pb, record_from_pb},
     pb::{etcdserverpb, mvccpb},
     record::{AsKey, KeyWithMetadata, Record},
@@ -166,7 +166,7 @@ impl<C, R> List<C, R> {
 impl<R> List<Client, R> {
     async fn fetch_first_batch(
         self,
-    ) -> Result<(ResponseHeader, Vec<mvccpb::KeyValue>, Option<ListContinuation>), ListError> {
+    ) -> Result<(ResponseHeader, Vec<mvccpb::KeyValue>, Option<ListContinuation>), GetError> {
         let mut request = self.request;
         if request.key.is_empty() && request.range_end.is_empty() {
             request.key = Bytes::from_static(&[0]);
@@ -182,7 +182,7 @@ impl<R> List<Client, R> {
                 request.clone(),
             )
             .await
-            .map_err(ListError::from_status)?;
+            .map_err(GetError::from_status)?;
 
         let header = ResponseHeader::from_pb(resp.header.expect("RangeResponse should have a valid header"));
 
@@ -193,8 +193,8 @@ impl<R> List<Client, R> {
             }
 
             let Some(last_kv) = resp.kvs.last() else {
-                return Err(ListError::new(
-                    ListErrorKind::InvalidResponse,
+                return Err(GetError::new(
+                    GetErrorKind::Unknown,
                     "`range` call has no results, but `more = true`...is something wrong with the server?",
                     None,
                 ));
@@ -207,14 +207,13 @@ impl<R> List<Client, R> {
         } else {
             None
         };
-
         Ok((header, resp.kvs, continuation))
     }
 }
 
 fn stream_remaining_chunks(
     continuation: ListContinuation,
-) -> impl Stream<Item = Result<etcdserverpb::RangeResponse, ListError>> {
+) -> impl Stream<Item = Result<etcdserverpb::RangeResponse, GetError>> {
     async_stream::stream! {
         let ListContinuation { client, mut request } = continuation;
         loop {
@@ -226,7 +225,7 @@ fn stream_remaining_chunks(
                 Ok(resp) => resp,
                 Err(status) => {
                     let is_unavailable = status.code() == tonic::Code::Unavailable;
-                    yield Err(ListError::from_status(status));
+                    yield Err(GetError::from_status(status));
                     if is_unavailable {
                         continue;
                     } else {
@@ -238,8 +237,8 @@ fn stream_remaining_chunks(
             let more = resp.more;
             if more {
                 let Some(last_kv) = resp.kvs.last() else {
-                    yield Err(ListError::new(
-                        ListErrorKind::InvalidResponse,
+                    yield Err(GetError::new(
+                        GetErrorKind::Unknown,
                         "`range` call has no results, but `more = true`...is something wrong with the server?",
                         None,
                     ));
@@ -286,7 +285,7 @@ impl<R> ListView<R> {
     pub fn into_stream(self) -> ListIterator<R> {
         let first_kvs = self.first_batch_kvs;
 
-        let iter: Box<dyn Stream<Item = Result<mvccpb::KeyValue, ListError>>> = match self.continuation {
+        let iter: Box<dyn Stream<Item = Result<mvccpb::KeyValue, GetError>>> = match self.continuation {
             None => Box::new(async_stream::stream! {
                 for kv in first_kvs {
                     yield Ok(kv);
@@ -320,7 +319,7 @@ impl<R> ListView<R> {
 }
 
 impl IntoFuture for List<Client, Record> {
-    type Output = Result<ListView<Record>, ListError>;
+    type Output = Result<ListView<Record>, GetError>;
     type IntoFuture = ListFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -337,7 +336,7 @@ impl IntoFuture for List<Client, Record> {
 }
 
 impl IntoFuture for List<Client, KeyWithMetadata> {
-    type Output = Result<ListView<KeyWithMetadata>, ListError>;
+    type Output = Result<ListView<KeyWithMetadata>, GetError>;
     type IntoFuture = ListFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -354,12 +353,12 @@ impl IntoFuture for List<Client, KeyWithMetadata> {
 }
 
 pub struct ListIterator<R> {
-    iter: Box<dyn Stream<Item = Result<mvccpb::KeyValue, ListError>>>,
+    iter: Box<dyn Stream<Item = Result<mvccpb::KeyValue, GetError>>>,
     convert: fn(mvccpb::KeyValue) -> R,
 }
 
 impl<R> ListIterator<R> {
-    fn poll_next_impl(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Option<R>, ListError>> {
+    fn poll_next_impl(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Option<R>, GetError>> {
         let convert = self.as_ref().convert;
         let iter = unsafe { self.map_unchecked_mut(|s| s.iter.as_mut()) };
         iter.poll_next(cx).map(|item| match item {
@@ -371,7 +370,7 @@ impl<R> ListIterator<R> {
 }
 
 impl<R> futures_core::Stream for ListIterator<R> {
-    type Item = Result<R, ListError>;
+    type Item = Result<R, GetError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll_next_impl(cx).map(Result::transpose)
@@ -380,7 +379,7 @@ impl<R> futures_core::Stream for ListIterator<R> {
 
 #[cfg(feature = "nightly-async-iterator")]
 impl<R> std::async_iter::AsyncIterator for ListIterator<R> {
-    type Item = Result<R, ListError>;
+    type Item = Result<R, GetError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll_next_impl(cx).map(Result::transpose)
@@ -392,7 +391,7 @@ impl<R> std::async_iter::IntoAsyncIterator for ListView<R>
 where
     R: 'static,
 {
-    type Item = Result<R, ListError>;
+    type Item = Result<R, GetError>;
     type IntoAsyncIter = ListIterator<R>;
 
     fn into_async_iter(self) -> Self::IntoAsyncIter {
@@ -401,7 +400,7 @@ where
 }
 
 impl List<Client, usize> {
-    async fn call(self) -> Result<CountResponse, ListError> {
+    async fn call(self) -> Result<CountResponse, GetError> {
         let resp = self
             .client
             .inner
@@ -411,7 +410,7 @@ impl List<Client, usize> {
                 self.request,
             )
             .await
-            .map_err(ListError::from_status)?;
+            .map_err(GetError::from_status)?;
         let header = ResponseHeader::from_pb(resp.header.expect("RangeResponse should have a valid header"));
         Ok(CountResponse {
             header,
@@ -451,7 +450,7 @@ impl<T> Future for ListFuture<T> {
 }
 
 impl IntoFuture for List<Client, usize> {
-    type Output = Result<CountResponse, ListError>;
+    type Output = Result<CountResponse, GetError>;
     type IntoFuture = ListFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -464,31 +463,11 @@ struct ListContinuation {
     request: etcdserverpb::RangeRequest,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ListErrorKind {
-    /// The server returned an invalid or unexpected response.
-    InvalidResponse,
-    /// A gRPC transport or unexpected error.
-    Transport,
-}
-
-define_op_error! {
-    /// An error from a [`list`][Client::list] operation.
-    pub struct ListError(ListErrorKind);
-}
-
-impl ListError {
-    pub(crate) fn from_status(status: tonic::Status) -> Self {
-        Self::new(ListErrorKind::Transport, "", Some(status))
-    }
-}
-
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _check() {
-        _assert_send::<ListFuture<Result<CountResponse, ListError>>>();
-        _assert_send::<ListFuture<Result<ListView<Record>, ListError>>>();
-        _assert_send::<ListFuture<Result<ListView<KeyWithMetadata>, ListError>>>();
+        _assert_send::<ListFuture<Result<CountResponse, GetError>>>();
+        _assert_send::<ListFuture<Result<ListView<Record>, GetError>>>();
+        _assert_send::<ListFuture<Result<ListView<KeyWithMetadata>, GetError>>>();
     }
 };

@@ -305,11 +305,33 @@ impl IntoFuture for Delete<Client, usize, GetPreviousValue> {
     }
 }
 
+/// An enumeration of the [`kind`][DeleteError::kind]s of errors that can occur from a
+/// [`delete`][Client::delete] or [`delete_range`][Client::delete_range] operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum DeleteErrorKind {
-    /// A gRPC transport or unexpected error.
-    Transport,
+    /// There is an authentication or authorization error.
+    ///
+    /// This comes from the gRPC API as `UNAUTHENTICATED`, `PERMISSION_DENIED` and `INVALID_ARGUMENT` when the argument
+    /// describes an authentication error.
+    Authentication,
+    /// The server or transport is resource-exhausted.
+    ///
+    /// This comes from the gRPC API as `RESOURCE_EXHAUSTED`.
+    Exhausted,
+    /// The server is not ready to serve that request.
+    ///
+    /// This comes from the gRPC API as `UNAVAILABLE`.
+    Unavailable,
+    /// The request timed out.
+    ///
+    /// This comes from the gRPC API as `CANCELLED` or `DEADLINE_EXCEEDED`. We do not distinguish between the two, as
+    /// the source of the timeout is usually not important.
+    Timeout,
+    /// An error that is not covered by any other error kind.
+    ///
+    /// All uncovered gRPC errors are mapped to this kind of error. They should not happen unless the etcd server has
+    /// changed its error codes.
+    Unknown,
 }
 
 define_op_error! {
@@ -319,7 +341,18 @@ define_op_error! {
 
 impl DeleteError {
     pub(crate) fn from_status(status: tonic::Status) -> Self {
-        Self::new(DeleteErrorKind::Transport, "", Some(status))
+        let kind = match status.code() {
+            tonic::Code::Unauthenticated => DeleteErrorKind::Authentication,
+            tonic::Code::PermissionDenied => DeleteErrorKind::Authentication,
+            // NOTE: Other "invalid arguments" won't be returned because we won't send bad arguments
+            tonic::Code::InvalidArgument => DeleteErrorKind::Authentication,
+            tonic::Code::ResourceExhausted => DeleteErrorKind::Exhausted,
+            tonic::Code::Unavailable => DeleteErrorKind::Unavailable,
+            // Don't care who timed us out
+            tonic::Code::Cancelled | tonic::Code::DeadlineExceeded => DeleteErrorKind::Timeout,
+            _ => DeleteErrorKind::Unknown,
+        };
+        Self::new(kind, "", Some(status))
     }
 }
 
