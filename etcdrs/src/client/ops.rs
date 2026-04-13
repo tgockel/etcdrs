@@ -1,3 +1,6 @@
+mod auth;
+pub use auth::*;
+
 mod delete;
 pub use delete::*;
 
@@ -15,6 +18,9 @@ pub use put::*;
 
 mod transaction;
 pub use transaction::*;
+
+mod user;
+pub use user::*;
 
 mod watch;
 pub use watch::*;

@@ -46,11 +46,22 @@ enum Remote {
 type ConfigureEndpointFn =
     dyn Fn(tonic::transport::Endpoint) -> Result<tonic::transport::Endpoint, Box<dyn std::error::Error + Send + Sync>>;
 
+struct Credentials {
+    username: String,
+    password: String,
+}
+
+enum AuthConfig {
+    Credentials(Credentials),
+    Token(tonic::metadata::AsciiMetadataValue),
+}
+
 #[derive(Default)]
 pub struct ClientBuilder {
     remotes: Vec<Remote>,
     configure_endpoint: Option<Box<ConfigureEndpointFn>>,
     metrics: Option<Box<dyn MetricsCollector>>,
+    auth: Option<AuthConfig>,
 }
 
 impl ClientBuilder {
@@ -115,11 +126,38 @@ impl ClientBuilder {
         self
     }
 
+    /// Set credentials for authenticating with the etcd cluster.
+    ///
+    /// When the client encounters an `UNAUTHENTICATED` error, it will use these credentials to
+    /// obtain an auth token via the `Authenticate` RPC, then retry the request. The token is cached
+    /// and reused for subsequent requests.
+    pub fn credentials(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
+        self.auth = Some(AuthConfig::Credentials(Credentials {
+            username: username.into(),
+            password: password.into(),
+        }));
+        self
+    }
+
+    /// Set a pre-obtained auth token for authenticating with the etcd cluster.
+    ///
+    /// The token is injected into all requests. If the token expires, the client cannot refresh it
+    /// automatically; use [`credentials`][Self::credentials] instead for automatic token management.
+    pub fn auth_token(mut self, token: impl Into<String>) -> Result<Self, BuildError> {
+        let value = token
+            .into()
+            .parse::<tonic::metadata::AsciiMetadataValue>()
+            .map_err(|err| BuildError::InvalidAuthToken(Box::new(err)))?;
+        self.auth = Some(AuthConfig::Token(value));
+        Ok(self)
+    }
+
     pub fn build(self) -> Result<Client, BuildError> {
         let Self {
             remotes,
             configure_endpoint,
             metrics,
+            auth,
         } = self;
 
         if remotes.is_empty() {
@@ -146,13 +184,27 @@ impl ClientBuilder {
             tonic::transport::Channel::balance_list(endpoints.into_iter())
         };
 
+        let auth = auth.map(|config| match config {
+            AuthConfig::Credentials(creds) => AuthState {
+                credentials: Some(creds),
+                token: tokio::sync::RwLock::new((0, None)),
+                refresh: tokio::sync::Mutex::new(()),
+            },
+            AuthConfig::Token(token) => AuthState {
+                credentials: None,
+                token: tokio::sync::RwLock::new((0, Some(token))),
+                refresh: tokio::sync::Mutex::new(()),
+            },
+        });
+
         Ok(Client {
-            inner: Arc::new(ClientInner { channel, metrics }),
+            inner: Arc::new(ClientInner { channel, metrics, auth }),
         })
     }
 }
 
 /// An error from building a [`Client`].
+#[derive(Debug)]
 pub enum BuildError {
     /// An invalid URI was provided.
     InvalidUri(Box<dyn std::error::Error + Send + Sync>),
@@ -160,16 +212,8 @@ pub enum BuildError {
     NoEndpoints,
     /// The [`configure_endpoint`][ClientBuilder::configure_endpoint] callback returned an error.
     EndpointConfiguration(Box<dyn std::error::Error + Send + Sync>),
-}
-
-impl fmt::Debug for BuildError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidUri(err) => f.debug_tuple("InvalidUri").field(err).finish(),
-            Self::NoEndpoints => f.debug_tuple("NoEndpoints").finish(),
-            Self::EndpointConfiguration(err) => f.debug_tuple("EndpointConfiguration").field(err).finish(),
-        }
-    }
+    /// An invalid auth token was provided.
+    InvalidAuthToken(Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl fmt::Display for BuildError {
@@ -178,6 +222,7 @@ impl fmt::Display for BuildError {
             Self::InvalidUri(err) => write!(f, "invalid URI: {err}"),
             Self::NoEndpoints => write!(f, "no endpoints were configured"),
             Self::EndpointConfiguration(err) => write!(f, "endpoint configuration failed: {err}"),
+            Self::InvalidAuthToken(err) => write!(f, "invalid auth token: {err}"),
         }
     }
 }
@@ -185,15 +230,26 @@ impl fmt::Display for BuildError {
 impl std::error::Error for BuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::InvalidUri(err) | Self::EndpointConfiguration(err) => Some(&**err),
+            Self::InvalidUri(err) | Self::EndpointConfiguration(err) | Self::InvalidAuthToken(err) => Some(&**err),
             Self::NoEndpoints => None,
         }
     }
 }
 
+struct AuthState {
+    credentials: Option<Credentials>,
+    /// The cached auth token and a generation counter. The generation is incremented each time the
+    /// token is refreshed, allowing concurrent callers to detect stale tokens without a separate
+    /// invalidation step.
+    token: tokio::sync::RwLock<(u64, Option<tonic::metadata::AsciiMetadataValue>)>,
+    /// Serializes refresh attempts so only one `Authenticate` RPC runs at a time.
+    refresh: tokio::sync::Mutex<()>,
+}
+
 struct ClientInner {
     channel: tonic::transport::Channel,
     metrics: Option<Box<dyn MetricsCollector>>,
+    auth: Option<AuthState>,
 }
 
 fn metadata_from_pb(r: &crate::pb::mvccpb::KeyValue) -> Metadata {
@@ -244,11 +300,26 @@ impl ClientInner {
             if let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
                 call_request.set_timeout(remaining);
             }
+            let mut token_generation = 0u64;
+            if let Some(ref auth) = self.auth {
+                let state = auth.token.read().await;
+                if let Some(ref token) = state.1 {
+                    call_request.metadata_mut().insert("token", token.clone());
+                }
+                token_generation = state.0;
+            }
             let response = call(&mut client, call_request).await;
             metric.complete(response.is_ok());
             match response {
                 Ok(r) => break Ok(r.into_inner()),
                 Err(e) => {
+                    if Self::is_auth_error(&e)
+                        && self.auth.is_some()
+                        && self.refresh_auth_token(token_generation).await.is_ok()
+                        && std::time::Instant::now() <= deadline
+                    {
+                        continue;
+                    }
                     if Self::can_retry(&e) && std::time::Instant::now() <= deadline {
                         continue;
                     }
@@ -260,5 +331,17 @@ impl ClientInner {
 
     fn can_retry(status: &tonic::Status) -> bool {
         status.code() == tonic::Code::Unavailable || is_client_side_timeout(status)
+    }
+
+    /// Check if a gRPC status represents an authentication/authorization error.
+    ///
+    /// etcd returns different codes depending on context: `UNAUTHENTICATED` for expired tokens,
+    /// `PERMISSION_DENIED` for insufficient permissions, and `INVALID_ARGUMENT` with auth-related
+    /// messages (e.g., "user name is empty") when no token is provided.
+    fn is_auth_error(status: &tonic::Status) -> bool {
+        matches!(
+            status.code(),
+            tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+        ) || (status.code() == tonic::Code::InvalidArgument && status.message().contains("user name"))
     }
 }

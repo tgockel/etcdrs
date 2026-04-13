@@ -10,9 +10,11 @@ pub(crate) mod range;
 pub mod record;
 
 pub use client::{
-    BuildError, Client, DeleteError, DeleteErrorKind, GetError, GetErrorKind, GrantLeaseError, GrantLeaseErrorKind,
-    PutError, PutErrorKind, RevokeLeaseError, RevokeLeaseErrorKind, TransactionError, TransactionErrorKind, WatchError,
-    WatchErrorKind, WatchId,
+    AuthDisableResponse, AuthEnableResponse, AuthError, AuthErrorKind, AuthenticateResponse, BuildError, Client,
+    DeleteError, DeleteErrorKind, GetError, GetErrorKind, GrantLeaseError, GrantLeaseErrorKind, PutError, PutErrorKind,
+    RevokeLeaseError, RevokeLeaseErrorKind, RoleAddResponse, RoleError, RoleErrorKind, TransactionError,
+    TransactionErrorKind, UserAddResponse, UserError, UserErrorKind, UserGrantRoleResponse, WatchError, WatchErrorKind,
+    WatchId,
 };
 pub use error::OperationError;
 pub use range::{AsRange, Prefix};
