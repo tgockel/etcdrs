@@ -207,7 +207,11 @@ impl GrantLease<Client> {
 
         let header = ResponseHeader::from_pb(resp.header.expect("LeaseGrantResponse should have a valid header"));
         let lease_id = LeaseId::new(resp.id).expect("etcd server should have returned a lease");
-        let ttl = if resp.ttl > 0 { Some(Duration::from_secs(resp.ttl as _)) } else { None };
+        let ttl = if resp.ttl > 0 {
+            Some(Duration::from_secs(resp.ttl as _))
+        } else {
+            None
+        };
 
         Ok(GrantLeaseResponse {
             header,
@@ -544,7 +548,9 @@ impl KeepAliveSender {
     /// The server will respond with a [`KeepAliveResponse`] containing the lease's remaining TTL.
     /// A [`ttl`][LeaseInfo::ttl] of [`None`] indicates the lease has already expired.
     pub fn keep_alive(&self, lease_id: LeaseId) {
-        let _ = self.sender.send(etcdserverpb::LeaseKeepAliveRequest { id: lease_id.get() });
+        let _ = self
+            .sender
+            .send(etcdserverpb::LeaseKeepAliveRequest { id: lease_id.get() });
     }
 }
 
@@ -553,11 +559,14 @@ impl KeepAliveSender {
 /// Obtained via [`LeaseKeeper::into_parts`]. Implements [`Stream`] — use
 /// [`StreamExt::next`][futures_core::Stream] or `for await` to consume responses.
 pub struct KeepAliveStream {
-    inner: Box<dyn Stream<Item = Result<KeepAliveResponse, KeepAliveError>>>,
+    inner: Box<dyn Stream<Item = Result<KeepAliveResponse, KeepAliveError>> + Send>,
 }
 
 impl KeepAliveStream {
-    fn poll_next_impl(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<Option<KeepAliveResponse>, KeepAliveError>> {
+    fn poll_next_impl(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Result<Option<KeepAliveResponse>, KeepAliveError>> {
         let inner = unsafe { self.map_unchecked_mut(|s| s.inner.as_mut()) };
         inner.poll_next(cx).map(|item| match item {
             None => Ok(None),
@@ -665,5 +674,8 @@ const _: () = {
     fn _assert_send<T: Send>() {}
     fn _check() {
         _assert_send::<GrantLeaseFuture>();
+        _assert_send::<KeepAliveSender>();
+        _assert_send::<KeepAliveStream>();
+        _assert_send::<LeaseKeeper>();
     }
 };

@@ -1,0 +1,24 @@
+[package]
+name = "etcdrs-util"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-stream.workspace = true
+bytes.workspace = true
+etcdrs.workspace = true
+futures = { workspace = true, default-features = false, features = ["std"] }
+futures-core.workspace = true
+rand.workspace = true
+tokio = { workspace = true, default-features = false, features = ["rt", "sync"] }
+
+[dev-dependencies]
+etcdrs-test = { workspace = true, features = ["rstest"] }
+rstest.workspace = true
+tokio = { workspace = true, default-features = false, features = ["macros", "rt", "time"] }
+
+[features]
+default = [
+    "lease-pool"
+]
+lease-pool = ["tokio/time"]
