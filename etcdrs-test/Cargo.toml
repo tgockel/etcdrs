@@ -10,8 +10,8 @@ rstest = ["dep:rstest"]
 etcdrs.workspace = true
 etcd-bin-vendored.workspace = true
 futures = { workspace = true, default-features = true }
-rand.workspace = true
-rstest = { workspace = true, optional = true }
+rand = { workspace = true, features = ["std", "std_rng"] }
+rstest = { workspace = true, optional = true, features = ["async-timeout", "crate-name"] }
 
 [dev-dependencies]
 etcdrs-test = { path = ".", features = ["rstest"] }

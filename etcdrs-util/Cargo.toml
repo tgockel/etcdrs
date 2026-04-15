@@ -5,16 +5,16 @@ edition.workspace = true
 
 [dependencies]
 async-stream.workspace = true
-bytes.workspace = true
+bytes = { workspace = true, features = ["std"] }
 etcdrs.workspace = true
 futures = { workspace = true, default-features = false, features = ["std"] }
-futures-core.workspace = true
-rand.workspace = true
+futures-core = { workspace = true, features = ["std"] }
+rand = { workspace = true, features = ["std", "std_rng"] }
 tokio = { workspace = true, default-features = false, features = ["rt", "sync"] }
 
 [dev-dependencies]
 etcdrs-test = { workspace = true, features = ["rstest"] }
-rstest.workspace = true
+rstest = { workspace = true, features = ["async-timeout", "crate-name"] }
 tokio = { workspace = true, default-features = false, features = ["macros", "rt", "time"] }
 
 [features]
