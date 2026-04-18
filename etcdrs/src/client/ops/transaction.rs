@@ -163,22 +163,61 @@ impl<C> Transaction<C> {
     }
 }
 
-impl Transaction<Client> {
+impl<C: crate::driver::TransactionDriver> Transaction<C> {
     /// Attempt to commit the transaction to the database.
     ///
     /// **Remember that an `Ok` result does not mean the transaction [`succeeded`][TransactionResponse::succeeded]**, it
     /// only means the attempt made a round trip to the server.
-    pub async fn commit(self) -> Result<TransactionResponse, TransactionError> {
-        self.client
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::kv_client::KvClient::new,
-                async |c, r| c.txn(r).await,
-                self.request,
-            )
-            .await
-            .map(|response| TransactionResponse::from_pb(response, &self.success_kinds, &self.failure_kinds))
-            .map_err(TransactionError::from_status)
+    pub fn commit(self) -> C::CommitFuture {
+        let Transaction {
+            client,
+            request,
+            success_kinds,
+            failure_kinds,
+        } = self;
+        client.execute_transaction(Transaction {
+            client: (),
+            request,
+            success_kinds,
+            failure_kinds,
+        })
+    }
+}
+
+/// The [`Future`] type returned by awaiting [`Transaction`] commits.
+pub struct TransactionFuture(
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<TransactionResponse, TransactionError>> + Send>>,
+);
+
+impl std::future::Future for TransactionFuture {
+    type Output = Result<TransactionResponse, TransactionError>;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
+impl crate::driver::TransactionDriver for Client {
+    type CommitFuture = TransactionFuture;
+
+    fn execute_transaction(self, txn: Transaction<()>) -> Self::CommitFuture {
+        let Transaction {
+            client: (),
+            request,
+            success_kinds,
+            failure_kinds,
+        } = txn;
+        TransactionFuture(Box::pin(async move {
+            self.inner
+                .wrap_unary_call(
+                    etcdserverpb::kv_client::KvClient::new,
+                    async |c, r| c.txn(r).await,
+                    request,
+                )
+                .await
+                .map(|response| TransactionResponse::from_pb(response, &success_kinds, &failure_kinds))
+                .map_err(TransactionError::from_status)
+        }))
     }
 }
 

@@ -8,7 +8,7 @@ use std::{
 use bytes::Bytes;
 
 use crate::{
-    AsRange, Client, Prefix, ResponseHeader,
+    AsRange, Client, Prefix, ResponseHeader, TargetRange,
     client::{GetPreviousValue, record_from_pb},
     pb::etcdserverpb,
     record::{AsKey, Record},
@@ -130,6 +130,11 @@ impl<C, R, P> Delete<C, R, P> {
         }
     }
 
+    /// The range this operation addresses.
+    pub fn target_range(&self) -> TargetRange<'_> {
+        TargetRange::from_wire(&self.request.key, &self.request.range_end)
+    }
+
     /// Decompose this operation into its client and a detached `Delete<(), R, P>`.
     pub(crate) fn into_parts(self) -> (C, Delete<(), R, P>) {
         (
@@ -141,7 +146,16 @@ impl<C, R, P> Delete<C, R, P> {
             },
         )
     }
+}
 
+impl<C, P> Delete<C, bool, P> {
+    /// The key this single-key delete addresses.
+    pub fn target_key(&self) -> &[u8] {
+        &self.request.key
+    }
+}
+
+impl<C, R, P> Delete<C, R, P> {
     /// Return the previous key-value.
     ///
     /// If you are deleting a single key, this means the previous value of the key will be returned.

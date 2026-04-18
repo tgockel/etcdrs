@@ -2,7 +2,7 @@ use bytes::Bytes;
 use futures_core::Stream;
 
 use crate::{
-    AsRange, GetError, GetErrorKind, Prefix, ResponseHeader, Revision,
+    AsRange, GetError, GetErrorKind, Prefix, ResponseHeader, Revision, TargetRange,
     client::{Client, key_with_metadata_from_pb, record_from_pb},
     pb::{etcdserverpb, mvccpb},
     record::{AsKey, KeyWithMetadata, Record},
@@ -99,6 +99,11 @@ impl<C, R> List<C, R> {
             request: self.request,
             _return: marker::PhantomData,
         }
+    }
+
+    /// The range this operation addresses.
+    pub fn target_range(&self) -> TargetRange<'_> {
+        TargetRange::from_wire(&self.request.key, &self.request.range_end)
     }
 
     /// Decompose this operation into its client and a detached `List<(), R>`.

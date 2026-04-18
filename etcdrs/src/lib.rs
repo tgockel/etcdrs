@@ -19,7 +19,7 @@ pub use client::{
     UserGrantRoleResponse, WatchError, WatchErrorKind, WatchId,
 };
 pub use error::OperationError;
-pub use range::{AsRange, Prefix};
+pub use range::{AsRange, Prefix, TargetRange};
 pub use record::{KeyWithMetadata, Metadata, Record};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]

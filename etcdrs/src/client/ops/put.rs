@@ -65,6 +65,11 @@ impl<C, R> Put<C, R> {
         }
     }
 
+    /// The key this operation addresses.
+    pub fn target_key(&self) -> &[u8] {
+        &self.request.key
+    }
+
     /// Decompose this operation into its client and a detached `Put<(), R>`.
     pub(crate) fn into_parts(self) -> (C, Put<(), R>) {
         (

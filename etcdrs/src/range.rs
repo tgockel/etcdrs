@@ -100,6 +100,38 @@ impl<T: AsKey + ?Sized> AsRange for T {
     }
 }
 
+/// A decoded view of an etcd range request's `(key, range_end)` bytes.
+///
+/// This is the inverse of [`AsRange::as_boundaries`]: given the wire bytes stored in a
+/// [`RangeRequest`][crate::pb::etcdserverpb::RangeRequest] (or any operation that carries the same
+/// encoding, such as a [`Delete`][crate::client::Delete]), it tells you what the operation
+/// addresses in human terms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetRange<'a> {
+    /// Every key in the store (wire: `key = [0]`, `range_end = [0]`).
+    All,
+    /// A single key lookup (wire: `key = k`, `range_end = ""`).
+    Single(&'a [u8]),
+    /// The range `[lower, upper)` with an explicit upper bound (wire: both non-empty and
+    /// `range_end != [0]`).
+    Span(&'a [u8], &'a [u8]),
+    /// Every key `>= lower` (wire: `key = k`, `range_end = [0]`, `k != [0]`).
+    ToEnd(&'a [u8]),
+}
+
+impl<'a> TargetRange<'a> {
+    /// Decode the wire representation of `(key, range_end)` used by etcd range-bearing
+    /// operations.
+    pub fn from_wire(key: &'a [u8], range_end: &'a [u8]) -> Self {
+        match (key, range_end) {
+            ([0], [0]) => TargetRange::All,
+            (k, []) => TargetRange::Single(k),
+            (k, [0]) => TargetRange::ToEnd(k),
+            (k, e) => TargetRange::Span(k, e),
+        }
+    }
+}
+
 /// Add one bit to the last element of `input`, carrying left on overflow.
 ///
 /// This is used in range queries to specify "include this `input`".
@@ -130,7 +162,18 @@ pub(crate) fn successor(input: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::add_one;
+    use super::{TargetRange, add_one};
+
+    #[test]
+    fn target_range_from_wire() {
+        assert_eq!(TargetRange::from_wire(&[0], &[0]), TargetRange::All);
+        assert_eq!(TargetRange::from_wire(b"foo", b""), TargetRange::Single(b"foo"));
+        assert_eq!(TargetRange::from_wire(b"foo", &[0]), TargetRange::ToEnd(b"foo"));
+        assert_eq!(
+            TargetRange::from_wire(b"foo/", b"foo0"),
+            TargetRange::Span(b"foo/", b"foo0"),
+        );
+    }
 
     #[test]
     fn test_add_one() {

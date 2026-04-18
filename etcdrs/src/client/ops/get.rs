@@ -61,6 +61,11 @@ impl<C> Get<C> {
         }
     }
 
+    /// The key this operation addresses.
+    pub fn target_key(&self) -> &[u8] {
+        &self.request.key
+    }
+
     /// Decompose this operation into its client and a detached `Get<()>`.
     pub(crate) fn into_parts(self) -> (C, Get<()>) {
         (
