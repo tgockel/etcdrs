@@ -1,0 +1,26 @@
+name: unit-test
+
+on:
+  push:
+    branches: [ "trunk" ]
+  pull_request:
+    branches: [ "trunk" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Test/Debug
+      run: cargo test --verbose
+    - name: Test/Release
+      run: cargo test --release --verbose
+    - name: Docs
+      run: cargo doc --verbose
+    - name: Format Check
+      run: cargo fmt --check
+    - name: Clippy
+      run: cargo clippy
