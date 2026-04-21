@@ -210,10 +210,10 @@ impl ServerName {
 }
 
 fn get_random_name(length: usize) -> String {
-    use rand::{Rng, distributions::Slice};
+    use rand::{RngExt, distr::slice::Choose};
 
-    let dist = Slice::new(b"abcdefghijklmnopqrstuvwxyz").unwrap();
-    rand::thread_rng()
+    let dist = Choose::new(b"abcdefghijklmnopqrstuvwxyz").unwrap();
+    rand::rng()
         .sample_iter(&dist)
         .take(length)
         .map(|c| char::from(*c))
