@@ -31,29 +31,19 @@ pool.revoke_lease(lease_id).await.expect("revoke_lease failed");
 # };
 ```
 
-## Public API
+## API Overview
 
-### `LeasePool::new(client: etcdrs::Client) -> Self`
+[`LeasePool::new`] creates a pool backed by a [`Client`][etcdrs::Client] and spawns a background
+task that manages the keep-alive stream.
 
-Create a new lease pool backed by the given client. This spawns a background task that manages the
-keep-alive stream.
+[`LeasePool::get_lease`] returns a lease with the requested TTL, reusing an existing one if the
+pool already has a lease at that TTL (rounded to the nearest whole second, since etcd only supports
+second-granularity TTLs). [`LeasePool::grant_lease`] always creates a new lease, even if one with
+the same TTL already exists, and adds it to the pool for automatic keep-alive.
 
-### `pub async fn get_lease(&self, ttl: Duration) -> LeaseId`
-
-Get a lease with the requested TTL. The TTL is rounded to the nearest whole second (since etcd
-only supports second-granularity TTLs). If a lease with that TTL already exists in the pool, its
-`LeaseId` is returned. Otherwise, a new lease is granted from the server and added to the pool.
-
-### `pub async fn grant_lease(&self, ttl: Duration) -> LeaseId`
-
-Grant a new lease from the server, even if one with the same TTL already exists. The lease is
-added to the pool and kept alive automatically.
-
-### `pub async fn revoke_lease(&self, lease_id: LeaseId)`
-
-Revoke a lease, removing it from the pool and sending a revoke request to the server. If the
-lease was a pooled lease (obtained via `get_lease`), it is removed from the pool and future calls
-to `get_lease` with that TTL will create a new lease.
+[`LeasePool::revoke_lease`] removes a lease from the pool and sends a revoke request to the server.
+If the lease was a pooled lease (obtained via [`get_lease`][LeasePool::get_lease]), future calls
+with that TTL will create a new lease.
 
 ## TTL Grouping
 

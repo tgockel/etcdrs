@@ -10,6 +10,21 @@ The [`Client`][crate::Client] type of this library implements every driver via g
 can implement one or more drivers to participate in the same operation pipeline. A simple use is a
 read-through cache that implements [`GetDriver`] and forwards everything else to an inner `Client`.
 
+## Available Traits
+
+| Trait | Method | Operation |
+|-------|--------|-----------|
+| [`GetDriver`] | `execute_get` | Single-key fetch |
+| [`PutDriver`] | `execute_put` | Set a key-value pair |
+| [`DeleteDriver`] | `execute_delete` | Delete one key or a range |
+| [`ListDriver`] | `execute_list_records`, `execute_list_keys`, `execute_count` | Range queries and scans |
+| [`TransactionDriver`] | `execute_transaction` | Atomic multi-operation transactions |
+| [`WatchDriver`] | `start_watch` | Real-time key monitoring |
+| [`LeaseDriver`] | `execute_grant_lease`, `execute_revoke_lease` | Lease lifecycle management |
+
+[`ListDriver`] also defines the [`ListView`] associated type, which abstracts the paginated stream
+returned by list operations.
+
 ## How a driver is called
 
 Operation builders are generic over their backend. `Get<Client>` is the *attached* form that you
