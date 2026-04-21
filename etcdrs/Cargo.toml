@@ -2,6 +2,7 @@
 name = "etcdrs"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 async-stream.workspace = true
