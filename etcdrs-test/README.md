@@ -45,6 +45,14 @@ The etcd binary is resolved in the following order:
 
 In most cases, the vendored binary handles resolution automatically and no configuration is needed.
 
+# Environment Variables
+
+- **`ETCD`** -- path to the etcd binary (see [etcd Binary Resolution](#etcd-binary-resolution)).
+- **`ETCDRS_KEEP_TEST_DIR`** -- set to `1` or `true` to prevent automatic cleanup of etcd data
+  directories after a test passes. By default, data directories under `/tmp` are removed when a
+  test completes successfully; they are always kept when a test fails so you can inspect the state.
+  Any other value emits a warning and is treated as `false`.
+
 # Feature Flags
 
 - **`rstest`** -- enables the `etcd_server` and `etcd_cluster` fixtures.

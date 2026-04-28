@@ -245,6 +245,20 @@ fn get_etcd_program() -> Cow<'static, ffi::OsStr> {
         .unwrap_or(Cow::Borrowed(ffi::OsStr::new("etcd")))
 }
 
+fn keep_test_dir() -> bool {
+    match std::env::var("ETCDRS_KEEP_TEST_DIR").as_deref() {
+        Err(_) | Ok("0") | Ok("false") => false,
+        Ok("1") | Ok("true") => true,
+        Ok(other) => {
+            eprintln!(
+                "warning: ETCDRS_KEEP_TEST_DIR={other:?} is not recognized; \
+                 use '1' or 'true' to keep test directories, '0' or 'false' to remove them"
+            );
+            false
+        }
+    }
+}
+
 struct EtcdRunner {
     proc: process::Child,
 }
@@ -257,6 +271,20 @@ impl Drop for EtcdRunner {
 
         if let Err(error) = self.proc.wait() {
             eprintln!("Failed to wait for etcd process: {error}");
+        }
+    }
+}
+
+impl Drop for EtcdServer {
+    fn drop(&mut self) {
+        drop(self.runner.take());
+
+        if !std::thread::panicking()
+            && !keep_test_dir()
+            && let Err(error) = std::fs::remove_dir_all(&self.config.working_dir)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!("Failed to remove etcd data dir {:?}: {error}", self.config.working_dir);
         }
     }
 }

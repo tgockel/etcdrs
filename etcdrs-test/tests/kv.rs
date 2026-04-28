@@ -150,3 +150,17 @@ async fn delete_range_get_previous(etcd_server: EtcdServer) {
     let keys: Vec<&[u8]> = previous.iter().map(|r| &r.key()[..]).collect();
     assert_eq!(keys, vec![b"foo/a", b"foo/b", b"foo/c"]);
 }
+
+#[rstest]
+#[tokio::test]
+async fn data_persists_across_restart(mut etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+    client.put("foo").value("bar").await.unwrap();
+
+    etcd_server.stop().unwrap();
+    etcd_server.start().unwrap();
+
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+    let record = client.get("foo").await.unwrap().into_record().unwrap();
+    assert_eq!(record.value(), &b"bar"[..]);
+}
