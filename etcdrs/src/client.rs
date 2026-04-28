@@ -279,6 +279,22 @@ fn is_client_side_timeout(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::Cancelled && status.message() == "Timeout expired"
 }
 
+fn is_transport_error(status: &tonic::Status) -> bool {
+    // On the client, tonic wraps dropped-connection errors (TCP reset, broken pipe) as
+    // Code::Unknown with message "transport error" -- from tonic::transport::Error(Kind::Transport)
+    // via Status::from_error. The h2-aware conversion paths in try_from_error and
+    // from_hyper_error are #[cfg(feature = "server")] only and do not run on the client.
+    //
+    // etcd-returned Unknown statuses are decoded from gRPC response headers and carry no source.
+    // The source check distinguishes those from transport-layer failures, where
+    // tonic::transport::Error is stored as the source.
+    //
+    // Note: like is_client_side_timeout, this cannot guarantee the request was not processed by
+    // the server before the connection dropped. etcd operations are safe to retry in practice.
+    use std::error::Error as _;
+    status.code() == tonic::Code::Unknown && status.source().is_some() && status.message() == "transport error"
+}
+
 impl ClientInner {
     /// Execute a unary gRPC call with retry and timeout logic.
     ///
@@ -332,7 +348,7 @@ impl ClientInner {
     }
 
     fn can_retry(status: &tonic::Status) -> bool {
-        status.code() == tonic::Code::Unavailable || is_client_side_timeout(status)
+        status.code() == tonic::Code::Unavailable || is_client_side_timeout(status) || is_transport_error(status)
     }
 
     /// Check if a gRPC status represents an authentication/authorization error.
