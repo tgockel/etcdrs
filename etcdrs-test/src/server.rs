@@ -44,6 +44,12 @@ impl EtcdServer {
                 .arg("--initial-advertise-peer-urls")
                 .arg(format!("http://127.0.0.1:{peer_port}"));
         }
+        if let Some(state) = self.config.cluster_state {
+            command.arg("--initial-cluster-state").arg(match state {
+                ClusterState::New => "new",
+                ClusterState::Existing => "existing",
+            });
+        }
 
         let mut etcd_process = command.spawn()?;
         if let Some(rc) = etcd_process.try_wait()? {
@@ -72,6 +78,17 @@ impl EtcdServer {
     }
 }
 
+/// Whether a server is bootstrapping a new cluster or joining an existing one.
+///
+/// This corresponds to etcd's `--initial-cluster-state` flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClusterState {
+    /// The server is part of a new cluster being bootstrapped.
+    New,
+    /// The server is joining an already-running cluster (e.g. via a `MemberAdd` call).
+    Existing,
+}
+
 #[derive(Clone, Debug)]
 pub struct EtcdServerConfig {
     name: ServerName,
@@ -80,6 +97,7 @@ pub struct EtcdServerConfig {
     peer_port: u16,
     cluster_token: Option<String>,
     initial_cluster: Option<String>,
+    cluster_state: Option<ClusterState>,
 }
 
 impl EtcdServerConfig {
@@ -96,7 +114,13 @@ impl EtcdServerConfig {
             peer_port: get_random_unused_tcp_port().unwrap(),
             cluster_token: None,
             initial_cluster: None,
+            cluster_state: None,
         }
+    }
+
+    /// The peer URL this server will advertise.
+    pub fn peer_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.peer_port)
     }
 
     /// Build a server, but do not start it.
@@ -151,6 +175,30 @@ impl EtcdCluster {
             .map(|s| s.connect_string())
             .collect::<Vec<_>>()
             .join(",")
+    }
+
+    /// Create a config for a new peer that will join this cluster.
+    ///
+    /// The returned config shares the cluster token, has fresh ports and a fresh data directory,
+    /// and is set up to join an existing cluster (`--initial-cluster-state=existing`). Its
+    /// `--initial-cluster` argument lists the existing peers plus this new one — the caller is
+    /// responsible for first announcing the new peer to the cluster (via
+    /// `Client::member_add` with the value of [`EtcdServerConfig::peer_url`]) and then calling
+    /// [`start`][`EtcdServerConfig::start`] on the returned config.
+    pub fn new_joining_peer(&self) -> EtcdServerConfig {
+        let mut config = EtcdServerConfig::new_single_temporary();
+        config.cluster_token = Some(self.cluster_token.clone());
+        config.cluster_state = Some(ClusterState::Existing);
+
+        let mut entries: Vec<String> = self
+            .servers
+            .values()
+            .map(|s| format!("{}=http://127.0.0.1:{}", s.config.name.0, s.config.peer_port))
+            .collect();
+        entries.push(format!("{}={}", config.name.0, config.peer_url()));
+        config.initial_cluster = Some(entries.join(","));
+
+        config
     }
 }
 

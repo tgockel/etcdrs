@@ -13,10 +13,12 @@ pub mod record;
 
 pub use client::{
     AuthDisableResponse, AuthEnableResponse, AuthError, AuthErrorKind, AuthenticateResponse, BuildError, Client,
-    DeleteError, DeleteErrorKind, GetError, GetErrorKind, GrantLeaseError, GrantLeaseErrorKind, KeepAliveError,
-    KeepAliveErrorKind, PutError, PutErrorKind, RetryPolicy, RevokeLeaseError, RevokeLeaseErrorKind, RoleAddResponse,
-    RoleError, RoleErrorKind, TransactionError, TransactionErrorKind, UserAddResponse, UserError, UserErrorKind,
-    UserGrantRoleResponse, WatchError, WatchErrorKind, WatchId,
+    ClusterError, ClusterErrorKind, DeleteError, DeleteErrorKind, GetError, GetErrorKind, GrantLeaseError,
+    GrantLeaseErrorKind, KeepAliveError, KeepAliveErrorKind, Member, MemberAdd, MemberAddResponse, MemberList,
+    MemberListResponse, MemberPromoteResponse, MemberRemoveResponse, MemberUpdateResponse, PutError, PutErrorKind,
+    RetryPolicy, RevokeLeaseError, RevokeLeaseErrorKind, RoleAddResponse, RoleError, RoleErrorKind, TransactionError,
+    TransactionErrorKind, UserAddResponse, UserError, UserErrorKind, UserGrantRoleResponse, WatchError, WatchErrorKind,
+    WatchId,
 };
 pub use error::OperationError;
 pub use range::{AsRange, Prefix, TargetRange};
@@ -42,7 +44,10 @@ impl ClusterId {
 pub struct MemberId(NonZeroU64);
 
 impl MemberId {
-    pub(crate) fn new(source: u64) -> Option<Self> {
+    /// Construct a `MemberId` from a raw `u64`.
+    ///
+    /// Returns `None` if `source` is zero, since a zero member ID is not a valid etcd member.
+    pub fn new(source: u64) -> Option<Self> {
         NonZeroU64::new(source).map(Self)
     }
 
@@ -151,6 +156,41 @@ impl ResponseHeader {
     /// The raft term increases monotonically whenever the cluster leader changes.
     pub fn raft_term(&self) -> Term {
         self.raft_term
+    }
+}
+
+/// Metadata returned with cluster management RPC responses.
+///
+/// Cluster RPCs (`member_list`, `member_add`, etc.) do not always populate the MVCC revision or
+/// raft term in their response headers, so a separate type exposes only the fields that are
+/// reliably present: the cluster ID and the responding member's ID.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ClusterResponseHeader {
+    cluster_id: ClusterId,
+    member_id: MemberId,
+}
+
+impl ClusterResponseHeader {
+    /// Construct a new `ClusterResponseHeader`.
+    pub fn new(cluster_id: ClusterId, member_id: MemberId) -> Self {
+        Self { cluster_id, member_id }
+    }
+
+    pub(crate) fn from_pb(pb: crate::pb::etcdserverpb::ResponseHeader) -> Self {
+        Self {
+            cluster_id: ClusterId::new(pb.cluster_id).expect("cluster_id should be non-zero"),
+            member_id: MemberId::new(pb.member_id).expect("member_id should be non-zero"),
+        }
+    }
+
+    /// ID of the cluster which sent the response.
+    pub fn cluster_id(&self) -> ClusterId {
+        self.cluster_id
+    }
+
+    /// ID of the member which sent the response.
+    pub fn member_id(&self) -> MemberId {
+        self.member_id
     }
 }
 
