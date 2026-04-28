@@ -14,8 +14,8 @@ pub mod record;
 pub use client::{
     AuthDisableResponse, AuthEnableResponse, AuthError, AuthErrorKind, AuthenticateResponse, BuildError, Client,
     DeleteError, DeleteErrorKind, GetError, GetErrorKind, GrantLeaseError, GrantLeaseErrorKind, KeepAliveError,
-    KeepAliveErrorKind, PutError, PutErrorKind, RevokeLeaseError, RevokeLeaseErrorKind, RoleAddResponse, RoleError,
-    RoleErrorKind, TransactionError, TransactionErrorKind, UserAddResponse, UserError, UserErrorKind,
+    KeepAliveErrorKind, PutError, PutErrorKind, RetryPolicy, RevokeLeaseError, RevokeLeaseErrorKind, RoleAddResponse,
+    RoleError, RoleErrorKind, TransactionError, TransactionErrorKind, UserAddResponse, UserError, UserErrorKind,
     UserGrantRoleResponse, WatchError, WatchErrorKind, WatchId,
 };
 pub use error::OperationError;

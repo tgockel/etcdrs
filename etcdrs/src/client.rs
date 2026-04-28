@@ -58,12 +58,38 @@ enum AuthConfig {
     Token(tonic::metadata::AsciiMetadataValue),
 }
 
+/// Controls how long [`wrap_unary_call`][ClientInner::wrap_unary_call] retries transient failures.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RetryPolicy {
+    /// Retry until the given duration has elapsed since the call started.
+    ///
+    /// The remaining time is also used as the per-request gRPC deadline sent to the server.
+    WithDeadline(std::time::Duration),
+    /// Never retry; return the first error immediately.
+    Never,
+    /// Retry forever with no deadline.
+    Forever,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self::WithDeadline(std::time::Duration::from_secs(5))
+    }
+}
+
+impl From<std::time::Duration> for RetryPolicy {
+    fn from(d: std::time::Duration) -> Self {
+        Self::WithDeadline(d)
+    }
+}
+
 #[derive(Default)]
 pub struct ClientBuilder {
     remotes: Vec<Remote>,
     configure_endpoint: Option<Box<ConfigureEndpointFn>>,
     metrics: Option<Box<dyn MetricsCollector>>,
     auth: Option<AuthConfig>,
+    retry_policy: RetryPolicy,
 }
 
 impl ClientBuilder {
@@ -128,6 +154,28 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the retry policy for transient failures.
+    ///
+    /// Accepts a [`RetryPolicy`] or a [`std::time::Duration`] (which becomes
+    /// [`RetryPolicy::WithDeadline`]). Use [`retry_never`][Self::retry_never] or
+    /// [`retry_forever`][Self::retry_forever] for the other variants.
+    ///
+    /// The default is [`RetryPolicy::WithDeadline`] of 5 seconds.
+    pub fn retry_policy(mut self, policy: impl Into<RetryPolicy>) -> Self {
+        self.retry_policy = policy.into();
+        self
+    }
+
+    /// Never retry on transient failures; return the first error immediately.
+    pub fn retry_never(self) -> Self {
+        self.retry_policy(RetryPolicy::Never)
+    }
+
+    /// Retry transient failures forever with no deadline.
+    pub fn retry_forever(self) -> Self {
+        self.retry_policy(RetryPolicy::Forever)
+    }
+
     /// Set credentials for authenticating with the etcd cluster.
     ///
     /// When the client encounters an `UNAUTHENTICATED` error, it will use these credentials to
@@ -160,6 +208,7 @@ impl ClientBuilder {
             configure_endpoint,
             metrics,
             auth,
+            retry_policy,
         } = self;
 
         if remotes.is_empty() {
@@ -200,7 +249,12 @@ impl ClientBuilder {
         });
 
         Ok(Client {
-            inner: Arc::new(ClientInner { channel, metrics, auth }),
+            inner: Arc::new(ClientInner {
+                channel,
+                metrics,
+                auth,
+                retry_policy,
+            }),
         })
     }
 }
@@ -252,6 +306,7 @@ struct ClientInner {
     channel: tonic::transport::Channel,
     metrics: Option<Box<dyn MetricsCollector>>,
     auth: Option<AuthState>,
+    retry_policy: RetryPolicy,
 }
 
 fn metadata_from_pb(r: &crate::pb::mvccpb::KeyValue) -> Metadata {
@@ -309,13 +364,20 @@ impl ClientInner {
     where
         Request: Clone,
     {
-        // TODO: configurable
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline: Option<std::time::Instant> = match &self.retry_policy {
+            RetryPolicy::WithDeadline(d) => Some(std::time::Instant::now() + *d),
+            RetryPolicy::Never | RetryPolicy::Forever => None,
+        };
+        let timing_allows_retry = || match &self.retry_policy {
+            RetryPolicy::Never => false,
+            RetryPolicy::Forever => true,
+            RetryPolicy::WithDeadline(_) => deadline.is_some_and(|d| std::time::Instant::now() <= d),
+        };
         let mut client = create_client(self.channel.clone());
         loop {
             let metric = metrics::MetricsSpan::new(&self.metrics);
             let mut call_request = tonic::Request::new(request.clone());
-            if let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+            if let Some(remaining) = deadline.and_then(|d| d.checked_duration_since(std::time::Instant::now())) {
                 call_request.set_timeout(remaining);
             }
             let mut token_generation = 0u64;
@@ -334,11 +396,11 @@ impl ClientInner {
                     if Self::is_auth_error(&e)
                         && self.auth.is_some()
                         && self.refresh_auth_token(token_generation).await.is_ok()
-                        && std::time::Instant::now() <= deadline
+                        && timing_allows_retry()
                     {
                         continue;
                     }
-                    if Self::can_retry(&e) && std::time::Instant::now() <= deadline {
+                    if Self::can_retry(&e) && timing_allows_retry() {
                         continue;
                     }
                     return Err(e);
