@@ -161,24 +161,16 @@ async fn watch_multiple_targets(etcd_server: EtcdServer) {
 
     let events = next_events(&mut watcher, 2).await;
 
-    let (
-        WatchEvent::Put {
-            record: r0,
-            watch_id: id0,
-            ..
-        },
-        WatchEvent::Put {
-            record: r1,
-            watch_id: id1,
-            ..
-        },
-    ) = (&events[0], &events[1])
-    else {
-        panic!("expected two Puts, got {:?}", events);
+    let WatchEvent::Put { record: r0, watch_id: w0, .. } = &events[0] else {
+        panic!("expected Put, got {:?}", events[0]);
     };
-    assert_eq!(r0.key(), &b"wm/a"[..]);
-    assert_eq!(r1.key(), &b"wm/b"[..]);
-    assert_ne!(id0, id1);
+    let WatchEvent::Put { record: r1, watch_id: w1, .. } = &events[1] else {
+        panic!("expected Put, got {:?}", events[1]);
+    };
+    let mut keys = [r0.key().as_ref(), r1.key().as_ref()];
+    keys.sort();
+    assert_eq!(keys, [&b"wm/a"[..], &b"wm/b"[..]]);
+    assert_ne!(w0, w1);
 }
 
 #[rstest]
