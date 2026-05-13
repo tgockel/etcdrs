@@ -1,3 +1,9 @@
+use std::{
+    future::{Future, IntoFuture},
+    pin::Pin,
+    task::{Context, Poll},
+};
+
 use crate::{Client, ResponseHeader, client::ClientInner, pb::etcdserverpb};
 
 impl Client {
@@ -6,33 +12,13 @@ impl Client {
     /// A root user must exist before authentication can be enabled. Create one with
     /// [`user_add`][Client::user_add], then assign the `root` role with
     /// [`user_grant_role`][Client::user_grant_role].
-    pub async fn auth_enable(&self) -> Result<AuthEnableResponse, AuthError> {
-        let resp = self
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::auth_client::AuthClient::new,
-                async |c, r| c.auth_enable(r).await,
-                etcdserverpb::AuthEnableRequest {},
-            )
-            .await
-            .map_err(AuthError::from_status)?;
-        let header = ResponseHeader::from_pb(resp.header.expect("AuthEnableResponse should have a valid header"));
-        Ok(AuthEnableResponse { header })
+    pub fn auth_enable(&self) -> AuthEnable<Self> {
+        AuthEnable::new().with_client(self.clone())
     }
 
     /// Disable authentication on the cluster.
-    pub async fn auth_disable(&self) -> Result<AuthDisableResponse, AuthError> {
-        let resp = self
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::auth_client::AuthClient::new,
-                async |c, r| c.auth_disable(r).await,
-                etcdserverpb::AuthDisableRequest {},
-            )
-            .await
-            .map_err(AuthError::from_status)?;
-        let header = ResponseHeader::from_pb(resp.header.expect("AuthDisableResponse should have a valid header"));
-        Ok(AuthDisableResponse { header })
+    pub fn auth_disable(&self) -> AuthDisable<Self> {
+        AuthDisable::new().with_client(self.clone())
     }
 
     /// Authenticate with the cluster using the credentials provided to
@@ -45,31 +31,158 @@ impl Client {
     ///
     /// Returns [`AuthErrorKind::InvalidCredentials`] if no credentials were configured on the
     /// client.
-    pub async fn authenticate(&self) -> Result<AuthenticateResponse, AuthError> {
-        let Some(auth) = &self.inner.auth else {
-            return Err(AuthError::new(
-                AuthErrorKind::InvalidCredentials,
-                "no credentials configured on client",
-                None,
-            ));
-        };
-        let Some(creds) = &auth.credentials else {
-            return Err(AuthError::new(
-                AuthErrorKind::InvalidCredentials,
-                "no credentials configured on client",
-                None,
-            ));
-        };
-        let resp = self
-            .inner
-            .authenticate(&creds.username, &creds.password)
-            .await
-            .map_err(AuthError::from_status)?;
-        let header = ResponseHeader::from_pb(resp.header.expect("AuthenticateResponse should have a valid header"));
-        Ok(AuthenticateResponse {
-            header,
-            token: resp.token,
-        })
+    pub fn authenticate(&self) -> Authenticate<Self> {
+        Authenticate::new().with_client(self.clone())
+    }
+}
+
+/// A [`Client::auth_enable`] operation.
+#[derive(Clone)]
+#[must_use = "AuthEnable does nothing unless you `await` it"]
+pub struct AuthEnable<C> {
+    client: C,
+}
+
+impl AuthEnable<()> {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self { client: () }
+    }
+}
+
+impl<C> AuthEnable<C> {
+    pub fn with_client<C2>(self, client: C2) -> AuthEnable<C2> {
+        AuthEnable { client }
+    }
+
+    pub(crate) fn into_parts(self) -> (C, AuthEnable<()>) {
+        (self.client, AuthEnable { client: () })
+    }
+}
+
+/// A [`Client::auth_disable`] operation.
+#[derive(Clone)]
+#[must_use = "AuthDisable does nothing unless you `await` it"]
+pub struct AuthDisable<C> {
+    client: C,
+}
+
+impl AuthDisable<()> {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self { client: () }
+    }
+}
+
+impl<C> AuthDisable<C> {
+    pub fn with_client<C2>(self, client: C2) -> AuthDisable<C2> {
+        AuthDisable { client }
+    }
+
+    pub(crate) fn into_parts(self) -> (C, AuthDisable<()>) {
+        (self.client, AuthDisable { client: () })
+    }
+}
+
+/// A [`Client::authenticate`] operation.
+#[derive(Clone)]
+#[must_use = "Authenticate does nothing unless you `await` it"]
+pub struct Authenticate<C> {
+    client: C,
+}
+
+impl Authenticate<()> {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self { client: () }
+    }
+}
+
+impl<C> Authenticate<C> {
+    pub fn with_client<C2>(self, client: C2) -> Authenticate<C2> {
+        Authenticate { client }
+    }
+
+    pub(crate) fn into_parts(self) -> (C, Authenticate<()>) {
+        (self.client, Authenticate { client: () })
+    }
+}
+
+pub struct AuthEnableFuture(Pin<Box<dyn Future<Output = Result<AuthEnableResponse, AuthError>> + Send>>);
+
+impl AuthEnableFuture {
+    pub(crate) fn new(future: impl Future<Output = Result<AuthEnableResponse, AuthError>> + Send + 'static) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
+impl Future for AuthEnableFuture {
+    type Output = Result<AuthEnableResponse, AuthError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
+pub struct AuthDisableFuture(Pin<Box<dyn Future<Output = Result<AuthDisableResponse, AuthError>> + Send>>);
+
+impl AuthDisableFuture {
+    pub(crate) fn new(future: impl Future<Output = Result<AuthDisableResponse, AuthError>> + Send + 'static) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
+impl Future for AuthDisableFuture {
+    type Output = Result<AuthDisableResponse, AuthError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
+pub struct AuthenticateFuture(Pin<Box<dyn Future<Output = Result<AuthenticateResponse, AuthError>> + Send>>);
+
+impl AuthenticateFuture {
+    pub(crate) fn new(future: impl Future<Output = Result<AuthenticateResponse, AuthError>> + Send + 'static) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
+impl Future for AuthenticateFuture {
+    type Output = Result<AuthenticateResponse, AuthError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
+impl<C: crate::driver::AuthDriver> IntoFuture for AuthEnable<C> {
+    type Output = Result<AuthEnableResponse, AuthError>;
+    type IntoFuture = C::AuthEnableFuture;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let (client, detached) = self.into_parts();
+        client.execute_auth_enable(detached)
+    }
+}
+
+impl<C: crate::driver::AuthDriver> IntoFuture for AuthDisable<C> {
+    type Output = Result<AuthDisableResponse, AuthError>;
+    type IntoFuture = C::AuthDisableFuture;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let (client, detached) = self.into_parts();
+        client.execute_auth_disable(detached)
+    }
+}
+
+impl<C: crate::driver::AuthDriver> IntoFuture for Authenticate<C> {
+    type Output = Result<AuthenticateResponse, AuthError>;
+    type IntoFuture = C::AuthenticateFuture;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let (client, detached) = self.into_parts();
+        client.execute_authenticate(detached)
     }
 }
 
@@ -80,6 +193,10 @@ pub struct AuthEnableResponse {
 }
 
 impl AuthEnableResponse {
+    pub(crate) fn new(header: ResponseHeader) -> Self {
+        Self { header }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ResponseHeader {
         &self.header
@@ -93,6 +210,10 @@ pub struct AuthDisableResponse {
 }
 
 impl AuthDisableResponse {
+    pub(crate) fn new(header: ResponseHeader) -> Self {
+        Self { header }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ResponseHeader {
         &self.header
@@ -107,6 +228,10 @@ pub struct AuthenticateResponse {
 }
 
 impl AuthenticateResponse {
+    pub(crate) fn new(header: ResponseHeader, token: String) -> Self {
+        Self { header, token }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ResponseHeader {
         &self.header

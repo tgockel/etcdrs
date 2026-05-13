@@ -8,7 +8,6 @@ use bytes::Bytes;
 
 use crate::{
     Client, ResponseHeader,
-    client::record_from_pb,
     pb::etcdserverpb,
     record::{AsKey, Record},
 };
@@ -32,6 +31,7 @@ impl Client {
     }
 }
 
+/// A [`Client::get`] operation.
 #[derive(Clone, Debug)]
 pub struct Get<C> {
     pub(crate) client: C,
@@ -78,36 +78,6 @@ impl<C> Get<C> {
     }
 }
 
-impl Get<Client> {
-    async fn call(self) -> Result<GetResponse, GetError> {
-        let resp = self
-            .client
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::kv_client::KvClient::new,
-                async |c, r| c.range(r).await,
-                self.request,
-            )
-            .await
-            .map_err(GetError::from_status)?;
-        let header = ResponseHeader::from_pb(resp.header.expect("RangeResponse should have a valid header"));
-        if resp.more || resp.kvs.len() > 1 {
-            Err(GetError::new(
-                GetErrorKind::Unknown,
-                "call to get should have only 1 response",
-                None,
-            ))
-        } else if let Some(r) = resp.kvs.into_iter().next() {
-            Ok(GetResponse {
-                header,
-                record: Some(record_from_pb(r)),
-            })
-        } else {
-            Ok(GetResponse { header, record: None })
-        }
-    }
-}
-
 /// The response from a [`get`][Client::get] operation.
 #[derive(Clone, Debug)]
 pub struct GetResponse {
@@ -140,6 +110,12 @@ impl GetResponse {
 /// The [`Future`] type returned by awaiting a [`get`][`Client::get`].
 pub struct GetFuture(Pin<Box<dyn Future<Output = Result<GetResponse, GetError>> + Send>>);
 
+impl GetFuture {
+    pub(crate) fn new(future: impl Future<Output = Result<GetResponse, GetError>> + Send + 'static) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
 impl Future for GetFuture {
     type Output = Result<GetResponse, GetError>;
 
@@ -148,15 +124,7 @@ impl Future for GetFuture {
     }
 }
 
-impl crate::driver::GetDriver for Client {
-    type GetFuture = GetFuture;
-
-    fn execute_get(self, get: Get<()>) -> GetFuture {
-        GetFuture(Box::pin(get.with_client(self).call()))
-    }
-}
-
-impl<C: crate::driver::GetDriver> IntoFuture for Get<C> {
+impl<C: crate::driver::KvDriver> IntoFuture for Get<C> {
     type Output = Result<GetResponse, GetError>;
     type IntoFuture = C::GetFuture;
 

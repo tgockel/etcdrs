@@ -47,45 +47,17 @@ impl Client {
     }
 
     /// Remove a member from the etcd cluster.
-    pub async fn member_remove(&self, member_id: MemberId) -> Result<MemberRemoveResponse, ClusterError> {
-        let resp = self
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::cluster_client::ClusterClient::new,
-                async |c, r| c.member_remove(r).await,
-                etcdserverpb::MemberRemoveRequest { id: member_id.get() },
-            )
-            .await
-            .map_err(ClusterError::from_status)?;
-        let header =
-            ClusterResponseHeader::from_pb(resp.header.expect("MemberRemoveResponse should have a valid header"));
-        let members = resp.members.into_iter().map(Member::from_pb).collect();
-        Ok(MemberRemoveResponse { header, members })
+    pub fn member_remove(&self, member_id: MemberId) -> MemberRemove<Self> {
+        MemberRemove::new(member_id).with_client(self.clone())
     }
 
     /// Update the peer URLs of an existing member.
-    pub async fn member_update(
+    pub fn member_update(
         &self,
         member_id: MemberId,
         peer_urls: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Result<MemberUpdateResponse, ClusterError> {
-        let request = etcdserverpb::MemberUpdateRequest {
-            id: member_id.get(),
-            peer_ur_ls: peer_urls.into_iter().map(Into::into).collect(),
-        };
-        let resp = self
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::cluster_client::ClusterClient::new,
-                async |c, r| c.member_update(r).await,
-                request,
-            )
-            .await
-            .map_err(ClusterError::from_status)?;
-        let header =
-            ClusterResponseHeader::from_pb(resp.header.expect("MemberUpdateResponse should have a valid header"));
-        let members = resp.members.into_iter().map(Member::from_pb).collect();
-        Ok(MemberUpdateResponse { header, members })
+    ) -> MemberUpdate<Self> {
+        MemberUpdate::new(member_id, peer_urls).with_client(self.clone())
     }
 
     /// Promote a learner member to a voting member.
@@ -93,20 +65,8 @@ impl Client {
     /// The learner must be in sync with the cluster leader; otherwise the call fails with
     /// [`ClusterErrorKind::LearnerNotReady`]. If the member is already a voter, the call fails
     /// with [`ClusterErrorKind::MemberNotLearner`].
-    pub async fn member_promote(&self, member_id: MemberId) -> Result<MemberPromoteResponse, ClusterError> {
-        let resp = self
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::cluster_client::ClusterClient::new,
-                async |c, r| c.member_promote(r).await,
-                etcdserverpb::MemberPromoteRequest { id: member_id.get() },
-            )
-            .await
-            .map_err(ClusterError::from_status)?;
-        let header =
-            ClusterResponseHeader::from_pb(resp.header.expect("MemberPromoteResponse should have a valid header"));
-        let members = resp.members.into_iter().map(Member::from_pb).collect();
-        Ok(MemberPromoteResponse { header, members })
+    pub fn member_promote(&self, member_id: MemberId) -> MemberPromote<Self> {
+        MemberPromote::new(member_id).with_client(self.clone())
     }
 }
 
@@ -169,12 +129,12 @@ impl Member {
 // member_list
 // -------------------------------------------------------------------------------------------------
 
-/// A builder for the [`member_list`][Client::member_list] operation.
+/// A [`Client::member_list`] operation.
 #[derive(Clone)]
 #[must_use = "MemberList does nothing unless you `await` it"]
 pub struct MemberList<C> {
     client: C,
-    request: etcdserverpb::MemberListRequest,
+    pub(crate) request: etcdserverpb::MemberListRequest,
 }
 
 impl MemberList<()> {
@@ -208,29 +168,31 @@ impl<C> MemberList<C> {
         self.request.linearizable = true;
         self
     }
-}
 
-impl MemberList<Client> {
-    async fn call(self) -> Result<MemberListResponse, ClusterError> {
-        let resp = self
-            .client
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::cluster_client::ClusterClient::new,
-                async |c, r| c.member_list(r).await,
-                self.request,
-            )
-            .await
-            .map_err(ClusterError::from_status)?;
-        let header =
-            ClusterResponseHeader::from_pb(resp.header.expect("MemberListResponse should have a valid header"));
-        let members = resp.members.into_iter().map(Member::from_pb).collect();
-        Ok(MemberListResponse { header, members })
+    /// Whether this operation requests a linearizable member list.
+    pub fn is_linearizable(&self) -> bool {
+        self.request.linearizable
+    }
+
+    pub(crate) fn into_parts(self) -> (C, MemberList<()>) {
+        (
+            self.client,
+            MemberList {
+                client: (),
+                request: self.request,
+            },
+        )
     }
 }
 
 /// The [`Future`] type returned by awaiting a [`member_list`][Client::member_list].
 pub struct MemberListFuture(Pin<Box<dyn Future<Output = Result<MemberListResponse, ClusterError>> + Send>>);
+
+impl MemberListFuture {
+    pub(crate) fn new(future: impl Future<Output = Result<MemberListResponse, ClusterError>> + Send + 'static) -> Self {
+        Self(Box::pin(future))
+    }
+}
 
 impl Future for MemberListFuture {
     type Output = Result<MemberListResponse, ClusterError>;
@@ -240,12 +202,13 @@ impl Future for MemberListFuture {
     }
 }
 
-impl IntoFuture for MemberList<Client> {
+impl<C: crate::driver::ClusterDriver> IntoFuture for MemberList<C> {
     type Output = Result<MemberListResponse, ClusterError>;
-    type IntoFuture = MemberListFuture;
+    type IntoFuture = C::MemberListFuture;
 
     fn into_future(self) -> Self::IntoFuture {
-        MemberListFuture(Box::pin(self.call()))
+        let (client, detached) = self.into_parts();
+        client.execute_member_list(detached)
     }
 }
 
@@ -257,6 +220,10 @@ pub struct MemberListResponse {
 }
 
 impl MemberListResponse {
+    pub(crate) fn new(header: ClusterResponseHeader, members: Vec<Member>) -> Self {
+        Self { header, members }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ClusterResponseHeader {
         &self.header
@@ -277,12 +244,12 @@ impl MemberListResponse {
 // member_add
 // -------------------------------------------------------------------------------------------------
 
-/// A builder for the [`member_add`][Client::member_add] operation.
+/// A [`Client::member_add`] operation.
 #[derive(Clone)]
 #[must_use = "MemberAdd does nothing unless you `await` it"]
 pub struct MemberAdd<C> {
     client: C,
-    request: etcdserverpb::MemberAddRequest,
+    pub(crate) request: etcdserverpb::MemberAddRequest,
 }
 
 impl MemberAdd<()> {
@@ -318,33 +285,36 @@ impl<C> MemberAdd<C> {
         self.request.is_learner = is_learner;
         self
     }
-}
 
-impl MemberAdd<Client> {
-    async fn call(self) -> Result<MemberAddResponse, ClusterError> {
-        let resp = self
-            .client
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::cluster_client::ClusterClient::new,
-                async |c, r| c.member_add(r).await,
-                self.request,
-            )
-            .await
-            .map_err(ClusterError::from_status)?;
-        let header = ClusterResponseHeader::from_pb(resp.header.expect("MemberAddResponse should have a valid header"));
-        let member = Member::from_pb(resp.member.expect("MemberAddResponse should have a valid member"));
-        let members = resp.members.into_iter().map(Member::from_pb).collect();
-        Ok(MemberAddResponse {
-            header,
-            member,
-            members,
-        })
+    /// The peer URLs to register for the new member.
+    pub fn peer_urls(&self) -> &[String] {
+        &self.request.peer_ur_ls
+    }
+
+    /// Whether the new member will be registered as a learner.
+    pub fn is_learner_member(&self) -> bool {
+        self.request.is_learner
+    }
+
+    pub(crate) fn into_parts(self) -> (C, MemberAdd<()>) {
+        (
+            self.client,
+            MemberAdd {
+                client: (),
+                request: self.request,
+            },
+        )
     }
 }
 
 /// The [`Future`] type returned by awaiting a [`member_add`][Client::member_add].
 pub struct MemberAddFuture(Pin<Box<dyn Future<Output = Result<MemberAddResponse, ClusterError>> + Send>>);
+
+impl MemberAddFuture {
+    pub(crate) fn new(future: impl Future<Output = Result<MemberAddResponse, ClusterError>> + Send + 'static) -> Self {
+        Self(Box::pin(future))
+    }
+}
 
 impl Future for MemberAddFuture {
     type Output = Result<MemberAddResponse, ClusterError>;
@@ -354,12 +324,13 @@ impl Future for MemberAddFuture {
     }
 }
 
-impl IntoFuture for MemberAdd<Client> {
+impl<C: crate::driver::ClusterDriver> IntoFuture for MemberAdd<C> {
     type Output = Result<MemberAddResponse, ClusterError>;
-    type IntoFuture = MemberAddFuture;
+    type IntoFuture = C::MemberAddFuture;
 
     fn into_future(self) -> Self::IntoFuture {
-        MemberAddFuture(Box::pin(self.call()))
+        let (client, detached) = self.into_parts();
+        client.execute_member_add(detached)
     }
 }
 
@@ -372,6 +343,14 @@ pub struct MemberAddResponse {
 }
 
 impl MemberAddResponse {
+    pub(crate) fn new(header: ClusterResponseHeader, member: Member, members: Vec<Member>) -> Self {
+        Self {
+            header,
+            member,
+            members,
+        }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ClusterResponseHeader {
         &self.header
@@ -389,6 +368,221 @@ impl MemberAddResponse {
 }
 
 // -------------------------------------------------------------------------------------------------
+// member_remove / member_update / member_promote
+// -------------------------------------------------------------------------------------------------
+
+/// A [`Client::member_remove`] operation.
+#[derive(Clone)]
+#[must_use = "MemberRemove does nothing unless you `await` it"]
+pub struct MemberRemove<C> {
+    client: C,
+    pub(crate) request: etcdserverpb::MemberRemoveRequest,
+}
+
+impl MemberRemove<()> {
+    pub fn new(member_id: MemberId) -> Self {
+        Self {
+            client: (),
+            request: etcdserverpb::MemberRemoveRequest { id: member_id.get() },
+        }
+    }
+}
+
+impl<C> MemberRemove<C> {
+    pub fn with_client<C2>(self, client: C2) -> MemberRemove<C2> {
+        MemberRemove {
+            client,
+            request: self.request,
+        }
+    }
+
+    pub fn member_id(&self) -> MemberId {
+        MemberId::new(self.request.id).expect("member remove request should have a member ID")
+    }
+
+    pub(crate) fn into_parts(self) -> (C, MemberRemove<()>) {
+        (
+            self.client,
+            MemberRemove {
+                client: (),
+                request: self.request,
+            },
+        )
+    }
+}
+
+pub struct MemberRemoveFuture(Pin<Box<dyn Future<Output = Result<MemberRemoveResponse, ClusterError>> + Send>>);
+
+impl MemberRemoveFuture {
+    pub(crate) fn new(
+        future: impl Future<Output = Result<MemberRemoveResponse, ClusterError>> + Send + 'static,
+    ) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
+impl Future for MemberRemoveFuture {
+    type Output = Result<MemberRemoveResponse, ClusterError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
+impl<C: crate::driver::ClusterDriver> IntoFuture for MemberRemove<C> {
+    type Output = Result<MemberRemoveResponse, ClusterError>;
+    type IntoFuture = C::MemberRemoveFuture;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let (client, detached) = self.into_parts();
+        client.execute_member_remove(detached)
+    }
+}
+
+/// A [`Client::member_update`] operation.
+#[derive(Clone)]
+#[must_use = "MemberUpdate does nothing unless you `await` it"]
+pub struct MemberUpdate<C> {
+    client: C,
+    pub(crate) request: etcdserverpb::MemberUpdateRequest,
+}
+
+impl MemberUpdate<()> {
+    pub fn new(member_id: MemberId, peer_urls: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            client: (),
+            request: etcdserverpb::MemberUpdateRequest {
+                id: member_id.get(),
+                peer_ur_ls: peer_urls.into_iter().map(Into::into).collect(),
+            },
+        }
+    }
+}
+
+impl<C> MemberUpdate<C> {
+    pub fn with_client<C2>(self, client: C2) -> MemberUpdate<C2> {
+        MemberUpdate {
+            client,
+            request: self.request,
+        }
+    }
+
+    pub fn member_id(&self) -> MemberId {
+        MemberId::new(self.request.id).expect("member update request should have a member ID")
+    }
+
+    pub fn peer_urls(&self) -> &[String] {
+        &self.request.peer_ur_ls
+    }
+
+    pub(crate) fn into_parts(self) -> (C, MemberUpdate<()>) {
+        (
+            self.client,
+            MemberUpdate {
+                client: (),
+                request: self.request,
+            },
+        )
+    }
+}
+
+pub struct MemberUpdateFuture(Pin<Box<dyn Future<Output = Result<MemberUpdateResponse, ClusterError>> + Send>>);
+
+impl MemberUpdateFuture {
+    pub(crate) fn new(
+        future: impl Future<Output = Result<MemberUpdateResponse, ClusterError>> + Send + 'static,
+    ) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
+impl Future for MemberUpdateFuture {
+    type Output = Result<MemberUpdateResponse, ClusterError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
+impl<C: crate::driver::ClusterDriver> IntoFuture for MemberUpdate<C> {
+    type Output = Result<MemberUpdateResponse, ClusterError>;
+    type IntoFuture = C::MemberUpdateFuture;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let (client, detached) = self.into_parts();
+        client.execute_member_update(detached)
+    }
+}
+
+/// A [`Client::member_promote`] operation.
+#[derive(Clone)]
+#[must_use = "MemberPromote does nothing unless you `await` it"]
+pub struct MemberPromote<C> {
+    client: C,
+    pub(crate) request: etcdserverpb::MemberPromoteRequest,
+}
+
+impl MemberPromote<()> {
+    pub fn new(member_id: MemberId) -> Self {
+        Self {
+            client: (),
+            request: etcdserverpb::MemberPromoteRequest { id: member_id.get() },
+        }
+    }
+}
+
+impl<C> MemberPromote<C> {
+    pub fn with_client<C2>(self, client: C2) -> MemberPromote<C2> {
+        MemberPromote {
+            client,
+            request: self.request,
+        }
+    }
+
+    pub fn member_id(&self) -> MemberId {
+        MemberId::new(self.request.id).expect("member promote request should have a member ID")
+    }
+
+    pub(crate) fn into_parts(self) -> (C, MemberPromote<()>) {
+        (
+            self.client,
+            MemberPromote {
+                client: (),
+                request: self.request,
+            },
+        )
+    }
+}
+
+pub struct MemberPromoteFuture(Pin<Box<dyn Future<Output = Result<MemberPromoteResponse, ClusterError>> + Send>>);
+
+impl MemberPromoteFuture {
+    pub(crate) fn new(
+        future: impl Future<Output = Result<MemberPromoteResponse, ClusterError>> + Send + 'static,
+    ) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
+impl Future for MemberPromoteFuture {
+    type Output = Result<MemberPromoteResponse, ClusterError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
+impl<C: crate::driver::ClusterDriver> IntoFuture for MemberPromote<C> {
+    type Output = Result<MemberPromoteResponse, ClusterError>;
+    type IntoFuture = C::MemberPromoteFuture;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let (client, detached) = self.into_parts();
+        client.execute_member_promote(detached)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
 // member_remove / member_update / member_promote responses
 // -------------------------------------------------------------------------------------------------
 
@@ -400,6 +594,10 @@ pub struct MemberRemoveResponse {
 }
 
 impl MemberRemoveResponse {
+    pub(crate) fn new(header: ClusterResponseHeader, members: Vec<Member>) -> Self {
+        Self { header, members }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ClusterResponseHeader {
         &self.header
@@ -419,6 +617,10 @@ pub struct MemberUpdateResponse {
 }
 
 impl MemberUpdateResponse {
+    pub(crate) fn new(header: ClusterResponseHeader, members: Vec<Member>) -> Self {
+        Self { header, members }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ClusterResponseHeader {
         &self.header
@@ -438,6 +640,10 @@ pub struct MemberPromoteResponse {
 }
 
 impl MemberPromoteResponse {
+    pub(crate) fn new(header: ClusterResponseHeader, members: Vec<Member>) -> Self {
+        Self { header, members }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ClusterResponseHeader {
         &self.header

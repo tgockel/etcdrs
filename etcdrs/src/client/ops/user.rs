@@ -23,48 +23,22 @@ impl Client {
     }
 
     /// Grant a role to a user.
-    pub async fn user_grant_role(&self, user: &str, role: &str) -> Result<UserGrantRoleResponse, UserError> {
-        let resp = self
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::auth_client::AuthClient::new,
-                async |c, r| c.user_grant_role(r).await,
-                etcdserverpb::AuthUserGrantRoleRequest {
-                    user: user.into(),
-                    role: role.into(),
-                },
-            )
-            .await
-            .map_err(UserError::from_status)?;
-        let header = ResponseHeader::from_pb(
-            resp.header
-                .expect("AuthUserGrantRoleResponse should have a valid header"),
-        );
-        Ok(UserGrantRoleResponse { header })
+    pub fn user_grant_role(&self, user: &str, role: &str) -> UserGrantRole<Self> {
+        UserGrantRole::new(user, role).with_client(self.clone())
     }
 
     /// Add a new role to the cluster.
-    pub async fn role_add(&self, name: &str) -> Result<RoleAddResponse, RoleError> {
-        let resp = self
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::auth_client::AuthClient::new,
-                async |c, r| c.role_add(r).await,
-                etcdserverpb::AuthRoleAddRequest { name: name.into() },
-            )
-            .await
-            .map_err(RoleError::from_status)?;
-        let header = ResponseHeader::from_pb(resp.header.expect("AuthRoleAddResponse should have a valid header"));
-        Ok(RoleAddResponse { header })
+    pub fn role_add(&self, name: &str) -> RoleAdd<Self> {
+        RoleAdd::new(name).with_client(self.clone())
     }
 }
 
-/// A builder for the [`user_add`][Client::user_add] operation.
+/// A [`Client::user_add`] operation.
 #[derive(Clone)]
 #[must_use = "UserAdd does nothing unless you `await` it"]
 pub struct UserAdd<C> {
     client: C,
-    request: etcdserverpb::AuthUserAddRequest,
+    pub(crate) request: etcdserverpb::AuthUserAddRequest,
 }
 
 impl UserAdd<()> {
@@ -108,27 +82,41 @@ impl<C> UserAdd<C> {
         self.request.options = Some(crate::pb::authpb::UserAddOptions { no_password: true });
         self
     }
-}
 
-impl UserAdd<Client> {
-    async fn call(self) -> Result<UserAddResponse, UserError> {
-        let resp = self
-            .client
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::auth_client::AuthClient::new,
-                async |c, r| c.user_add(r).await,
-                self.request,
-            )
-            .await
-            .map_err(UserError::from_status)?;
-        let header = ResponseHeader::from_pb(resp.header.expect("AuthUserAddResponse should have a valid header"));
-        Ok(UserAddResponse { header })
+    /// The user name to create.
+    pub fn name(&self) -> &str {
+        &self.request.name
+    }
+
+    /// The configured password, if this user is password-authenticated.
+    pub fn configured_password(&self) -> Option<&str> {
+        (!self.is_no_password()).then_some(self.request.password.as_str())
+    }
+
+    /// Whether the user is created without a password.
+    pub fn is_no_password(&self) -> bool {
+        self.request.options.as_ref().is_some_and(|options| options.no_password)
+    }
+
+    pub(crate) fn into_parts(self) -> (C, UserAdd<()>) {
+        (
+            self.client,
+            UserAdd {
+                client: (),
+                request: self.request,
+            },
+        )
     }
 }
 
 /// The [`Future`] type returned by awaiting a [`user_add`][Client::user_add].
 pub struct UserAddFuture(Pin<Box<dyn Future<Output = Result<UserAddResponse, UserError>> + Send>>);
+
+impl UserAddFuture {
+    pub(crate) fn new(future: impl Future<Output = Result<UserAddResponse, UserError>> + Send + 'static) -> Self {
+        Self(Box::pin(future))
+    }
+}
 
 impl Future for UserAddFuture {
     type Output = Result<UserAddResponse, UserError>;
@@ -138,12 +126,86 @@ impl Future for UserAddFuture {
     }
 }
 
-impl IntoFuture for UserAdd<Client> {
+impl<C: crate::driver::AuthDriver> IntoFuture for UserAdd<C> {
     type Output = Result<UserAddResponse, UserError>;
-    type IntoFuture = UserAddFuture;
+    type IntoFuture = C::UserAddFuture;
 
     fn into_future(self) -> Self::IntoFuture {
-        UserAddFuture(Box::pin(self.call()))
+        let (client, detached) = self.into_parts();
+        client.execute_user_add(detached)
+    }
+}
+
+/// A [`Client::user_grant_role`] operation.
+#[derive(Clone)]
+#[must_use = "UserGrantRole does nothing unless you `await` it"]
+pub struct UserGrantRole<C> {
+    client: C,
+    pub(crate) request: etcdserverpb::AuthUserGrantRoleRequest,
+}
+
+impl UserGrantRole<()> {
+    pub fn new(user: &str, role: &str) -> Self {
+        Self {
+            client: (),
+            request: etcdserverpb::AuthUserGrantRoleRequest {
+                user: user.into(),
+                role: role.into(),
+            },
+        }
+    }
+}
+
+impl<C> UserGrantRole<C> {
+    pub fn with_client<C2>(self, client: C2) -> UserGrantRole<C2> {
+        UserGrantRole {
+            client,
+            request: self.request,
+        }
+    }
+
+    pub fn user(&self) -> &str {
+        &self.request.user
+    }
+
+    pub fn role(&self) -> &str {
+        &self.request.role
+    }
+
+    pub(crate) fn into_parts(self) -> (C, UserGrantRole<()>) {
+        (
+            self.client,
+            UserGrantRole {
+                client: (),
+                request: self.request,
+            },
+        )
+    }
+}
+
+pub struct UserGrantRoleFuture(Pin<Box<dyn Future<Output = Result<UserGrantRoleResponse, UserError>> + Send>>);
+
+impl UserGrantRoleFuture {
+    pub(crate) fn new(future: impl Future<Output = Result<UserGrantRoleResponse, UserError>> + Send + 'static) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
+impl Future for UserGrantRoleFuture {
+    type Output = Result<UserGrantRoleResponse, UserError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
+impl<C: crate::driver::AuthDriver> IntoFuture for UserGrantRole<C> {
+    type Output = Result<UserGrantRoleResponse, UserError>;
+    type IntoFuture = C::UserGrantRoleFuture;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let (client, detached) = self.into_parts();
+        client.execute_user_grant_role(detached)
     }
 }
 
@@ -154,6 +216,10 @@ pub struct UserAddResponse {
 }
 
 impl UserAddResponse {
+    pub(crate) fn new(header: ResponseHeader) -> Self {
+        Self { header }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ResponseHeader {
         &self.header
@@ -167,6 +233,10 @@ pub struct UserGrantRoleResponse {
 }
 
 impl UserGrantRoleResponse {
+    pub(crate) fn new(header: ResponseHeader) -> Self {
+        Self { header }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ResponseHeader {
         &self.header
@@ -260,9 +330,79 @@ pub struct RoleAddResponse {
 }
 
 impl RoleAddResponse {
+    pub(crate) fn new(header: ResponseHeader) -> Self {
+        Self { header }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ResponseHeader {
         &self.header
+    }
+}
+
+/// A [`Client::role_add`] operation.
+#[derive(Clone)]
+#[must_use = "RoleAdd does nothing unless you `await` it"]
+pub struct RoleAdd<C> {
+    client: C,
+    pub(crate) request: etcdserverpb::AuthRoleAddRequest,
+}
+
+impl RoleAdd<()> {
+    pub fn new(name: &str) -> Self {
+        Self {
+            client: (),
+            request: etcdserverpb::AuthRoleAddRequest { name: name.into() },
+        }
+    }
+}
+
+impl<C> RoleAdd<C> {
+    pub fn with_client<C2>(self, client: C2) -> RoleAdd<C2> {
+        RoleAdd {
+            client,
+            request: self.request,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.request.name
+    }
+
+    pub(crate) fn into_parts(self) -> (C, RoleAdd<()>) {
+        (
+            self.client,
+            RoleAdd {
+                client: (),
+                request: self.request,
+            },
+        )
+    }
+}
+
+pub struct RoleAddFuture(Pin<Box<dyn Future<Output = Result<RoleAddResponse, RoleError>> + Send>>);
+
+impl RoleAddFuture {
+    pub(crate) fn new(future: impl Future<Output = Result<RoleAddResponse, RoleError>> + Send + 'static) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
+impl Future for RoleAddFuture {
+    type Output = Result<RoleAddResponse, RoleError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
+impl<C: crate::driver::AuthDriver> IntoFuture for RoleAdd<C> {
+    type Output = Result<RoleAddResponse, RoleError>;
+    type IntoFuture = C::RoleAddFuture;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let (client, detached) = self.into_parts();
+        client.execute_role_add(detached)
     }
 }
 

@@ -1,17 +1,18 @@
 #![doc = include_str!("README.md")]
 
-mod delete;
-mod get;
+mod auth;
+mod cluster;
+mod kv;
 mod lease;
-mod list;
-mod put;
-mod transaction;
 mod watch;
 
-pub use delete::DeleteDriver;
-pub use get::GetDriver;
+pub use auth::AuthDriver;
+pub use cluster::ClusterDriver;
+pub use kv::{KvDriver, ListView};
 pub use lease::LeaseDriver;
-pub use list::{ListDriver, ListView};
-pub use put::PutDriver;
-pub use transaction::TransactionDriver;
 pub use watch::WatchDriver;
+
+/// Driver for all public etcd operation families.
+pub trait Driver: KvDriver + LeaseDriver + WatchDriver + AuthDriver + ClusterDriver {}
+
+impl<T> Driver for T where T: KvDriver + LeaseDriver + WatchDriver + AuthDriver + ClusterDriver {}

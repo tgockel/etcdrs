@@ -9,7 +9,6 @@ use bytes::Bytes;
 
 use crate::{
     Client, LeaseId, ResponseHeader,
-    client::record_from_pb,
     pb::etcdserverpb,
     record::{AsKey, AsValue, Record},
 };
@@ -32,6 +31,7 @@ impl Client {
     }
 }
 
+/// A [`Client::put`] operation.
 #[derive(Clone, Debug)]
 pub struct Put<C, R> {
     client: C,
@@ -68,6 +68,31 @@ impl<C, R> Put<C, R> {
     /// The key this operation addresses.
     pub fn target_key(&self) -> &[u8] {
         &self.request.key
+    }
+
+    /// The value this operation will write.
+    pub fn value_bytes(&self) -> &[u8] {
+        &self.request.value
+    }
+
+    /// Whether this operation leaves the existing value unchanged.
+    pub fn ignores_value(&self) -> bool {
+        self.request.ignore_value
+    }
+
+    /// The lease this operation will attach to the key, if one was specified.
+    pub fn lease_id(&self) -> Option<LeaseId> {
+        LeaseId::new(self.request.lease)
+    }
+
+    /// Whether this operation leaves the existing lease unchanged.
+    pub fn ignores_lease(&self) -> bool {
+        self.request.ignore_lease
+    }
+
+    /// Whether the previous key-value will be returned.
+    pub fn returns_previous(&self) -> bool {
+        self.request.prev_kv
     }
 
     /// Decompose this operation into its client and a detached `Put<(), R>`.
@@ -126,7 +151,7 @@ impl<C, R> Put<C, R> {
 pub struct PutResponse<R = ()> {
     header: ResponseHeader,
     previous: Option<Record>,
-    _marker: PhantomData<R>,
+    _marker: PhantomData<fn() -> R>,
 }
 
 impl<R> PutResponse<R> {
@@ -160,6 +185,12 @@ impl PutResponse<GetPreviousValue> {
 /// The [`Future`] type returned by awaiting [`put`][Client::put] operations.
 pub struct PutFuture<T>(Pin<Box<dyn Future<Output = T> + Send>>);
 
+impl<T> PutFuture<T> {
+    pub(crate) fn new(future: impl Future<Output = T> + Send + 'static) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
 impl<T> Future for PutFuture<T> {
     type Output = T;
 
@@ -168,39 +199,16 @@ impl<T> Future for PutFuture<T> {
     }
 }
 
-impl crate::driver::PutDriver for Client {
-    type PutFuture<R> = PutFuture<Result<PutResponse<R>, PutError>>;
-
-    fn execute_put<R>(self, put: Put<(), R>) -> Self::PutFuture<R> {
-        let request = put.request;
-        PutFuture(Box::pin(async move {
-            let resp = self
-                .inner
-                .wrap_unary_call(
-                    etcdserverpb::kv_client::KvClient::new,
-                    async |c, r| c.put(r).await,
-                    request,
-                )
-                .await
-                .map_err(PutError::from_status)?;
-            let header = ResponseHeader::from_pb(resp.header.expect("PutResponse should have a valid header"));
-            let previous = resp.prev_kv.map(record_from_pb);
-            Ok(PutResponse::new(header, previous))
-        }))
-    }
-}
-
 impl<C, R> IntoFuture for Put<C, R>
 where
-    C: crate::driver::PutDriver + Send + 'static,
-    R: Send + 'static,
+    C: crate::driver::KvDriver,
 {
     type Output = Result<PutResponse<R>, PutError>;
-    type IntoFuture = PutFuture<Self::Output>;
+    type IntoFuture = C::PutFuture<R>;
 
     fn into_future(self) -> Self::IntoFuture {
         let (client, detached) = self.into_parts();
-        PutFuture(Box::pin(async move { client.execute_put(detached).await }))
+        client.execute_put(detached)
     }
 }
 

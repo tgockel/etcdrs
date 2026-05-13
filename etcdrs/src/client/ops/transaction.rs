@@ -72,7 +72,7 @@ impl Client {
     }
 }
 
-/// A [`transaction`][Client::transaction] operation.
+/// A [`Client::transaction`] operation.
 #[derive(Clone, Debug)]
 #[must_use = "transaction operations are not executed without calling `commit`"]
 pub struct Transaction<C> {
@@ -163,7 +163,7 @@ impl<C> Transaction<C> {
     }
 }
 
-impl<C: crate::driver::TransactionDriver> Transaction<C> {
+impl<C: crate::driver::KvDriver> Transaction<C> {
     /// Attempt to commit the transaction to the database.
     ///
     /// **Remember that an `Ok` result does not mean the transaction [`succeeded`][TransactionResponse::succeeded]**, it
@@ -197,30 +197,29 @@ impl std::future::Future for TransactionFuture {
     }
 }
 
-impl crate::driver::TransactionDriver for Client {
-    type CommitFuture = TransactionFuture;
+impl TransactionFuture {
+    pub(crate) fn new(
+        future: impl std::future::Future<Output = Result<TransactionResponse, TransactionError>> + Send + 'static,
+    ) -> Self {
+        Self(Box::pin(future))
+    }
+}
 
-    fn execute_transaction(self, txn: Transaction<()>) -> Self::CommitFuture {
+impl Transaction<()> {
+    pub(crate) fn into_request_parts(
+        self,
+    ) -> (etcdserverpb::TxnRequest, Vec<TransactionOpKind>, Vec<TransactionOpKind>) {
         let Transaction {
             client: (),
             request,
             success_kinds,
             failure_kinds,
-        } = txn;
-        TransactionFuture(Box::pin(async move {
-            self.inner
-                .wrap_unary_call(
-                    etcdserverpb::kv_client::KvClient::new,
-                    async |c, r| c.txn(r).await,
-                    request,
-                )
-                .await
-                .map(|response| TransactionResponse::from_pb(response, &success_kinds, &failure_kinds))
-                .map_err(TransactionError::from_status)
-        }))
+        } = self;
+        (request, success_kinds, failure_kinds)
     }
 }
 
+/// A condition used by a [`Client::transaction`] operation.
 #[derive(Clone, Debug)]
 #[must_use = "TransactionCheck does nothing on its own; it should be used in a transaction"]
 pub struct TransactionCheck {
@@ -321,6 +320,7 @@ impl TransactionCheckOp {
     }
 }
 
+/// An operation branch entry used by a [`Client::transaction`] operation.
 #[derive(Clone, Debug)]
 pub struct TransactionOp {
     request: etcdserverpb::RequestOp,
@@ -453,7 +453,7 @@ impl TransactionResponse {
         self.responses
     }
 
-    fn from_pb(
+    pub(crate) fn from_pb(
         response: etcdserverpb::TxnResponse,
         success_kinds: &[TransactionOpKind],
         failure_kinds: &[TransactionOpKind],
@@ -503,7 +503,7 @@ pub enum TransactionOpResponse {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TransactionOpKind {
+pub(crate) enum TransactionOpKind {
     Get,
     Count,
     Put,

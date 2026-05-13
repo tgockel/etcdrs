@@ -138,7 +138,7 @@ pub enum WatchEvent {
     },
 }
 
-/// Top-level builder for creating a [`Watcher`].
+/// A [`Client::watch`] operation builder.
 ///
 /// A `WatchBuilder` collects watch targets — call [`.key()`][Self::key],
 /// [`.prefix()`][Self::prefix], or [`.range()`][Self::range] to specify what to watch. Each call
@@ -171,6 +171,16 @@ impl<C> WatchBuilder<C> {
             client,
             specs: self.specs,
         }
+    }
+
+    pub(crate) fn into_parts(self) -> (C, WatchBuilder<()>) {
+        (
+            self.client,
+            WatchBuilder {
+                client: (),
+                specs: self.specs,
+            },
+        )
     }
 
     /// Add a pre-built [`Watch`] to this builder.
@@ -210,7 +220,15 @@ impl<C> WatchBuilder<C> {
     }
 }
 
-/// Per-target watch configuration.
+impl<C: crate::driver::WatchDriver> WatchBuilder<C> {
+    /// Create a watcher and begin watching for events.
+    pub fn start(self) -> C::Watcher {
+        let (client, builder) = self.into_parts();
+        client.start_watch(builder)
+    }
+}
+
+/// A per-target watch specification for [`Client::watch`] or [`Client::watcher`].
 ///
 /// The type parameter `W` determines what operations are available:
 ///
@@ -366,7 +384,7 @@ impl WatchBuilder<Client> {
     /// calling `start` and the first poll may be missed. Use
     /// [`start_revision`][Watch::start_revision] to watch from a known point in history if you need
     /// to guarantee delivery.
-    pub fn start(self) -> Watcher {
+    pub(crate) fn start_client_watch(self) -> Watcher {
         let channel = self.client.inner.channel.clone();
         let next_id = Arc::new(AtomicI64::new(1));
 
@@ -448,11 +466,11 @@ impl WatchBuilder<Client> {
 }
 
 /// `start` on a `Watch` chain forwards to the underlying [`WatchBuilder`].
-impl Watch<WatchBuilder<Client>> {
+impl<C: crate::driver::WatchDriver> Watch<WatchBuilder<C>> {
     /// Finalize the current target and create a [`Watcher`].
     ///
     /// See [`WatchBuilder::start`] for details.
-    pub fn start(self) -> Watcher {
+    pub fn start(self) -> C::Watcher {
         let Watch { mut watcher, current } = self;
         watcher.specs.push(current);
         watcher.start()

@@ -3,7 +3,7 @@ use futures_core::Stream;
 
 use crate::{
     AsRange, GetError, GetErrorKind, Prefix, ResponseHeader, Revision, TargetRange,
-    client::{Client, key_with_metadata_from_pb, record_from_pb},
+    client::Client,
     pb::{etcdserverpb, mvccpb},
     record::{AsKey, KeyWithMetadata, Record},
 };
@@ -64,6 +64,7 @@ impl Client {
     }
 }
 
+/// A [`Client::list`] or [`Client::list_prefix`] operation.
 pub struct List<C = (), R = Record> {
     client: C,
     pub(crate) request: etcdserverpb::RangeRequest,
@@ -104,6 +105,26 @@ impl<C, R> List<C, R> {
     /// The range this operation addresses.
     pub fn target_range(&self) -> TargetRange<'_> {
         TargetRange::from_wire(&self.request.key, &self.request.range_end)
+    }
+
+    /// The revision this operation reads from, or `None` for the server's current revision.
+    pub fn revision(&self) -> Option<Revision> {
+        Revision::new(self.request.revision)
+    }
+
+    /// The per-request page limit, or `None` when the server default is used.
+    pub fn page_limit(&self) -> Option<usize> {
+        usize::try_from(self.request.limit).ok().filter(|&limit| limit > 0)
+    }
+
+    /// Whether this operation returns keys and metadata without values.
+    pub fn is_keys_only(&self) -> bool {
+        self.request.keys_only
+    }
+
+    /// Whether this operation returns only a count.
+    pub fn is_count_only(&self) -> bool {
+        self.request.count_only
     }
 
     /// Decompose this operation into its client and a detached `List<(), R>`.
@@ -181,54 +202,6 @@ impl<C, R> List<C, R> {
     }
 }
 
-impl<R> List<Client, R> {
-    async fn fetch_first_batch(
-        self,
-    ) -> Result<(ResponseHeader, Vec<mvccpb::KeyValue>, Option<ListContinuation>), GetError> {
-        let mut request = self.request;
-        if request.key.is_empty() && request.range_end.is_empty() {
-            request.key = Bytes::from_static(&[0]);
-            request.range_end = Bytes::from_static(&[0]);
-        }
-
-        let resp = self
-            .client
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::kv_client::KvClient::new,
-                async |c, r| c.range(r).await,
-                request.clone(),
-            )
-            .await
-            .map_err(GetError::from_status)?;
-
-        let header = ResponseHeader::from_pb(resp.header.expect("RangeResponse should have a valid header"));
-
-        let continuation = if resp.more {
-            // Pin the revision from the first response so subsequent pages are consistent.
-            if request.revision == 0 {
-                request.revision = header.revision().get();
-            }
-
-            let Some(last_kv) = resp.kvs.last() else {
-                return Err(GetError::new(
-                    GetErrorKind::Unknown,
-                    "`range` call has no results, but `more = true`...is something wrong with the server?",
-                    None,
-                ));
-            };
-            request.key = crate::range::successor(&last_kv.key).into();
-            Some(ListContinuation {
-                client: self.client,
-                request,
-            })
-        } else {
-            None
-        };
-        Ok((header, resp.kvs, continuation))
-    }
-}
-
 fn stream_remaining_chunks(
     continuation: ListContinuation,
 ) -> impl Stream<Item = Result<etcdserverpb::RangeResponse, GetError>> {
@@ -284,6 +257,20 @@ pub struct ListView<R> {
 }
 
 impl<R> ListView<R> {
+    pub(crate) fn new(
+        header: ResponseHeader,
+        first_batch_kvs: Vec<mvccpb::KeyValue>,
+        continuation: Option<ListContinuation>,
+        convert: fn(mvccpb::KeyValue) -> R,
+    ) -> Self {
+        Self {
+            header,
+            first_batch_kvs,
+            continuation,
+            convert,
+        }
+    }
+
     /// The response header from the first fetched batch.
     pub fn header(&self) -> &ResponseHeader {
         &self.header
@@ -395,26 +382,6 @@ where
     }
 }
 
-impl List<Client, usize> {
-    async fn call(self) -> Result<CountResponse, GetError> {
-        let resp = self
-            .client
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::kv_client::KvClient::new,
-                async |c, r| c.range(r).await,
-                self.request,
-            )
-            .await
-            .map_err(GetError::from_status)?;
-        let header = ResponseHeader::from_pb(resp.header.expect("RangeResponse should have a valid header"));
-        Ok(CountResponse {
-            header,
-            count: resp.count as usize,
-        })
-    }
-}
-
 /// The response from a [`list`][Client::list] operation with [`count_only`][List::count_only].
 #[derive(Clone, Copy, Debug)]
 pub struct CountResponse {
@@ -442,6 +409,12 @@ impl CountResponse {
 /// The [`Future`] type returned by awaiting [`list`][Client::list] operations.
 pub struct ListFuture<T>(Pin<Box<dyn Future<Output = T> + Send>>);
 
+impl<T> ListFuture<T> {
+    pub(crate) fn new(future: impl Future<Output = T> + Send + 'static) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
 impl<T> Future for ListFuture<T> {
     type Output = T;
 
@@ -450,43 +423,7 @@ impl<T> Future for ListFuture<T> {
     }
 }
 
-impl Client {
-    fn execute_list_impl<R: Send + 'static>(
-        self,
-        list: List<(), R>,
-        convert: fn(mvccpb::KeyValue) -> R,
-    ) -> ListFuture<Result<ListView<R>, GetError>> {
-        ListFuture(Box::pin(async move {
-            let (header, first_batch_kvs, continuation) = list.with_client(self).fetch_first_batch().await?;
-            Ok(ListView {
-                header,
-                first_batch_kvs,
-                continuation,
-                convert,
-            })
-        }))
-    }
-}
-
-impl crate::driver::ListDriver for Client {
-    type ListView<R> = ListView<R>;
-    type ListViewFuture<R> = ListFuture<Result<Self::ListView<R>, GetError>>;
-    type CountFuture = ListFuture<Result<CountResponse, GetError>>;
-
-    fn execute_list_records(self, list: List<(), Record>) -> Self::ListViewFuture<Record> {
-        self.execute_list_impl(list, record_from_pb)
-    }
-
-    fn execute_list_keys(self, list: List<(), KeyWithMetadata>) -> Self::ListViewFuture<KeyWithMetadata> {
-        self.execute_list_impl(list, key_with_metadata_from_pb)
-    }
-
-    fn execute_count(self, list: List<(), usize>) -> Self::CountFuture {
-        ListFuture(Box::pin(list.with_client(self).call()))
-    }
-}
-
-impl<C: crate::driver::ListDriver> IntoFuture for List<C, usize> {
+impl<C: crate::driver::KvDriver> IntoFuture for List<C, usize> {
     type Output = Result<CountResponse, GetError>;
     type IntoFuture = C::CountFuture;
 
@@ -496,7 +433,7 @@ impl<C: crate::driver::ListDriver> IntoFuture for List<C, usize> {
     }
 }
 
-impl<C: crate::driver::ListDriver> IntoFuture for List<C, Record> {
+impl<C: crate::driver::KvDriver> IntoFuture for List<C, Record> {
     type Output = Result<C::ListView<Record>, GetError>;
     type IntoFuture = C::ListViewFuture<Record>;
 
@@ -506,7 +443,7 @@ impl<C: crate::driver::ListDriver> IntoFuture for List<C, Record> {
     }
 }
 
-impl<C: crate::driver::ListDriver> IntoFuture for List<C, KeyWithMetadata> {
+impl<C: crate::driver::KvDriver> IntoFuture for List<C, KeyWithMetadata> {
     type Output = Result<C::ListView<KeyWithMetadata>, GetError>;
     type IntoFuture = C::ListViewFuture<KeyWithMetadata>;
 
@@ -516,9 +453,9 @@ impl<C: crate::driver::ListDriver> IntoFuture for List<C, KeyWithMetadata> {
     }
 }
 
-struct ListContinuation {
-    client: Client,
-    request: etcdserverpb::RangeRequest,
+pub(crate) struct ListContinuation {
+    pub(crate) client: Client,
+    pub(crate) request: etcdserverpb::RangeRequest,
 }
 
 const _: () = {

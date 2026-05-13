@@ -14,6 +14,7 @@ mod lease;
 pub use lease::*;
 
 mod list;
+pub(crate) use list::ListContinuation;
 pub use list::*;
 
 mod put;

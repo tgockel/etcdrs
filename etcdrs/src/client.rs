@@ -8,6 +8,7 @@ use std::{ops::AsyncFn, sync::Arc};
 
 mod builder;
 pub use builder::{BuildError, ClientBuilder};
+mod driver;
 mod metrics;
 pub use metrics::{MetricsCollector, RequestCount, RequestCounter};
 mod ops;

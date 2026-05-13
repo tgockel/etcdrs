@@ -44,10 +44,10 @@ calling `.keys_only()` on a [`List`][client::List] changes the stream item type 
 
 ### Pluggable Backends
 
-The [`driver`] module defines traits ([`GetDriver`][driver::GetDriver],
-[`PutDriver`][driver::PutDriver], etc.) that abstract how operations are executed. The default
-[`Client`] implements all drivers via gRPC. Custom types can implement a subset of drivers to
-build caching layers, mock clients, or proxies.
+The [`driver`] module defines service-boundary traits like [`KvDriver`][driver::KvDriver],
+[`LeaseDriver`][driver::LeaseDriver], and [`WatchDriver`][driver::WatchDriver] that abstract how
+operations are executed. The default [`Client`] implements all drivers via gRPC. Custom types can
+wrap a client to build caching layers, mock clients, instrumentation, or proxies.
 
 ### Authentication
 

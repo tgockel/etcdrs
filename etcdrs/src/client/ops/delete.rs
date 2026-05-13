@@ -9,7 +9,7 @@ use bytes::Bytes;
 
 use crate::{
     AsRange, Client, Prefix, ResponseHeader, TargetRange,
-    client::{GetPreviousValue, record_from_pb},
+    client::GetPreviousValue,
     pb::etcdserverpb,
     record::{AsKey, Record},
 };
@@ -76,6 +76,7 @@ impl Client {
     }
 }
 
+/// A [`Client::delete`], [`Client::delete_range`], or [`Client::delete_prefix`] operation.
 #[derive(Clone, Debug)]
 pub struct Delete<C, R, P = ()> {
     client: C,
@@ -133,6 +134,11 @@ impl<C, R, P> Delete<C, R, P> {
     /// The range this operation addresses.
     pub fn target_range(&self) -> TargetRange<'_> {
         TargetRange::from_wire(&self.request.key, &self.request.range_end)
+    }
+
+    /// Whether the previous key-value(s) will be returned.
+    pub fn returns_previous(&self) -> bool {
+        self.request.prev_kv
     }
 
     /// Decompose this operation into its client and a detached `Delete<(), R, P>`.
@@ -252,6 +258,12 @@ impl DeleteResponse<usize, GetPreviousValue> {
 /// [`delete_range`][Client::delete_range] operations.
 pub struct DeleteFuture<T>(Pin<Box<dyn Future<Output = T> + Send>>);
 
+impl<T> DeleteFuture<T> {
+    pub(crate) fn new(future: impl Future<Output = T> + Send + 'static) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
 impl<T> Future for DeleteFuture<T> {
     type Output = T;
 
@@ -260,41 +272,16 @@ impl<T> Future for DeleteFuture<T> {
     }
 }
 
-impl crate::driver::DeleteDriver for Client {
-    type DeleteFuture<R, P> = DeleteFuture<Result<DeleteResponse<R, P>, DeleteError>>;
-
-    fn execute_delete<R, P>(self, delete: Delete<(), R, P>) -> Self::DeleteFuture<R, P> {
-        let request = delete.request;
-        DeleteFuture(Box::pin(async move {
-            let resp = self
-                .inner
-                .wrap_unary_call(
-                    etcdserverpb::kv_client::KvClient::new,
-                    async |c, r| c.delete_range(r).await,
-                    request,
-                )
-                .await
-                .map_err(DeleteError::from_status)?;
-            let header = ResponseHeader::from_pb(resp.header.expect("DeleteRangeResponse should have a valid header"));
-            let deleted = resp.deleted as usize;
-            let previous = resp.prev_kvs.into_iter().map(record_from_pb).collect();
-            Ok(DeleteResponse::new(header, deleted, previous))
-        }))
-    }
-}
-
 impl<C, R, P> IntoFuture for Delete<C, R, P>
 where
-    C: crate::driver::DeleteDriver + Send + 'static,
-    R: Send + 'static,
-    P: Send + 'static,
+    C: crate::driver::KvDriver,
 {
     type Output = Result<DeleteResponse<R, P>, DeleteError>;
-    type IntoFuture = DeleteFuture<Self::Output>;
+    type IntoFuture = C::DeleteFuture<R, P>;
 
     fn into_future(self) -> Self::IntoFuture {
         let (client, detached) = self.into_parts();
-        DeleteFuture(Box::pin(async move { client.execute_delete(detached).await }))
+        client.execute_delete(detached)
     }
 }
 

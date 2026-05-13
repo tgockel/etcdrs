@@ -16,7 +16,7 @@ decouple operations from the transport, and the client is cheaply cloneable acro
 
 The main client library. Provides `Client`, all operation builders (`Get`, `Put`, `Delete`,
 `List`, `Watch`, `Transaction`), lease management, and authentication. Supports type-safe response
-variants via phantom types and custom backends via the `driver` trait system.
+variants via phantom types and custom backends via service-boundary driver traits.
 
 ### [`etcdrs-util`](etcdrs-util/) -- Utilities
 

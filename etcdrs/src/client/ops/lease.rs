@@ -42,18 +42,8 @@ impl Client {
     }
 
     /// Revoke an existing lease.
-    pub async fn revoke_lease(&self, lease_id: LeaseId) -> Result<RevokeLeaseResponse, RevokeLeaseError> {
-        let resp = self
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::lease_client::LeaseClient::new,
-                async |c, r| c.lease_revoke(r).await,
-                etcdserverpb::LeaseRevokeRequest { id: lease_id.get() },
-            )
-            .await
-            .map_err(RevokeLeaseError::from_status)?;
-        let header = ResponseHeader::from_pb(resp.header.expect("LeaseRevokeResponse should have a valid header"));
-        Ok(RevokeLeaseResponse { header })
+    pub fn revoke_lease(&self, lease_id: LeaseId) -> RevokeLease<Self> {
+        RevokeLease::new(lease_id).with_client(self.clone())
     }
 
     /// Create a [`LeaseKeeper`] for keeping leases alive via a bidirectional streaming RPC.
@@ -76,57 +66,7 @@ impl Client {
     /// # };
     /// ```
     pub fn lease_keeper(&self) -> LeaseKeeper {
-        let channel = self.inner.channel.clone();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let shared_rx = Arc::new(std::sync::Mutex::new(rx));
-
-        let inner = async_stream::stream! {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let mut response_stream = loop {
-                let request_stream = KeepAliveReceiverStream { inner: shared_rx.clone() };
-                let mut lease_client = etcdserverpb::lease_client::LeaseClient::new(channel.clone());
-                match lease_client.lease_keep_alive(request_stream).await {
-                    Ok(resp) => break resp.into_inner(),
-                    Err(status)
-                        if status.code() == tonic::Code::Unavailable
-                            && std::time::Instant::now() <= deadline =>
-                    {
-                        continue;
-                    }
-                    Err(status) => {
-                        yield Err(KeepAliveError::from_status(status));
-                        return;
-                    }
-                }
-            };
-
-            loop {
-                match response_stream.message().await {
-                    Ok(Some(resp)) => {
-                        let header = ResponseHeader::from_pb(
-                            resp.header.expect("LeaseKeepAliveResponse should have a valid header"),
-                        );
-                        let lease_id =
-                            LeaseId::new(resp.id).expect("LeaseKeepAliveResponse should have a valid lease ID");
-                        let ttl = if resp.ttl > 0 { Some(Duration::from_secs(resp.ttl as _)) } else { None };
-                        yield Ok(KeepAliveResponse {
-                            header,
-                            info: LeaseInfo { lease_id, ttl },
-                        });
-                    }
-                    Ok(None) => break,
-                    Err(status) => {
-                        yield Err(KeepAliveError::from_status(status));
-                        break;
-                    }
-                }
-            }
-        };
-
-        LeaseKeeper {
-            sender: KeepAliveSender { sender: tx },
-            stream: KeepAliveStream { inner: Box::new(inner) },
-        }
+        crate::driver::LeaseDriver::start_lease_keeper(self.clone())
     }
 }
 
@@ -137,6 +77,7 @@ pub struct LeaseInfo {
     pub ttl: Option<Duration>,
 }
 
+/// A [`Client::grant_lease`] operation.
 #[derive(Clone)]
 #[must_use = "GrantLease does nothing unless you `await` it"]
 pub struct GrantLease<C> {
@@ -186,37 +127,25 @@ impl<C> GrantLease<C> {
         self.request.ttl = duration.as_secs() as _;
         self
     }
-}
 
-impl GrantLease<Client> {
-    async fn call(self) -> Result<GrantLeaseResponse, GrantLeaseError> {
-        let resp = self
-            .client
-            .inner
-            .wrap_unary_call(
-                etcdserverpb::lease_client::LeaseClient::new,
-                async |c, r| c.lease_grant(r).await,
-                self.request,
-            )
-            .await
-            .map_err(GrantLeaseError::from_status)?;
+    /// The requested lease ID, or `None` when etcd should choose one.
+    pub fn requested_lease_id(&self) -> Option<LeaseId> {
+        LeaseId::new(self.request.id)
+    }
 
-        if !resp.error.is_empty() {
-            return Err(GrantLeaseError::new(GrantLeaseErrorKind::LeaseExists, resp.error, None));
-        }
+    /// The requested lease TTL, or `None` when the server default is used.
+    pub fn requested_ttl(&self) -> Option<Duration> {
+        (self.request.ttl > 0).then(|| Duration::from_secs(self.request.ttl as _))
+    }
 
-        let header = ResponseHeader::from_pb(resp.header.expect("LeaseGrantResponse should have a valid header"));
-        let lease_id = LeaseId::new(resp.id).expect("etcd server should have returned a lease");
-        let ttl = if resp.ttl > 0 {
-            Some(Duration::from_secs(resp.ttl as _))
-        } else {
-            None
-        };
-
-        Ok(GrantLeaseResponse {
-            header,
-            info: LeaseInfo { lease_id, ttl },
-        })
+    pub(crate) fn into_parts(self) -> (C, GrantLease<()>) {
+        (
+            self.client,
+            GrantLease {
+                client: (),
+                request: self.request,
+            },
+        )
     }
 }
 
@@ -228,6 +157,10 @@ pub struct GrantLeaseResponse {
 }
 
 impl GrantLeaseResponse {
+    pub(crate) fn new(header: ResponseHeader, info: LeaseInfo) -> Self {
+        Self { header, info }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ResponseHeader {
         &self.header
@@ -259,6 +192,10 @@ pub struct RevokeLeaseResponse {
 }
 
 impl RevokeLeaseResponse {
+    pub(crate) fn new(header: ResponseHeader) -> Self {
+        Self { header }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ResponseHeader {
         &self.header
@@ -268,6 +205,14 @@ impl RevokeLeaseResponse {
 /// The [`Future`] type returned by awaiting a [`grant_lease`][`Client::grant_lease`].
 pub struct GrantLeaseFuture(Pin<Box<dyn Future<Output = Result<GrantLeaseResponse, GrantLeaseError>> + Send>>);
 
+impl GrantLeaseFuture {
+    pub(crate) fn new(
+        future: impl Future<Output = Result<GrantLeaseResponse, GrantLeaseError>> + Send + 'static,
+    ) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
 impl Future for GrantLeaseFuture {
     type Output = Result<GrantLeaseResponse, GrantLeaseError>;
 
@@ -276,12 +221,78 @@ impl Future for GrantLeaseFuture {
     }
 }
 
-impl IntoFuture for GrantLease<Client> {
+impl<C: crate::driver::LeaseDriver> IntoFuture for GrantLease<C> {
     type Output = Result<GrantLeaseResponse, GrantLeaseError>;
-    type IntoFuture = GrantLeaseFuture;
+    type IntoFuture = C::GrantFuture;
 
     fn into_future(self) -> Self::IntoFuture {
-        GrantLeaseFuture(Box::pin(self.call()))
+        let (client, detached) = self.into_parts();
+        client.execute_grant_lease(detached)
+    }
+}
+
+/// A [`Client::revoke_lease`] operation.
+#[derive(Clone)]
+#[must_use = "RevokeLease does nothing unless you `await` it"]
+pub struct RevokeLease<C> {
+    client: C,
+    pub(crate) lease_id: LeaseId,
+}
+
+impl RevokeLease<()> {
+    pub fn new(lease_id: LeaseId) -> Self {
+        Self { client: (), lease_id }
+    }
+}
+
+impl<C> RevokeLease<C> {
+    pub fn with_client<C2>(self, client: C2) -> RevokeLease<C2> {
+        RevokeLease {
+            client,
+            lease_id: self.lease_id,
+        }
+    }
+
+    pub fn lease_id(&self) -> LeaseId {
+        self.lease_id
+    }
+
+    pub(crate) fn into_parts(self) -> (C, RevokeLease<()>) {
+        (
+            self.client,
+            RevokeLease {
+                client: (),
+                lease_id: self.lease_id,
+            },
+        )
+    }
+}
+
+pub struct RevokeLeaseFuture(Pin<Box<dyn Future<Output = Result<RevokeLeaseResponse, RevokeLeaseError>> + Send>>);
+
+impl RevokeLeaseFuture {
+    pub(crate) fn new(
+        future: impl Future<Output = Result<RevokeLeaseResponse, RevokeLeaseError>> + Send + 'static,
+    ) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
+impl Future for RevokeLeaseFuture {
+    type Output = Result<RevokeLeaseResponse, RevokeLeaseError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
+impl<C: crate::driver::LeaseDriver> IntoFuture for RevokeLease<C> {
+    type Output = Result<RevokeLeaseResponse, RevokeLeaseError>;
+    type IntoFuture = C::RevokeFuture;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let (client, detached) = self.into_parts();
+        client.execute_revoke_lease(detached)
     }
 }
 
@@ -431,6 +442,10 @@ pub struct KeepAliveResponse {
 }
 
 impl KeepAliveResponse {
+    pub(crate) fn new(header: ResponseHeader, info: LeaseInfo) -> Self {
+        Self { header, info }
+    }
+
     /// The response header containing cluster metadata and the store revision.
     pub fn header(&self) -> &ResponseHeader {
         &self.header
@@ -486,6 +501,10 @@ pub struct LeaseKeeper {
 }
 
 impl LeaseKeeper {
+    pub(crate) fn new(sender: KeepAliveSender, stream: KeepAliveStream) -> Self {
+        Self { sender, stream }
+    }
+
     /// Split the `LeaseKeeper` into its sender and stream halves.
     ///
     /// This is useful when you need to send keep-alive requests from a different context than
@@ -543,6 +562,10 @@ pub struct KeepAliveSender {
 }
 
 impl KeepAliveSender {
+    pub(crate) fn new(sender: tokio::sync::mpsc::UnboundedSender<etcdserverpb::LeaseKeepAliveRequest>) -> Self {
+        Self { sender }
+    }
+
     /// Send a keep-alive request for the given lease.
     ///
     /// The server will respond with a [`KeepAliveResponse`] containing the lease's remaining TTL.
@@ -563,6 +586,10 @@ pub struct KeepAliveStream {
 }
 
 impl KeepAliveStream {
+    pub(crate) fn new(inner: impl Stream<Item = Result<KeepAliveResponse, KeepAliveError>> + Send + 'static) -> Self {
+        Self { inner: Box::new(inner) }
+    }
+
     fn poll_next_impl(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -597,8 +624,8 @@ impl std::async_iter::AsyncIterator for KeepAliveStream {
 ///
 /// The receiver is behind an `Arc<Mutex<>>` so that the stream can be reconstructed on connection
 /// retry without losing messages buffered in the channel.
-struct KeepAliveReceiverStream {
-    inner: Arc<std::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<etcdserverpb::LeaseKeepAliveRequest>>>,
+pub(crate) struct KeepAliveReceiverStream {
+    pub(crate) inner: Arc<std::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<etcdserverpb::LeaseKeepAliveRequest>>>,
 }
 
 impl Stream for KeepAliveReceiverStream {
