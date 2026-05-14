@@ -13,6 +13,7 @@ etcd-bin-vendored.workspace = true
 futures = { workspace = true, default-features = true }
 rand = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
 rstest = { workspace = true, optional = true, features = ["async-timeout", "crate-name"] }
+tokio = { workspace = true, default-features = false, features = ["rt", "time"] }
 
 [dev-dependencies]
 etcdrs-test = { path = ".", features = ["rstest"] }
