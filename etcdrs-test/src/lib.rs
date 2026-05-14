@@ -13,16 +13,26 @@ mod fixtures {
 
     #[fixture]
     pub fn etcd_server() -> EtcdServer {
-        EtcdServerConfig::new_single_temporary().start().unwrap()
+        let server = EtcdServerConfig::new_single_temporary().start().unwrap();
+        wait_until_ready(&server.connect_string(), 1);
+        server
     }
 
     #[fixture]
     pub fn etcd_cluster(#[default(3)] peers: usize) -> EtcdCluster {
         let cluster = EtcdClusterConfig::with_generated_peers(peers).start().unwrap();
-        // Block on a dedicated thread until a linearizable `member_list` returns `peers`
-        // fully-populated members (or panic after 30s). The fixture is sync and is called
-        // from inside a `#[tokio::test]` runtime, so we can't build a runtime on this thread.
-        let connect = cluster.connect_string();
+        wait_until_ready(&cluster.connect_string(), peers);
+        cluster
+    }
+
+    /// Block until a linearizable `member_list` against `connect_string` returns
+    /// `expected_peers` fully-populated members (or panic after 30s).
+    ///
+    /// Runs on a dedicated thread with its own current-thread tokio runtime: the
+    /// fixture is sync and is called from inside a `#[tokio::test]` runtime, so
+    /// we can't build a runtime on the calling thread.
+    fn wait_until_ready(connect_string: &str, expected_peers: usize) {
+        let connect = connect_string.to_owned();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -39,7 +49,7 @@ mod fixtures {
                 loop {
                     let status = match client.member_list().linearizable().await {
                         Ok(r)
-                            if r.members().len() == peers
+                            if r.members().len() == expected_peers
                                 && r.members()
                                     .iter()
                                     .all(|m| !m.name().is_empty() && !m.client_urls().is_empty()) =>
@@ -51,7 +61,7 @@ mod fixtures {
                     };
                     assert!(
                         Instant::now() < deadline,
-                        "etcd cluster not ready after 30s; last status: {status}"
+                        "etcd not ready after 30s; last status: {status}"
                     );
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -59,7 +69,6 @@ mod fixtures {
         })
         .join()
         .unwrap();
-        cluster
     }
 }
 
