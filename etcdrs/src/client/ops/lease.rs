@@ -1,5 +1,6 @@
 use std::{
     future::{Future, IntoFuture},
+    marker::PhantomData,
     ops::{Deref, DerefMut},
     pin::Pin,
     sync::Arc,
@@ -7,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
 use futures_core::Stream;
 
 use crate::{Client, LeaseId, ResponseHeader, pb::etcdserverpb};
@@ -44,6 +46,41 @@ impl Client {
     /// Revoke an existing lease.
     pub fn revoke_lease(&self, lease_id: LeaseId) -> RevokeLease<Self> {
         RevokeLease::new(lease_id).with_client(self.clone())
+    }
+
+    /// Retrieve the remaining time-to-live of a lease.
+    ///
+    /// A missing or expired lease is reported as a successful response with no remaining
+    /// [`ttl`][LeaseInfo::ttl]. Use [`with_keys`][LeaseTimeToLive::with_keys] to also fetch the
+    /// keys attached to the lease.
+    ///
+    /// ```no_run
+    /// # async {
+    /// let client: etcdrs::Client = todo!();
+    /// # let lease_id: etcdrs::LeaseId = todo!();
+    /// let response = client.lease_time_to_live(lease_id).await.unwrap();
+    /// match response.ttl {
+    ///     Some(remaining) => println!("lease expires in {remaining:?}"),
+    ///     None => println!("lease has expired"),
+    /// }
+    /// # };
+    /// ```
+    pub fn lease_time_to_live(&self, lease_id: LeaseId) -> LeaseTimeToLive<Self> {
+        LeaseTimeToLive::new(lease_id).with_client(self.clone())
+    }
+
+    /// List the IDs of all active leases in the cluster.
+    ///
+    /// ```no_run
+    /// # async {
+    /// let client: etcdrs::Client = todo!();
+    /// for lease_id in client.leases().await.unwrap().leases() {
+    ///     println!("active lease: {lease_id:?}");
+    /// }
+    /// # };
+    /// ```
+    pub fn leases(&self) -> Leases<Self> {
+        Leases::new().with_client(self.clone())
     }
 
     /// Create a [`LeaseKeeper`] for keeping leases alive via a bidirectional streaming RPC.
@@ -431,6 +468,378 @@ impl RevokeLeaseError {
 }
 
 // -------------------------------------------------------------------------------------------------
+// Time-to-live
+// -------------------------------------------------------------------------------------------------
+
+/// A [`Client::lease_time_to_live`] operation.
+#[derive(Clone, Debug)]
+#[must_use = "LeaseTimeToLive does nothing unless you `await` it"]
+pub struct LeaseTimeToLive<C, K = ()> {
+    client: C,
+    pub(crate) request: etcdserverpb::LeaseTimeToLiveRequest,
+    _keys: PhantomData<fn() -> K>,
+}
+
+impl LeaseTimeToLive<()> {
+    pub fn new(lease_id: LeaseId) -> Self {
+        Self {
+            client: (),
+            request: etcdserverpb::LeaseTimeToLiveRequest {
+                id: lease_id.get(),
+                ..Default::default()
+            },
+            _keys: PhantomData,
+        }
+    }
+}
+
+impl<C, K> LeaseTimeToLive<C, K> {
+    /// Attach a `client` to this operation.
+    ///
+    /// You typically do not have to call this function, as it is called automatically by
+    /// [`lease_time_to_live`][`Client::lease_time_to_live`].
+    pub fn with_client<C2>(self, client: C2) -> LeaseTimeToLive<C2, K> {
+        LeaseTimeToLive {
+            client,
+            request: self.request,
+            _keys: PhantomData,
+        }
+    }
+
+    /// Return the keys attached to the lease.
+    pub fn with_keys(self) -> LeaseTimeToLive<C, WithKeys> {
+        let mut request = self.request;
+        request.keys = true;
+        LeaseTimeToLive {
+            client: self.client,
+            request,
+            _keys: PhantomData,
+        }
+    }
+
+    /// The lease this operation queries.
+    pub fn lease_id(&self) -> LeaseId {
+        LeaseId::new(self.request.id).expect("LeaseTimeToLive lease ID should be non-zero")
+    }
+
+    /// Whether the keys attached to the lease will be returned.
+    pub fn returns_keys(&self) -> bool {
+        self.request.keys
+    }
+
+    pub(crate) fn into_parts(self) -> (C, LeaseTimeToLive<(), K>) {
+        (
+            self.client,
+            LeaseTimeToLive {
+                client: (),
+                request: self.request,
+                _keys: PhantomData,
+            },
+        )
+    }
+}
+
+/// The response from a [`lease_time_to_live`][Client::lease_time_to_live] operation.
+#[derive(Clone, Debug)]
+pub struct LeaseTimeToLiveResponse<K = ()> {
+    header: ResponseHeader,
+    info: LeaseInfo,
+    granted_ttl: Option<Duration>,
+    keys: Vec<Bytes>,
+    _marker: PhantomData<fn() -> K>,
+}
+
+impl<K> LeaseTimeToLiveResponse<K> {
+    /// Construct a new `LeaseTimeToLiveResponse`.
+    pub fn new(header: ResponseHeader, info: LeaseInfo, granted_ttl: Option<Duration>, keys: Vec<Bytes>) -> Self {
+        Self {
+            header,
+            info,
+            granted_ttl,
+            keys,
+            _marker: PhantomData,
+        }
+    }
+
+    /// The response header containing cluster metadata and the store revision.
+    pub fn header(&self) -> &ResponseHeader {
+        &self.header
+    }
+
+    /// The lease information, including the ID and the remaining TTL.
+    ///
+    /// A [`ttl`][LeaseInfo::ttl] of [`None`] indicates the lease has expired or does not exist.
+    pub fn info(&self) -> &LeaseInfo {
+        &self.info
+    }
+
+    /// The TTL originally granted to the lease, or `None` if the lease has expired or does not
+    /// exist.
+    pub fn granted_ttl(&self) -> Option<Duration> {
+        self.granted_ttl
+    }
+}
+
+impl LeaseTimeToLiveResponse<WithKeys> {
+    /// The keys attached to the lease.
+    pub fn keys(&self) -> &[Bytes] {
+        &self.keys
+    }
+
+    /// Consume the response and return the keys attached to the lease.
+    pub fn into_keys(self) -> Vec<Bytes> {
+        self.keys
+    }
+}
+
+impl<K> Deref for LeaseTimeToLiveResponse<K> {
+    type Target = LeaseInfo;
+
+    fn deref(&self) -> &LeaseInfo {
+        &self.info
+    }
+}
+
+/// The [`Future`] type returned by awaiting a [`lease_time_to_live`][`Client::lease_time_to_live`].
+pub struct LeaseTimeToLiveFuture<T>(Pin<Box<dyn Future<Output = T> + Send>>);
+
+impl<T> LeaseTimeToLiveFuture<T> {
+    pub(crate) fn new(future: impl Future<Output = T> + Send + 'static) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
+impl<T> Future for LeaseTimeToLiveFuture<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
+impl<C, K> IntoFuture for LeaseTimeToLive<C, K>
+where
+    C: crate::driver::LeaseDriver,
+{
+    type Output = Result<LeaseTimeToLiveResponse<K>, LeaseTimeToLiveError>;
+    type IntoFuture = C::TimeToLiveFuture<K>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let (client, detached) = self.into_parts();
+        client.execute_lease_time_to_live(detached)
+    }
+}
+
+/// Used in [`LeaseTimeToLive`]s to denote that the keys attached to the lease should be returned.
+pub struct WithKeys;
+
+/// An enumeration of the [`kind`][LeaseTimeToLiveError::kind]s of errors that can occur from a
+/// [`lease_time_to_live`][Client::lease_time_to_live] operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseTimeToLiveErrorKind {
+    /// The lease was not found.
+    ///
+    /// This comes from the gRPC API as `NOT_FOUND`. Only very old etcd servers report a missing
+    /// lease this way; modern servers respond successfully with no remaining
+    /// [`ttl`][LeaseInfo::ttl].
+    NotFound,
+    /// There is an authentication or authorization error.
+    ///
+    /// This comes from the gRPC API as `UNAUTHENTICATED`, `PERMISSION_DENIED` and `INVALID_ARGUMENT` when the argument
+    /// describes an authentication error.
+    Authentication,
+    /// The server or transport is resource-exhausted.
+    ///
+    /// This comes from the gRPC API as `RESOURCE_EXHAUSTED`.
+    Exhausted,
+    /// The server has lost data.
+    ///
+    /// This comes from the gRPC API as `DATA_LOSS`.
+    DataLoss,
+    /// The server is not ready to serve that request.
+    ///
+    /// This comes from the gRPC API as `UNAVAILABLE`.
+    Unavailable,
+    /// The request timed out.
+    ///
+    /// This comes from the gRPC API as `CANCELLED` or `DEADLINE_EXCEEDED`. We do not distinguish between the two, as
+    /// the source of the timeout is usually not important.
+    Timeout,
+    /// An error that is not covered by any other error kind.
+    ///
+    /// All uncovered gRPC errors are mapped to this kind of error. They should not happen unless the etcd server has
+    /// changed its error codes.
+    Unknown,
+}
+
+define_op_error! {
+    /// An error from a [`lease_time_to_live`][Client::lease_time_to_live] operation.
+    pub struct LeaseTimeToLiveError(LeaseTimeToLiveErrorKind);
+}
+
+impl LeaseTimeToLiveError {
+    pub(crate) fn from_status(status: tonic::Status) -> Self {
+        let kind = match status.code() {
+            tonic::Code::NotFound => LeaseTimeToLiveErrorKind::NotFound,
+            tonic::Code::Unauthenticated => LeaseTimeToLiveErrorKind::Authentication,
+            tonic::Code::PermissionDenied => LeaseTimeToLiveErrorKind::Authentication,
+            // NOTE: Other "invalid arguments" won't be returned because we won't send bad arguments
+            tonic::Code::InvalidArgument => LeaseTimeToLiveErrorKind::Authentication,
+            tonic::Code::ResourceExhausted => LeaseTimeToLiveErrorKind::Exhausted,
+            tonic::Code::DataLoss => LeaseTimeToLiveErrorKind::DataLoss,
+            tonic::Code::Unavailable => LeaseTimeToLiveErrorKind::Unavailable,
+            // Don't care who timed us out
+            tonic::Code::Cancelled | tonic::Code::DeadlineExceeded => LeaseTimeToLiveErrorKind::Timeout,
+            _ => LeaseTimeToLiveErrorKind::Unknown,
+        };
+        Self::new(kind, "", Some(status))
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Lease listing
+// -------------------------------------------------------------------------------------------------
+
+/// A [`Client::leases`] operation.
+#[derive(Clone)]
+#[must_use = "Leases does nothing unless you `await` it"]
+pub struct Leases<C> {
+    client: C,
+}
+
+impl Leases<()> {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self { client: () }
+    }
+}
+
+impl<C> Leases<C> {
+    /// Attach a `client` to this operation.
+    ///
+    /// You typically do not have to call this function, as it is called automatically by
+    /// [`leases`][`Client::leases`].
+    pub fn with_client<C2>(self, client: C2) -> Leases<C2> {
+        Leases { client }
+    }
+
+    pub(crate) fn into_parts(self) -> (C, Leases<()>) {
+        (self.client, Leases { client: () })
+    }
+}
+
+/// The response from a [`leases`][Client::leases] operation.
+#[derive(Clone, Debug)]
+pub struct LeasesResponse {
+    header: ResponseHeader,
+    leases: Vec<LeaseId>,
+}
+
+impl LeasesResponse {
+    pub(crate) fn new(header: ResponseHeader, leases: Vec<LeaseId>) -> Self {
+        Self { header, leases }
+    }
+
+    /// The response header containing cluster metadata and the store revision.
+    pub fn header(&self) -> &ResponseHeader {
+        &self.header
+    }
+
+    /// The IDs of all active leases in the cluster.
+    pub fn leases(&self) -> &[LeaseId] {
+        &self.leases
+    }
+
+    /// Consume the response and return the lease IDs.
+    pub fn into_leases(self) -> Vec<LeaseId> {
+        self.leases
+    }
+}
+
+/// The [`Future`] type returned by awaiting a [`leases`][`Client::leases`].
+pub struct LeasesFuture(Pin<Box<dyn Future<Output = Result<LeasesResponse, LeasesError>> + Send>>);
+
+impl LeasesFuture {
+    pub(crate) fn new(future: impl Future<Output = Result<LeasesResponse, LeasesError>> + Send + 'static) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
+impl Future for LeasesFuture {
+    type Output = Result<LeasesResponse, LeasesError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
+impl<C: crate::driver::LeaseDriver> IntoFuture for Leases<C> {
+    type Output = Result<LeasesResponse, LeasesError>;
+    type IntoFuture = C::LeasesFuture;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let (client, detached) = self.into_parts();
+        client.execute_leases(detached)
+    }
+}
+
+/// An enumeration of the [`kind`][LeasesError::kind]s of errors that can occur from a
+/// [`leases`][Client::leases] operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeasesErrorKind {
+    /// There is an authentication or authorization error.
+    ///
+    /// This comes from the gRPC API as `UNAUTHENTICATED`, `PERMISSION_DENIED` and `INVALID_ARGUMENT` when the argument
+    /// describes an authentication error.
+    Authentication,
+    /// The server or transport is resource-exhausted.
+    ///
+    /// This comes from the gRPC API as `RESOURCE_EXHAUSTED`.
+    Exhausted,
+    /// The server has lost data.
+    ///
+    /// This comes from the gRPC API as `DATA_LOSS`.
+    DataLoss,
+    /// The server is not ready to serve that request.
+    ///
+    /// This comes from the gRPC API as `UNAVAILABLE`.
+    Unavailable,
+    /// The request timed out.
+    ///
+    /// This comes from the gRPC API as `CANCELLED` or `DEADLINE_EXCEEDED`. We do not distinguish between the two, as
+    /// the source of the timeout is usually not important.
+    Timeout,
+    /// An error that is not covered by any other error kind.
+    ///
+    /// All uncovered gRPC errors are mapped to this kind of error. They should not happen unless the etcd server has
+    /// changed its error codes.
+    Unknown,
+}
+
+define_op_error! {
+    /// An error from a [`leases`][Client::leases] operation.
+    pub struct LeasesError(LeasesErrorKind);
+}
+
+impl LeasesError {
+    pub(crate) fn from_status(status: tonic::Status) -> Self {
+        let kind = match status.code() {
+            tonic::Code::Unauthenticated => LeasesErrorKind::Authentication,
+            tonic::Code::PermissionDenied => LeasesErrorKind::Authentication,
+            // NOTE: Other "invalid arguments" won't be returned because we won't send bad arguments
+            tonic::Code::InvalidArgument => LeasesErrorKind::Authentication,
+            tonic::Code::ResourceExhausted => LeasesErrorKind::Exhausted,
+            tonic::Code::DataLoss => LeasesErrorKind::DataLoss,
+            tonic::Code::Unavailable => LeasesErrorKind::Unavailable,
+            // Don't care who timed us out
+            tonic::Code::Cancelled | tonic::Code::DeadlineExceeded => LeasesErrorKind::Timeout,
+            _ => LeasesErrorKind::Unknown,
+        };
+        Self::new(kind, "", Some(status))
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
 // Keep-alive
 // -------------------------------------------------------------------------------------------------
 
@@ -704,5 +1113,8 @@ const _: () = {
         _assert_send::<KeepAliveSender>();
         _assert_send::<KeepAliveStream>();
         _assert_send::<LeaseKeeper>();
+        _assert_send::<LeaseTimeToLiveFuture<Result<LeaseTimeToLiveResponse, LeaseTimeToLiveError>>>();
+        _assert_send::<LeaseTimeToLiveFuture<Result<LeaseTimeToLiveResponse<WithKeys>, LeaseTimeToLiveError>>>();
+        _assert_send::<LeasesFuture>();
     }
 };

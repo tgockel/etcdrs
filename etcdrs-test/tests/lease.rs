@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use etcdrs::{Client, GrantLeaseErrorKind, RevokeLeaseErrorKind};
+use etcdrs::{Client, GrantLeaseErrorKind, LeaseId, RevokeLeaseErrorKind};
 use etcdrs_test::{EtcdCluster, etcd_cluster};
 use futures::StreamExt;
 use rstest::rstest;
@@ -37,6 +37,73 @@ async fn leases(etcd_cluster: EtcdCluster) {
 
     let revoke_err = client.revoke_lease(lease.lease_id).await.unwrap_err();
     assert_eq!(revoke_err.kind(), RevokeLeaseErrorKind::NotFound, "{revoke_err:?}");
+}
+
+#[rstest]
+#[tokio::test]
+async fn time_to_live(etcd_cluster: EtcdCluster) {
+    let client = Client::new(&etcd_cluster.connect_string()).unwrap();
+    let lease = client
+        .grant_lease()
+        .ttl(Duration::from_secs(60))
+        .await
+        .expect("Should have granted lease");
+
+    client.put("ttl/a").value("a").lease(lease.lease_id).await.unwrap();
+    client.put("ttl/b").value("b").lease(lease.lease_id).await.unwrap();
+
+    let response = client.lease_time_to_live(lease.lease_id).await.unwrap();
+    assert_eq!(response.lease_id, lease.lease_id);
+    let remaining = response.ttl.expect("live lease should have a TTL");
+    assert!(remaining <= Duration::from_secs(60), "{remaining:?}");
+    assert_eq!(response.granted_ttl(), Some(Duration::from_secs(60)));
+
+    let with_keys = client.lease_time_to_live(lease.lease_id).with_keys().await.unwrap();
+    let mut keys = with_keys.into_keys();
+    keys.sort();
+    assert_eq!(keys, vec![&b"ttl/a"[..], &b"ttl/b"[..]]);
+}
+
+#[rstest]
+#[tokio::test]
+async fn time_to_live_missing_lease(etcd_cluster: EtcdCluster) {
+    let client = Client::new(&etcd_cluster.connect_string()).unwrap();
+    let lease_id = LeaseId::new(0x7ead_beef).unwrap();
+
+    let response = client
+        .lease_time_to_live(lease_id)
+        .await
+        .expect("querying an unknown lease should succeed with no TTL");
+    assert_eq!(response.lease_id, lease_id);
+    assert_eq!(response.ttl, None);
+    assert_eq!(response.granted_ttl(), None);
+}
+
+#[rstest]
+#[tokio::test]
+async fn leases_listing(etcd_cluster: EtcdCluster) {
+    let client = Client::new(&etcd_cluster.connect_string()).unwrap();
+    let a = client
+        .grant_lease()
+        .ttl(Duration::from_secs(60))
+        .await
+        .unwrap()
+        .lease_id;
+    let b = client
+        .grant_lease()
+        .ttl(Duration::from_secs(60))
+        .await
+        .unwrap()
+        .lease_id;
+
+    let listed = client.leases().await.unwrap();
+    assert!(listed.leases().contains(&a));
+    assert!(listed.leases().contains(&b));
+
+    client.revoke_lease(a).await.unwrap();
+    let listed = client.leases().await.unwrap().into_leases();
+    assert!(!listed.contains(&a));
+    assert!(listed.contains(&b));
 }
 
 #[rstest]

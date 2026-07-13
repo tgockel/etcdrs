@@ -14,11 +14,12 @@ pub mod record;
 pub use client::{
     AuthDisableResponse, AuthEnableResponse, AuthError, AuthErrorKind, AuthenticateResponse, BuildError, Client,
     ClusterError, ClusterErrorKind, CompactError, CompactErrorKind, DeleteError, DeleteErrorKind, GetError,
-    GetErrorKind, GrantLeaseError, GrantLeaseErrorKind, KeepAliveError, KeepAliveErrorKind, Member, MemberAdd,
-    MemberAddResponse, MemberList, MemberListResponse, MemberPromoteResponse, MemberRemoveResponse,
-    MemberUpdateResponse, PutError, PutErrorKind, RetryPolicy, RevokeLeaseError, RevokeLeaseErrorKind, RoleAddResponse,
-    RoleError, RoleErrorKind, TransactionError, TransactionErrorKind, UserAddResponse, UserError, UserErrorKind,
-    UserGrantRoleResponse, WatchError, WatchErrorKind, WatchId,
+    GetErrorKind, GrantLeaseError, GrantLeaseErrorKind, KeepAliveError, KeepAliveErrorKind, LeaseTimeToLiveError,
+    LeaseTimeToLiveErrorKind, LeasesError, LeasesErrorKind, Member, MemberAdd, MemberAddResponse, MemberList,
+    MemberListResponse, MemberPromoteResponse, MemberRemoveResponse, MemberUpdateResponse, PutError, PutErrorKind,
+    RetryPolicy, RevokeLeaseError, RevokeLeaseErrorKind, RoleAddResponse, RoleError, RoleErrorKind, TransactionError,
+    TransactionErrorKind, UserAddResponse, UserError, UserErrorKind, UserGrantRoleResponse, WatchError, WatchErrorKind,
+    WatchId,
 };
 pub use error::OperationError;
 pub use range::{AsRange, Prefix, TargetRange};

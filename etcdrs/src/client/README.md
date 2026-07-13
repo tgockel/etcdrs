@@ -63,9 +63,11 @@ consumption, and new watches can be added or cancelled on an active watcher.
 ### Leases
 
 [`Client::grant_lease`] returns a [`GrantLease`] builder for creating leases with a requested TTL.
-Leases are revoked with [`Client::revoke_lease`]. To keep leases alive, [`Client::lease_keeper`]
-opens a bidirectional stream that can be split into a [`KeepAliveSender`] and [`KeepAliveStream`]
-for concurrent keep-alive requests and response consumption.
+Leases are revoked with [`Client::revoke_lease`]. [`Client::lease_time_to_live`] queries the
+remaining and originally-granted TTL of a lease (with [`with_keys`][LeaseTimeToLive::with_keys],
+also its attached keys), and [`Client::leases`] lists all active lease IDs. To keep leases alive,
+[`Client::lease_keeper`] opens a bidirectional stream that can be split into a [`KeepAliveSender`]
+and [`KeepAliveStream`] for concurrent keep-alive requests and response consumption.
 
 ### Phantom Return Types
 

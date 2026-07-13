@@ -10,13 +10,15 @@ use crate::{
         CompactError, CompactFuture, CompactResponse, CountResponse, Delete, DeleteError, DeleteFuture, DeleteResponse,
         Get, GetFuture, GetResponse, GrantLease, GrantLeaseError, GrantLeaseErrorKind, GrantLeaseFuture,
         GrantLeaseResponse, KeepAliveError, KeepAliveReceiverStream, KeepAliveResponse, KeepAliveSender,
-        KeepAliveStream, LeaseInfo, LeaseKeeper, List, ListContinuation, ListFuture, ListView, Member, MemberAdd,
-        MemberAddFuture, MemberAddResponse, MemberList, MemberListFuture, MemberListResponse, MemberPromote,
-        MemberPromoteFuture, MemberPromoteResponse, MemberRemove, MemberRemoveFuture, MemberRemoveResponse,
-        MemberUpdate, MemberUpdateFuture, MemberUpdateResponse, Put, PutError, PutFuture, PutResponse, RevokeLease,
-        RevokeLeaseError, RevokeLeaseFuture, RevokeLeaseResponse, RoleAdd, RoleAddFuture, RoleAddResponse, RoleError,
-        Transaction, TransactionError, TransactionFuture, TransactionResponse, UserAdd, UserAddFuture, UserAddResponse,
-        UserError, UserGrantRole, UserGrantRoleFuture, UserGrantRoleResponse, WatchBuilder, Watcher,
+        KeepAliveStream, LeaseInfo, LeaseKeeper, LeaseTimeToLive, LeaseTimeToLiveError, LeaseTimeToLiveFuture,
+        LeaseTimeToLiveResponse, Leases, LeasesError, LeasesFuture, LeasesResponse, List, ListContinuation, ListFuture,
+        ListView, Member, MemberAdd, MemberAddFuture, MemberAddResponse, MemberList, MemberListFuture,
+        MemberListResponse, MemberPromote, MemberPromoteFuture, MemberPromoteResponse, MemberRemove,
+        MemberRemoveFuture, MemberRemoveResponse, MemberUpdate, MemberUpdateFuture, MemberUpdateResponse, Put,
+        PutError, PutFuture, PutResponse, RevokeLease, RevokeLeaseError, RevokeLeaseFuture, RevokeLeaseResponse,
+        RoleAdd, RoleAddFuture, RoleAddResponse, RoleError, Transaction, TransactionError, TransactionFuture,
+        TransactionResponse, UserAdd, UserAddFuture, UserAddResponse, UserError, UserGrantRole, UserGrantRoleFuture,
+        UserGrantRoleResponse, WatchBuilder, Watcher,
     },
     pb::{etcdserverpb, mvccpb},
 };
@@ -209,6 +211,8 @@ impl crate::driver::KvDriver for Client {
 impl crate::driver::LeaseDriver for Client {
     type GrantFuture = GrantLeaseFuture;
     type RevokeFuture = RevokeLeaseFuture;
+    type TimeToLiveFuture<K> = LeaseTimeToLiveFuture<Result<LeaseTimeToLiveResponse<K>, LeaseTimeToLiveError>>;
+    type LeasesFuture = LeasesFuture;
     type LeaseKeeper = LeaseKeeper;
 
     fn execute_grant_lease(self, grant: GrantLease<()>) -> Self::GrantFuture {
@@ -251,6 +255,54 @@ impl crate::driver::LeaseDriver for Client {
                 .map_err(RevokeLeaseError::from_status)?;
             let header = ResponseHeader::from_pb(resp.header.expect("LeaseRevokeResponse should have a valid header"));
             Ok(RevokeLeaseResponse::new(header))
+        })
+    }
+
+    fn execute_lease_time_to_live<K>(self, op: LeaseTimeToLive<(), K>) -> Self::TimeToLiveFuture<K> {
+        let request = op.request;
+        LeaseTimeToLiveFuture::new(async move {
+            let resp = self
+                .inner
+                .wrap_unary_call(
+                    etcdserverpb::lease_client::LeaseClient::new,
+                    async |c, r| c.lease_time_to_live(r).await,
+                    request,
+                )
+                .await
+                .map_err(LeaseTimeToLiveError::from_status)?;
+            let header =
+                ResponseHeader::from_pb(resp.header.expect("LeaseTimeToLiveResponse should have a valid header"));
+            let lease_id = LeaseId::new(resp.id).expect("LeaseTimeToLiveResponse should echo the lease ID");
+            // The server reports a missing or expired lease as `ttl = -1` on a successful response.
+            let ttl = (resp.ttl > 0).then(|| Duration::from_secs(resp.ttl as _));
+            let granted_ttl = (resp.granted_ttl > 0).then(|| Duration::from_secs(resp.granted_ttl as _));
+            Ok(LeaseTimeToLiveResponse::new(
+                header,
+                LeaseInfo { lease_id, ttl },
+                granted_ttl,
+                resp.keys,
+            ))
+        })
+    }
+
+    fn execute_leases(self, _: Leases<()>) -> Self::LeasesFuture {
+        LeasesFuture::new(async move {
+            let resp = self
+                .inner
+                .wrap_unary_call(
+                    etcdserverpb::lease_client::LeaseClient::new,
+                    async |c, r| c.lease_leases(r).await,
+                    etcdserverpb::LeaseLeasesRequest {},
+                )
+                .await
+                .map_err(LeasesError::from_status)?;
+            let header = ResponseHeader::from_pb(resp.header.expect("LeaseLeasesResponse should have a valid header"));
+            let leases = resp
+                .leases
+                .into_iter()
+                .map(|status| LeaseId::new(status.id).expect("lease listing should not contain a zero lease ID"))
+                .collect();
+            Ok(LeasesResponse::new(header, leases))
         })
     }
 
