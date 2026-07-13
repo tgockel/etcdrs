@@ -21,6 +21,19 @@ impl Client {
         AuthDisable::new().with_client(self.clone())
     }
 
+    /// Query whether authentication is enabled on the cluster.
+    ///
+    /// ```no_run
+    /// # async {
+    /// let client: etcdrs::Client = todo!();
+    /// let status = client.auth_status().await.unwrap();
+    /// println!("auth enabled: {}", status.enabled());
+    /// # };
+    /// ```
+    pub fn auth_status(&self) -> AuthStatus<Self> {
+        AuthStatus::new().with_client(self.clone())
+    }
+
     /// Authenticate with the cluster using the credentials provided to
     /// [`ClientBuilder::credentials`][crate::client::ClientBuilder::credentials], returning a
     /// token.
@@ -84,6 +97,30 @@ impl<C> AuthDisable<C> {
     }
 }
 
+/// A [`Client::auth_status`] operation.
+#[derive(Clone)]
+#[must_use = "AuthStatus does nothing unless you `await` it"]
+pub struct AuthStatus<C> {
+    client: C,
+}
+
+impl AuthStatus<()> {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self { client: () }
+    }
+}
+
+impl<C> AuthStatus<C> {
+    pub fn with_client<C2>(self, client: C2) -> AuthStatus<C2> {
+        AuthStatus { client }
+    }
+
+    pub(crate) fn into_parts(self) -> (C, AuthStatus<()>) {
+        (self.client, AuthStatus { client: () })
+    }
+}
+
 /// A [`Client::authenticate`] operation.
 #[derive(Clone)]
 #[must_use = "Authenticate does nothing unless you `await` it"]
@@ -140,6 +177,22 @@ impl Future for AuthDisableFuture {
     }
 }
 
+pub struct AuthStatusFuture(Pin<Box<dyn Future<Output = Result<AuthStatusResponse, AuthError>> + Send>>);
+
+impl AuthStatusFuture {
+    pub(crate) fn new(future: impl Future<Output = Result<AuthStatusResponse, AuthError>> + Send + 'static) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
+impl Future for AuthStatusFuture {
+    type Output = Result<AuthStatusResponse, AuthError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().0.as_mut().poll(cx)
+    }
+}
+
 pub struct AuthenticateFuture(Pin<Box<dyn Future<Output = Result<AuthenticateResponse, AuthError>> + Send>>);
 
 impl AuthenticateFuture {
@@ -173,6 +226,16 @@ impl<C: crate::driver::AuthDriver> IntoFuture for AuthDisable<C> {
     fn into_future(self) -> Self::IntoFuture {
         let (client, detached) = self.into_parts();
         client.execute_auth_disable(detached)
+    }
+}
+
+impl<C: crate::driver::AuthDriver> IntoFuture for AuthStatus<C> {
+    type Output = Result<AuthStatusResponse, AuthError>;
+    type IntoFuture = C::AuthStatusFuture;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let (client, detached) = self.into_parts();
+        client.execute_auth_status(detached)
     }
 }
 
@@ -220,6 +283,42 @@ impl AuthDisableResponse {
     }
 }
 
+/// The response from an [`auth_status`][Client::auth_status] operation.
+#[derive(Clone, Copy, Debug)]
+pub struct AuthStatusResponse {
+    header: ResponseHeader,
+    enabled: bool,
+    auth_revision: u64,
+}
+
+impl AuthStatusResponse {
+    pub(crate) fn new(header: ResponseHeader, enabled: bool, auth_revision: u64) -> Self {
+        Self {
+            header,
+            enabled,
+            auth_revision,
+        }
+    }
+
+    /// The response header containing cluster metadata and the store revision.
+    pub fn header(&self) -> &ResponseHeader {
+        &self.header
+    }
+
+    /// Whether authentication is enabled on the cluster.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// The revision of the auth store.
+    ///
+    /// This increments with each authentication-related mutation (user, role, or permission
+    /// change), independently of the key-value store revision.
+    pub fn auth_revision(&self) -> u64 {
+        self.auth_revision
+    }
+}
+
 /// The response from an [`authenticate`][Client::authenticate] operation.
 #[derive(Clone, Debug)]
 pub struct AuthenticateResponse {
@@ -250,7 +349,7 @@ impl AuthenticateResponse {
 
 /// An enumeration of the [`kind`][AuthError::kind]s of errors that can occur from auth control
 /// operations ([`auth_enable`][Client::auth_enable], [`auth_disable`][Client::auth_disable],
-/// [`authenticate`][Client::authenticate]).
+/// [`auth_status`][Client::auth_status], [`authenticate`][Client::authenticate]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthErrorKind {
     /// Authentication is already enabled.
@@ -293,7 +392,8 @@ pub enum AuthErrorKind {
 
 define_op_error! {
     /// An error from an auth control operation ([`auth_enable`][Client::auth_enable],
-    /// [`auth_disable`][Client::auth_disable], [`authenticate`][Client::authenticate]).
+    /// [`auth_disable`][Client::auth_disable], [`auth_status`][Client::auth_status],
+    /// [`authenticate`][Client::authenticate]).
     pub struct AuthError(AuthErrorKind);
 }
 

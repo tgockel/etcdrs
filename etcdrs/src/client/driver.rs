@@ -6,19 +6,25 @@ use crate::{
     Client, ClusterResponseHeader, GetError, GetErrorKind, KeyWithMetadata, LeaseId, Record, ResponseHeader,
     client::{
         AuthDisable, AuthDisableFuture, AuthDisableResponse, AuthEnable, AuthEnableFuture, AuthEnableResponse,
-        AuthError, AuthErrorKind, Authenticate, AuthenticateFuture, AuthenticateResponse, ClusterError, Compact,
-        CompactError, CompactFuture, CompactResponse, CountResponse, Delete, DeleteError, DeleteFuture, DeleteResponse,
-        Get, GetFuture, GetResponse, GrantLease, GrantLeaseError, GrantLeaseErrorKind, GrantLeaseFuture,
-        GrantLeaseResponse, KeepAliveError, KeepAliveReceiverStream, KeepAliveResponse, KeepAliveSender,
-        KeepAliveStream, LeaseInfo, LeaseKeeper, LeaseTimeToLive, LeaseTimeToLiveError, LeaseTimeToLiveFuture,
-        LeaseTimeToLiveResponse, Leases, LeasesError, LeasesFuture, LeasesResponse, List, ListContinuation, ListFuture,
-        ListView, Member, MemberAdd, MemberAddFuture, MemberAddResponse, MemberList, MemberListFuture,
-        MemberListResponse, MemberPromote, MemberPromoteFuture, MemberPromoteResponse, MemberRemove,
-        MemberRemoveFuture, MemberRemoveResponse, MemberUpdate, MemberUpdateFuture, MemberUpdateResponse, Put,
-        PutError, PutFuture, PutResponse, RevokeLease, RevokeLeaseError, RevokeLeaseFuture, RevokeLeaseResponse,
-        RoleAdd, RoleAddFuture, RoleAddResponse, RoleError, Transaction, TransactionError, TransactionFuture,
-        TransactionResponse, UserAdd, UserAddFuture, UserAddResponse, UserError, UserGrantRole, UserGrantRoleFuture,
-        UserGrantRoleResponse, WatchBuilder, Watcher,
+        AuthError, AuthErrorKind, AuthStatus, AuthStatusFuture, AuthStatusResponse, Authenticate, AuthenticateFuture,
+        AuthenticateResponse, ClusterError, Compact, CompactError, CompactFuture, CompactResponse, CountResponse,
+        Delete, DeleteError, DeleteFuture, DeleteResponse, Get, GetFuture, GetResponse, GrantLease, GrantLeaseError,
+        GrantLeaseErrorKind, GrantLeaseFuture, GrantLeaseResponse, KeepAliveError, KeepAliveReceiverStream,
+        KeepAliveResponse, KeepAliveSender, KeepAliveStream, LeaseInfo, LeaseKeeper, LeaseTimeToLive,
+        LeaseTimeToLiveError, LeaseTimeToLiveFuture, LeaseTimeToLiveResponse, Leases, LeasesError, LeasesFuture,
+        LeasesResponse, List, ListContinuation, ListFuture, ListView, Member, MemberAdd, MemberAddFuture,
+        MemberAddResponse, MemberList, MemberListFuture, MemberListResponse, MemberPromote, MemberPromoteFuture,
+        MemberPromoteResponse, MemberRemove, MemberRemoveFuture, MemberRemoveResponse, MemberUpdate,
+        MemberUpdateFuture, MemberUpdateResponse, Permission, Put, PutError, PutFuture, PutResponse, RevokeLease,
+        RevokeLeaseError, RevokeLeaseFuture, RevokeLeaseResponse, RoleAdd, RoleAddFuture, RoleAddResponse, RoleDelete,
+        RoleDeleteFuture, RoleDeleteResponse, RoleError, RoleGet, RoleGetFuture, RoleGetResponse, RoleGrantPermission,
+        RoleGrantPermissionFuture, RoleGrantPermissionResponse, RoleList, RoleListFuture, RoleListResponse,
+        RoleRevokePermission, RoleRevokePermissionFuture, RoleRevokePermissionResponse, Transaction, TransactionError,
+        TransactionFuture, TransactionResponse, UserAdd, UserAddFuture, UserAddResponse, UserChangePassword,
+        UserChangePasswordFuture, UserChangePasswordResponse, UserDelete, UserDeleteFuture, UserDeleteResponse,
+        UserError, UserGet, UserGetFuture, UserGetResponse, UserGrantRole, UserGrantRoleFuture, UserGrantRoleResponse,
+        UserList, UserListFuture, UserListResponse, UserRevokeRole, UserRevokeRoleFuture, UserRevokeRoleResponse,
+        WatchBuilder, Watcher,
     },
     pb::{etcdserverpb, mvccpb},
 };
@@ -357,10 +363,21 @@ impl crate::driver::WatchDriver for Client {
 impl crate::driver::AuthDriver for Client {
     type AuthEnableFuture = AuthEnableFuture;
     type AuthDisableFuture = AuthDisableFuture;
+    type AuthStatusFuture = AuthStatusFuture;
     type AuthenticateFuture = AuthenticateFuture;
     type UserAddFuture = UserAddFuture;
+    type UserGetFuture = UserGetFuture;
+    type UserListFuture = UserListFuture;
+    type UserDeleteFuture = UserDeleteFuture;
+    type UserChangePasswordFuture = UserChangePasswordFuture;
     type UserGrantRoleFuture = UserGrantRoleFuture;
+    type UserRevokeRoleFuture = UserRevokeRoleFuture;
     type RoleAddFuture = RoleAddFuture;
+    type RoleGetFuture = RoleGetFuture;
+    type RoleListFuture = RoleListFuture;
+    type RoleDeleteFuture = RoleDeleteFuture;
+    type RoleGrantPermissionFuture = RoleGrantPermissionFuture;
+    type RoleRevokePermissionFuture = RoleRevokePermissionFuture;
 
     fn execute_auth_enable(self, _: AuthEnable<()>) -> Self::AuthEnableFuture {
         AuthEnableFuture::new(async move {
@@ -391,6 +408,22 @@ impl crate::driver::AuthDriver for Client {
                 .map_err(AuthError::from_status)?;
             let header = ResponseHeader::from_pb(resp.header.expect("AuthDisableResponse should have a valid header"));
             Ok(AuthDisableResponse::new(header))
+        })
+    }
+
+    fn execute_auth_status(self, _: AuthStatus<()>) -> Self::AuthStatusFuture {
+        AuthStatusFuture::new(async move {
+            let resp = self
+                .inner
+                .wrap_unary_call(
+                    etcdserverpb::auth_client::AuthClient::new,
+                    async |c, r| c.auth_status(r).await,
+                    etcdserverpb::AuthStatusRequest {},
+                )
+                .await
+                .map_err(AuthError::from_status)?;
+            let header = ResponseHeader::from_pb(resp.header.expect("AuthStatusResponse should have a valid header"));
+            Ok(AuthStatusResponse::new(header, resp.enabled, resp.auth_revision))
         })
     }
 
@@ -437,6 +470,77 @@ impl crate::driver::AuthDriver for Client {
         })
     }
 
+    fn execute_user_get(self, op: UserGet<()>) -> Self::UserGetFuture {
+        let request = op.request;
+        UserGetFuture::new(async move {
+            let resp = self
+                .inner
+                .wrap_unary_call(
+                    etcdserverpb::auth_client::AuthClient::new,
+                    async |c, r| c.user_get(r).await,
+                    request,
+                )
+                .await
+                .map_err(UserError::from_status)?;
+            let header = ResponseHeader::from_pb(resp.header.expect("AuthUserGetResponse should have a valid header"));
+            Ok(UserGetResponse::new(header, resp.roles))
+        })
+    }
+
+    fn execute_user_list(self, _: UserList<()>) -> Self::UserListFuture {
+        UserListFuture::new(async move {
+            let resp = self
+                .inner
+                .wrap_unary_call(
+                    etcdserverpb::auth_client::AuthClient::new,
+                    async |c, r| c.user_list(r).await,
+                    etcdserverpb::AuthUserListRequest {},
+                )
+                .await
+                .map_err(UserError::from_status)?;
+            let header = ResponseHeader::from_pb(resp.header.expect("AuthUserListResponse should have a valid header"));
+            Ok(UserListResponse::new(header, resp.users))
+        })
+    }
+
+    fn execute_user_delete(self, op: UserDelete<()>) -> Self::UserDeleteFuture {
+        let request = op.request;
+        UserDeleteFuture::new(async move {
+            let resp = self
+                .inner
+                .wrap_unary_call(
+                    etcdserverpb::auth_client::AuthClient::new,
+                    async |c, r| c.user_delete(r).await,
+                    request,
+                )
+                .await
+                .map_err(UserError::from_status)?;
+            let header =
+                ResponseHeader::from_pb(resp.header.expect("AuthUserDeleteResponse should have a valid header"));
+            Ok(UserDeleteResponse::new(header))
+        })
+    }
+
+    fn execute_user_change_password(self, op: UserChangePassword<()>) -> Self::UserChangePasswordFuture {
+        let request = op.request;
+        UserChangePasswordFuture::new(async move {
+            let resp = self
+                .inner
+                .wrap_unary_call(
+                    etcdserverpb::auth_client::AuthClient::new,
+                    async |c, r| c.user_change_password(r).await,
+                    request,
+                )
+                .await
+                .map_err(UserError::from_status)?;
+            let header = ResponseHeader::from_pb(
+                resp.header
+                    .expect("AuthUserChangePasswordResponse should have a valid header"),
+            );
+            Ok(UserChangePasswordResponse::new(header))
+        })
+    }
+
     fn execute_user_grant_role(self, op: UserGrantRole<()>) -> Self::UserGrantRoleFuture {
         let request = op.request;
         UserGrantRoleFuture::new(async move {
@@ -457,6 +561,26 @@ impl crate::driver::AuthDriver for Client {
         })
     }
 
+    fn execute_user_revoke_role(self, op: UserRevokeRole<()>) -> Self::UserRevokeRoleFuture {
+        let request = op.request;
+        UserRevokeRoleFuture::new(async move {
+            let resp = self
+                .inner
+                .wrap_unary_call(
+                    etcdserverpb::auth_client::AuthClient::new,
+                    async |c, r| c.user_revoke_role(r).await,
+                    request,
+                )
+                .await
+                .map_err(UserError::from_status)?;
+            let header = ResponseHeader::from_pb(
+                resp.header
+                    .expect("AuthUserRevokeRoleResponse should have a valid header"),
+            );
+            Ok(UserRevokeRoleResponse::new(header))
+        })
+    }
+
     fn execute_role_add(self, op: RoleAdd<()>) -> Self::RoleAddFuture {
         let request = op.request;
         RoleAddFuture::new(async move {
@@ -471,6 +595,101 @@ impl crate::driver::AuthDriver for Client {
                 .map_err(RoleError::from_status)?;
             let header = ResponseHeader::from_pb(resp.header.expect("AuthRoleAddResponse should have a valid header"));
             Ok(RoleAddResponse::new(header))
+        })
+    }
+
+    fn execute_role_get(self, op: RoleGet<()>) -> Self::RoleGetFuture {
+        let request = op.request;
+        RoleGetFuture::new(async move {
+            let resp = self
+                .inner
+                .wrap_unary_call(
+                    etcdserverpb::auth_client::AuthClient::new,
+                    async |c, r| c.role_get(r).await,
+                    request,
+                )
+                .await
+                .map_err(RoleError::from_status)?;
+            let header = ResponseHeader::from_pb(resp.header.expect("AuthRoleGetResponse should have a valid header"));
+            let permissions = resp.perm.into_iter().map(Permission::from_pb).collect();
+            Ok(RoleGetResponse::new(header, permissions))
+        })
+    }
+
+    fn execute_role_list(self, _: RoleList<()>) -> Self::RoleListFuture {
+        RoleListFuture::new(async move {
+            let resp = self
+                .inner
+                .wrap_unary_call(
+                    etcdserverpb::auth_client::AuthClient::new,
+                    async |c, r| c.role_list(r).await,
+                    etcdserverpb::AuthRoleListRequest {},
+                )
+                .await
+                .map_err(RoleError::from_status)?;
+            let header = ResponseHeader::from_pb(resp.header.expect("AuthRoleListResponse should have a valid header"));
+            Ok(RoleListResponse::new(header, resp.roles))
+        })
+    }
+
+    fn execute_role_delete(self, op: RoleDelete<()>) -> Self::RoleDeleteFuture {
+        let request = op.request;
+        RoleDeleteFuture::new(async move {
+            let resp = self
+                .inner
+                .wrap_unary_call(
+                    etcdserverpb::auth_client::AuthClient::new,
+                    async |c, r| c.role_delete(r).await,
+                    request,
+                )
+                .await
+                .map_err(RoleError::from_status)?;
+            let header =
+                ResponseHeader::from_pb(resp.header.expect("AuthRoleDeleteResponse should have a valid header"));
+            Ok(RoleDeleteResponse::new(header))
+        })
+    }
+
+    fn execute_role_grant_permission(self, op: RoleGrantPermission<()>) -> Self::RoleGrantPermissionFuture {
+        let request = etcdserverpb::AuthRoleGrantPermissionRequest {
+            name: op.name,
+            perm: Some(op.permission.into_pb()),
+        };
+        RoleGrantPermissionFuture::new(async move {
+            let resp = self
+                .inner
+                .wrap_unary_call(
+                    etcdserverpb::auth_client::AuthClient::new,
+                    async |c, r| c.role_grant_permission(r).await,
+                    request,
+                )
+                .await
+                .map_err(RoleError::from_status)?;
+            let header = ResponseHeader::from_pb(
+                resp.header
+                    .expect("AuthRoleGrantPermissionResponse should have a valid header"),
+            );
+            Ok(RoleGrantPermissionResponse::new(header))
+        })
+    }
+
+    fn execute_role_revoke_permission(self, op: RoleRevokePermission<()>) -> Self::RoleRevokePermissionFuture {
+        let request = op.request;
+        RoleRevokePermissionFuture::new(async move {
+            let resp = self
+                .inner
+                .wrap_unary_call(
+                    etcdserverpb::auth_client::AuthClient::new,
+                    async |c, r| c.role_revoke_permission(r).await,
+                    request,
+                )
+                .await
+                .map_err(RoleError::from_status)?;
+            let header = ResponseHeader::from_pb(
+                resp.header
+                    .expect("AuthRoleRevokePermissionResponse should have a valid header"),
+            );
+            Ok(RoleRevokePermissionResponse::new(header))
         })
     }
 }
