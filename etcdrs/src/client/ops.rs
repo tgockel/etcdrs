@@ -4,6 +4,9 @@ pub use auth::*;
 mod cluster;
 pub use cluster::*;
 
+mod compact;
+pub use compact::*;
+
 mod delete;
 pub use delete::*;
 

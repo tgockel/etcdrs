@@ -12,7 +12,7 @@ client to add caching, testing, instrumentation, or proxy behavior.
 
 | Trait | Operation family |
 |-------|------------------|
-| [`KvDriver`] | Get, put, delete, list, count, and transactions |
+| [`KvDriver`] | Get, put, delete, list, count, transactions, and compaction |
 | [`LeaseDriver`] | Lease grant, revoke, and keep-alive |
 | [`WatchDriver`] | Watch stream creation |
 | [`AuthDriver`] | Auth control, user management, and role management |

@@ -1,6 +1,6 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use etcdrs::Version;
+use etcdrs::{CompactErrorKind, Revision, Version, WatchErrorKind};
 use etcdrs_test::{EtcdCluster, EtcdServer, etcd_cluster, etcd_server};
 use futures::StreamExt;
 use rstest::rstest;
@@ -149,6 +149,42 @@ async fn delete_range_get_previous(etcd_server: EtcdServer) {
     assert_eq!(previous.len(), 3);
     let keys: Vec<&[u8]> = previous.iter().map(|r| &r.key()[..]).collect();
     assert_eq!(keys, vec![b"foo/a", b"foo/b", b"foo/c"]);
+}
+
+#[rstest]
+#[tokio::test]
+async fn compact(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+
+    // Build up some revision history.
+    let first_rev = client.put("compact-key").value("v1").await.unwrap().header().revision();
+    let mid_rev = client.put("compact-key").value("v2").await.unwrap().header().revision();
+    let last_rev = client.put("compact-key").value("v3").await.unwrap().header().revision();
+
+    // Compaction succeeds in both the default and physical modes, and the current value survives.
+    client.compact(mid_rev).await.unwrap();
+    client.compact(last_rev).physical().await.unwrap();
+    let fetched = client.get("compact-key").await.unwrap().into_record().unwrap();
+    assert_eq!(fetched.value(), &b"v3"[..]);
+
+    // Compacting the same revision again fails as already-compacted.
+    let err = client.compact(last_rev).await.unwrap_err();
+    assert_eq!(err.kind(), CompactErrorKind::CompactedRevision);
+
+    // Compacting a revision the server does not have yet fails as a future revision.
+    let future_rev = Revision::new(last_rev.get() + 1_000_000).unwrap();
+    let err = client.compact(future_rev).await.unwrap_err();
+    assert_eq!(err.kind(), CompactErrorKind::FutureRevision);
+
+    // History from before the compacted revision is no longer observable.
+    let mut watcher = client.watch().key("compact-key").start_revision(first_rev).start();
+    let err = tokio::time::timeout(Duration::from_secs(5), watcher.next())
+        .await
+        .expect("timed out waiting for watch error")
+        .expect("watch stream ended unexpectedly")
+        .expect_err("watching from a compacted revision should fail");
+    assert_eq!(err.kind(), WatchErrorKind::Compacted);
+    assert_eq!(err.compact_revision(), Some(last_rev.get()));
 }
 
 #[rstest]

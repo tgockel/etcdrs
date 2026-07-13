@@ -5,8 +5,8 @@ use futures_core::Stream;
 use crate::{
     GetError, ResponseHeader, Revision,
     client::{
-        CountResponse, Delete, DeleteError, DeleteResponse, Get, GetResponse, List, Put, PutError, PutResponse,
-        Transaction, TransactionError, TransactionResponse,
+        Compact, CompactError, CompactResponse, CountResponse, Delete, DeleteError, DeleteResponse, Get, GetResponse,
+        List, Put, PutError, PutResponse, Transaction, TransactionError, TransactionResponse,
     },
     record::{KeyWithMetadata, Record},
 };
@@ -34,6 +34,9 @@ pub trait KvDriver {
     /// The future returned by [`execute_transaction`][Self::execute_transaction].
     type CommitFuture: Future<Output = Result<TransactionResponse, TransactionError>> + Send;
 
+    /// The future returned by [`execute_compact`][Self::execute_compact].
+    type CompactFuture: Future<Output = Result<CompactResponse, CompactError>> + Send;
+
     /// Execute a get operation.
     fn execute_get(self, get: Get<()>) -> Self::GetFuture;
 
@@ -54,6 +57,9 @@ pub trait KvDriver {
 
     /// Execute a transaction.
     fn execute_transaction(self, txn: Transaction<()>) -> Self::CommitFuture;
+
+    /// Execute a compaction operation.
+    fn execute_compact(self, compact: Compact<()>) -> Self::CompactFuture;
 }
 
 pub trait ListView<R> {

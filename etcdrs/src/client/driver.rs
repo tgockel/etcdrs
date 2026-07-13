@@ -6,17 +6,17 @@ use crate::{
     Client, ClusterResponseHeader, GetError, GetErrorKind, KeyWithMetadata, LeaseId, Record, ResponseHeader,
     client::{
         AuthDisable, AuthDisableFuture, AuthDisableResponse, AuthEnable, AuthEnableFuture, AuthEnableResponse,
-        AuthError, AuthErrorKind, Authenticate, AuthenticateFuture, AuthenticateResponse, ClusterError, CountResponse,
-        Delete, DeleteError, DeleteFuture, DeleteResponse, Get, GetFuture, GetResponse, GrantLease, GrantLeaseError,
-        GrantLeaseErrorKind, GrantLeaseFuture, GrantLeaseResponse, KeepAliveError, KeepAliveReceiverStream,
-        KeepAliveResponse, KeepAliveSender, KeepAliveStream, LeaseInfo, LeaseKeeper, List, ListContinuation,
-        ListFuture, ListView, Member, MemberAdd, MemberAddFuture, MemberAddResponse, MemberList, MemberListFuture,
-        MemberListResponse, MemberPromote, MemberPromoteFuture, MemberPromoteResponse, MemberRemove,
-        MemberRemoveFuture, MemberRemoveResponse, MemberUpdate, MemberUpdateFuture, MemberUpdateResponse, Put,
-        PutError, PutFuture, PutResponse, RevokeLease, RevokeLeaseError, RevokeLeaseFuture, RevokeLeaseResponse,
-        RoleAdd, RoleAddFuture, RoleAddResponse, RoleError, Transaction, TransactionError, TransactionFuture,
-        TransactionResponse, UserAdd, UserAddFuture, UserAddResponse, UserError, UserGrantRole, UserGrantRoleFuture,
-        UserGrantRoleResponse, WatchBuilder, Watcher,
+        AuthError, AuthErrorKind, Authenticate, AuthenticateFuture, AuthenticateResponse, ClusterError, Compact,
+        CompactError, CompactFuture, CompactResponse, CountResponse, Delete, DeleteError, DeleteFuture, DeleteResponse,
+        Get, GetFuture, GetResponse, GrantLease, GrantLeaseError, GrantLeaseErrorKind, GrantLeaseFuture,
+        GrantLeaseResponse, KeepAliveError, KeepAliveReceiverStream, KeepAliveResponse, KeepAliveSender,
+        KeepAliveStream, LeaseInfo, LeaseKeeper, List, ListContinuation, ListFuture, ListView, Member, MemberAdd,
+        MemberAddFuture, MemberAddResponse, MemberList, MemberListFuture, MemberListResponse, MemberPromote,
+        MemberPromoteFuture, MemberPromoteResponse, MemberRemove, MemberRemoveFuture, MemberRemoveResponse,
+        MemberUpdate, MemberUpdateFuture, MemberUpdateResponse, Put, PutError, PutFuture, PutResponse, RevokeLease,
+        RevokeLeaseError, RevokeLeaseFuture, RevokeLeaseResponse, RoleAdd, RoleAddFuture, RoleAddResponse, RoleError,
+        Transaction, TransactionError, TransactionFuture, TransactionResponse, UserAdd, UserAddFuture, UserAddResponse,
+        UserError, UserGrantRole, UserGrantRoleFuture, UserGrantRoleResponse, WatchBuilder, Watcher,
     },
     pb::{etcdserverpb, mvccpb},
 };
@@ -82,6 +82,7 @@ impl crate::driver::KvDriver for Client {
     type ListViewFuture<R> = ListFuture<Result<Self::ListView<R>, GetError>>;
     type CountFuture = ListFuture<Result<CountResponse, GetError>>;
     type CommitFuture = TransactionFuture;
+    type CompactFuture = CompactFuture;
 
     fn execute_get(self, get: Get<()>) -> Self::GetFuture {
         let request = get.request;
@@ -184,6 +185,23 @@ impl crate::driver::KvDriver for Client {
                 .await
                 .map(|response| TransactionResponse::from_pb(response, &success_kinds, &failure_kinds))
                 .map_err(TransactionError::from_status)
+        })
+    }
+
+    fn execute_compact(self, compact: Compact<()>) -> Self::CompactFuture {
+        let request = compact.request;
+        CompactFuture::new(async move {
+            let resp = self
+                .inner
+                .wrap_unary_call(
+                    etcdserverpb::kv_client::KvClient::new,
+                    async |c, r| c.compact(r).await,
+                    request,
+                )
+                .await
+                .map_err(CompactError::from_status)?;
+            let header = ResponseHeader::from_pb(resp.header.expect("CompactionResponse should have a valid header"));
+            Ok(CompactResponse::new(header))
         })
     }
 }
