@@ -23,6 +23,9 @@ pub use list::*;
 mod put;
 pub use put::*;
 
+mod role;
+pub use role::*;
+
 mod transaction;
 pub use transaction::*;
 
