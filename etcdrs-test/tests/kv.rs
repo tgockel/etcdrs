@@ -153,6 +153,37 @@ async fn delete_range_get_previous(etcd_server: EtcdServer) {
 
 #[rstest]
 #[tokio::test]
+async fn get_at_revision(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+
+    let rev1 = client.put("gar/key").value("v1").await.unwrap().header().revision();
+    let rev2 = client.put("gar/key").value("v2").await.unwrap().header().revision();
+    client.put("gar/other").value("x").await.unwrap();
+
+    // A plain get reads the current value; a pinned get reads the historical one.
+    let current = client.get("gar/key").await.unwrap().into_record().unwrap();
+    assert_eq!(current.value(), &b"v2"[..]);
+    let old = client
+        .get("gar/key")
+        .at_revision(rev1)
+        .await
+        .unwrap()
+        .into_record()
+        .unwrap();
+    assert_eq!(old.value(), &b"v1"[..]);
+
+    // A key that did not exist yet at the pinned revision is absent.
+    let absent = client.get("gar/other").at_revision(rev2).await.unwrap();
+    assert!(absent.record().is_none());
+
+    // Reading a revision the server has not reached yet fails.
+    let future_rev = etcdrs::Revision::new(rev2.get() + 1000).unwrap();
+    let err = client.get("gar/key").at_revision(future_rev).await.unwrap_err();
+    assert_eq!(err.kind(), etcdrs::GetErrorKind::FutureRevision);
+}
+
+#[rstest]
+#[tokio::test]
 async fn compact(etcd_server: EtcdServer) {
     let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
 
@@ -176,7 +207,11 @@ async fn compact(etcd_server: EtcdServer) {
     let err = client.compact(future_rev).await.unwrap_err();
     assert_eq!(err.kind(), CompactErrorKind::FutureRevision);
 
-    // History from before the compacted revision is no longer observable.
+    // History from before the compacted revision is no longer readable...
+    let err = client.get("compact-key").at_revision(first_rev).await.unwrap_err();
+    assert_eq!(err.kind(), etcdrs::GetErrorKind::CompactedRevision);
+
+    // ...nor watchable.
     let mut watcher = client.watch().key("compact-key").start_revision(first_rev).start();
     let err = tokio::time::timeout(Duration::from_secs(5), watcher.next())
         .await

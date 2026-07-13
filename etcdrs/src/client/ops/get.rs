@@ -7,7 +7,7 @@ use std::{
 use bytes::Bytes;
 
 use crate::{
-    Client, ResponseHeader,
+    Client, ResponseHeader, Revision,
     pb::etcdserverpb,
     record::{AsKey, Record},
 };
@@ -61,9 +61,37 @@ impl<C> Get<C> {
         }
     }
 
+    /// Read the key as of a historical store `revision` instead of the current one.
+    ///
+    /// The revision is the global store revision from a [`ResponseHeader`] (or a record's
+    /// [`modified_revision`][crate::Metadata::modified_revision]), not the key's version. Reading
+    /// a revision that has been [compacted][Client::compact] fails with
+    /// [`CompactedRevision`][GetErrorKind::CompactedRevision]; reading a revision the server has
+    /// not reached yet fails with [`FutureRevision`][GetErrorKind::FutureRevision].
+    ///
+    /// ```no_run
+    /// # async {
+    /// let client: etcdrs::Client = todo!();
+    /// let revision = client.put("foo").value("old").await.unwrap().header().revision();
+    /// client.put("foo").value("new").await.unwrap();
+    ///
+    /// let old = client.get("foo").at_revision(revision).await.unwrap();
+    /// assert_eq!(old.record().unwrap().value(), &b"old"[..]);
+    /// # };
+    /// ```
+    pub fn at_revision(mut self, revision: Revision) -> Self {
+        self.request.revision = revision.get();
+        self
+    }
+
     /// The key this operation addresses.
     pub fn target_key(&self) -> &[u8] {
         &self.request.key
+    }
+
+    /// The revision this operation reads from, or `None` for the server's current revision.
+    pub fn revision(&self) -> Option<Revision> {
+        Revision::new(self.request.revision)
     }
 
     /// Decompose this operation into its client and a detached `Get<()>`.
