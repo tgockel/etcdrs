@@ -20,6 +20,8 @@ tokio = { workspace = true, default-features = false, features = ["macros", "rt"
 
 [features]
 default = [
-    "lease-pool"
+    "cache",
+    "lease-pool",
 ]
+cache = ["tokio/time"]
 lease-pool = ["tokio/time"]
