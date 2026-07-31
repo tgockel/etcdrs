@@ -20,9 +20,10 @@ variants via phantom types and custom backends via service-boundary driver trait
 
 ### [`etcdrs-util`](etcdrs-util/) -- Utilities
 
-Higher-level abstractions built on `etcdrs`. Currently provides `LeasePool`, which manages etcd
-leases with automatic keep-alive and TTL-based grouping to reduce the number of active leases on
-the server. Feature-gated behind `lease-pool` (enabled by default).
+Higher-level abstractions built on `etcdrs`, each behind its own feature flag (all enabled by
+default). Among them: `CacheClient`, which serves reads of configured key ranges from a local
+in-memory store kept coherent by a watch, and `LeasePool`, which manages etcd leases with automatic
+keep-alive and TTL-based grouping to reduce the number of active leases on the server.
 
 ### [`etcdrs-test`](etcdrs-test/) -- Test Infrastructure
 
