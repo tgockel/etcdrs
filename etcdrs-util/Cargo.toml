@@ -2,7 +2,14 @@
 name = "etcdrs-util"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Higher-level utilities for etcdrs: a watch-coherent read cache and an automatic lease pool"
+documentation = "https://docs.rs/etcdrs-util"
+readme = "README.md"
+keywords = ["etcd", "cache", "lease", "async", "client"]
+categories = ["database", "asynchronous", "caching"]
 
 [dependencies]
 async-stream.workspace = true

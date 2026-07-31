@@ -2,7 +2,14 @@
 name = "etcdrs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "An async etcd v3 client built on tonic and tokio, with composable operation builders and type-safe responses"
+documentation = "https://docs.rs/etcdrs"
+readme = "README.md"
+keywords = ["etcd", "client", "grpc", "async", "tonic"]
+categories = ["database", "asynchronous", "api-bindings"]
 
 [dependencies]
 async-stream.workspace = true

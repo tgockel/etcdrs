@@ -2,7 +2,17 @@
 name = "etcdrs-test"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Integration test infrastructure for etcdrs: spawn real etcd servers and clusters, with rstest fixtures"
+documentation = "https://docs.rs/etcdrs-test"
+readme = "README.md"
+keywords = ["etcd", "testing", "rstest", "fixtures", "integration"]
+categories = ["development-tools::testing", "database"]
+
+[package.metadata.docs.rs]
+features = ["rstest"]
 
 [features]
 rstest = ["dep:rstest"]
