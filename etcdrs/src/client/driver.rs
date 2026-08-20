@@ -9,10 +9,10 @@ use crate::{
         AuthError, AuthErrorKind, AuthStatus, AuthStatusFuture, AuthStatusResponse, Authenticate, AuthenticateFuture,
         AuthenticateResponse, ClusterError, Compact, CompactError, CompactFuture, CompactResponse, CountResponse,
         Delete, DeleteError, DeleteFuture, DeleteResponse, Get, GetFuture, GetResponse, GrantLease, GrantLeaseError,
-        GrantLeaseErrorKind, GrantLeaseFuture, GrantLeaseResponse, KeepAliveError, KeepAliveReceiverStream,
-        KeepAliveResponse, KeepAliveSender, KeepAliveStream, LeaseInfo, LeaseKeeper, LeaseTimeToLive,
-        LeaseTimeToLiveError, LeaseTimeToLiveFuture, LeaseTimeToLiveResponse, Leases, LeasesError, LeasesFuture,
-        LeasesResponse, List, ListContinuation, ListFuture, ListView, Member, MemberAdd, MemberAddFuture,
+        GrantLeaseErrorKind, GrantLeaseFuture, GrantLeaseResponse, Idempotency, KeepAliveError,
+        KeepAliveReceiverStream, KeepAliveResponse, KeepAliveSender, KeepAliveStream, LeaseInfo, LeaseKeeper,
+        LeaseTimeToLive, LeaseTimeToLiveError, LeaseTimeToLiveFuture, LeaseTimeToLiveResponse, Leases, LeasesError,
+        LeasesFuture, LeasesResponse, List, ListContinuation, ListFuture, ListView, Member, MemberAdd, MemberAddFuture,
         MemberAddResponse, MemberList, MemberListFuture, MemberListResponse, MemberPromote, MemberPromoteFuture,
         MemberPromoteResponse, MemberRemove, MemberRemoveFuture, MemberRemoveResponse, MemberUpdate,
         MemberUpdateFuture, MemberUpdateResponse, Permission, Put, PutError, PutFuture, PutResponse, RevokeLease,
@@ -20,11 +20,11 @@ use crate::{
         RoleDeleteFuture, RoleDeleteResponse, RoleError, RoleGet, RoleGetFuture, RoleGetResponse, RoleGrantPermission,
         RoleGrantPermissionFuture, RoleGrantPermissionResponse, RoleList, RoleListFuture, RoleListResponse,
         RoleRevokePermission, RoleRevokePermissionFuture, RoleRevokePermissionResponse, Transaction, TransactionError,
-        TransactionFuture, TransactionResponse, UserAdd, UserAddFuture, UserAddResponse, UserChangePassword,
-        UserChangePasswordFuture, UserChangePasswordResponse, UserDelete, UserDeleteFuture, UserDeleteResponse,
-        UserError, UserGet, UserGetFuture, UserGetResponse, UserGrantRole, UserGrantRoleFuture, UserGrantRoleResponse,
-        UserList, UserListFuture, UserListResponse, UserRevokeRole, UserRevokeRoleFuture, UserRevokeRoleResponse,
-        WatchBuilder, Watcher,
+        TransactionFuture, TransactionOpKind, TransactionResponse, UserAdd, UserAddFuture, UserAddResponse,
+        UserChangePassword, UserChangePasswordFuture, UserChangePasswordResponse, UserDelete, UserDeleteFuture,
+        UserDeleteResponse, UserError, UserGet, UserGetFuture, UserGetResponse, UserGrantRole, UserGrantRoleFuture,
+        UserGrantRoleResponse, UserList, UserListFuture, UserListResponse, UserRevokeRole, UserRevokeRoleFuture,
+        UserRevokeRoleResponse, WatchBuilder, Watcher,
     },
     pb::{etcdserverpb, mvccpb},
 };
@@ -41,6 +41,7 @@ async fn fetch_first_list_batch(
     let resp = client
         .inner
         .wrap_unary_call(
+            Idempotency::Immutable,
             etcdserverpb::kv_client::KvClient::new,
             async |c, r| c.range(r).await,
             request.clone(),
@@ -98,6 +99,7 @@ impl crate::driver::KvDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Immutable,
                     etcdserverpb::kv_client::KvClient::new,
                     async |c, r| c.range(r).await,
                     request,
@@ -125,6 +127,7 @@ impl crate::driver::KvDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::kv_client::KvClient::new,
                     async |c, r| c.put(r).await,
                     request,
@@ -143,6 +146,7 @@ impl crate::driver::KvDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::kv_client::KvClient::new,
                     async |c, r| c.delete_range(r).await,
                     request,
@@ -170,6 +174,7 @@ impl crate::driver::KvDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Immutable,
                     etcdserverpb::kv_client::KvClient::new,
                     async |c, r| c.range(r).await,
                     request,
@@ -183,9 +188,23 @@ impl crate::driver::KvDriver for Client {
 
     fn execute_transaction(self, txn: Transaction<()>) -> Self::CommitFuture {
         let (request, success_kinds, failure_kinds) = txn.into_request_parts();
+        // Unlike every other operation, a transaction's mutability is a property of the call rather
+        // than the RPC: a transaction whose every branch only reads is as safe to replay as a Get.
+        // The builder can only produce Put/Delete/Get/Count operations, so there are no nested
+        // transactions to recurse into.
+        let idempotency = if success_kinds
+            .iter()
+            .chain(failure_kinds.iter())
+            .all(|kind| matches!(kind, TransactionOpKind::Get | TransactionOpKind::Count))
+        {
+            Idempotency::Immutable
+        } else {
+            Idempotency::Mutable
+        };
         TransactionFuture::new(async move {
             self.inner
                 .wrap_unary_call(
+                    idempotency,
                     etcdserverpb::kv_client::KvClient::new,
                     async |c, r| c.txn(r).await,
                     request,
@@ -202,6 +221,7 @@ impl crate::driver::KvDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::kv_client::KvClient::new,
                     async |c, r| c.compact(r).await,
                     request,
@@ -227,6 +247,7 @@ impl crate::driver::LeaseDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::lease_client::LeaseClient::new,
                     async |c, r| c.lease_grant(r).await,
                     request,
@@ -253,6 +274,7 @@ impl crate::driver::LeaseDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::lease_client::LeaseClient::new,
                     async |c, r| c.lease_revoke(r).await,
                     etcdserverpb::LeaseRevokeRequest { id: lease_id.get() },
@@ -270,6 +292,7 @@ impl crate::driver::LeaseDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Immutable,
                     etcdserverpb::lease_client::LeaseClient::new,
                     async |c, r| c.lease_time_to_live(r).await,
                     request,
@@ -296,6 +319,7 @@ impl crate::driver::LeaseDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Immutable,
                     etcdserverpb::lease_client::LeaseClient::new,
                     async |c, r| c.lease_leases(r).await,
                     etcdserverpb::LeaseLeasesRequest {},
@@ -384,6 +408,7 @@ impl crate::driver::AuthDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::auth_client::AuthClient::new,
                     async |c, r| c.auth_enable(r).await,
                     etcdserverpb::AuthEnableRequest {},
@@ -400,6 +425,7 @@ impl crate::driver::AuthDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::auth_client::AuthClient::new,
                     async |c, r| c.auth_disable(r).await,
                     etcdserverpb::AuthDisableRequest {},
@@ -416,6 +442,7 @@ impl crate::driver::AuthDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Immutable,
                     etcdserverpb::auth_client::AuthClient::new,
                     async |c, r| c.auth_status(r).await,
                     etcdserverpb::AuthStatusRequest {},
@@ -459,6 +486,7 @@ impl crate::driver::AuthDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::auth_client::AuthClient::new,
                     async |c, r| c.user_add(r).await,
                     request,
@@ -476,6 +504,7 @@ impl crate::driver::AuthDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Immutable,
                     etcdserverpb::auth_client::AuthClient::new,
                     async |c, r| c.user_get(r).await,
                     request,
@@ -492,6 +521,7 @@ impl crate::driver::AuthDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Immutable,
                     etcdserverpb::auth_client::AuthClient::new,
                     async |c, r| c.user_list(r).await,
                     etcdserverpb::AuthUserListRequest {},
@@ -509,6 +539,7 @@ impl crate::driver::AuthDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::auth_client::AuthClient::new,
                     async |c, r| c.user_delete(r).await,
                     request,
@@ -527,6 +558,7 @@ impl crate::driver::AuthDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::auth_client::AuthClient::new,
                     async |c, r| c.user_change_password(r).await,
                     request,
@@ -547,6 +579,7 @@ impl crate::driver::AuthDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::auth_client::AuthClient::new,
                     async |c, r| c.user_grant_role(r).await,
                     request,
@@ -567,6 +600,7 @@ impl crate::driver::AuthDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::auth_client::AuthClient::new,
                     async |c, r| c.user_revoke_role(r).await,
                     request,
@@ -587,6 +621,7 @@ impl crate::driver::AuthDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::auth_client::AuthClient::new,
                     async |c, r| c.role_add(r).await,
                     request,
@@ -604,6 +639,7 @@ impl crate::driver::AuthDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Immutable,
                     etcdserverpb::auth_client::AuthClient::new,
                     async |c, r| c.role_get(r).await,
                     request,
@@ -621,6 +657,7 @@ impl crate::driver::AuthDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Immutable,
                     etcdserverpb::auth_client::AuthClient::new,
                     async |c, r| c.role_list(r).await,
                     etcdserverpb::AuthRoleListRequest {},
@@ -638,6 +675,7 @@ impl crate::driver::AuthDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::auth_client::AuthClient::new,
                     async |c, r| c.role_delete(r).await,
                     request,
@@ -659,6 +697,7 @@ impl crate::driver::AuthDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::auth_client::AuthClient::new,
                     async |c, r| c.role_grant_permission(r).await,
                     request,
@@ -679,6 +718,7 @@ impl crate::driver::AuthDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::auth_client::AuthClient::new,
                     async |c, r| c.role_revoke_permission(r).await,
                     request,
@@ -707,6 +747,7 @@ impl crate::driver::ClusterDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Immutable,
                     etcdserverpb::cluster_client::ClusterClient::new,
                     async |c, r| c.member_list(r).await,
                     request,
@@ -726,6 +767,7 @@ impl crate::driver::ClusterDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::cluster_client::ClusterClient::new,
                     async |c, r| c.member_add(r).await,
                     request,
@@ -746,6 +788,7 @@ impl crate::driver::ClusterDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::cluster_client::ClusterClient::new,
                     async |c, r| c.member_remove(r).await,
                     request,
@@ -765,6 +808,7 @@ impl crate::driver::ClusterDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::cluster_client::ClusterClient::new,
                     async |c, r| c.member_update(r).await,
                     request,
@@ -784,6 +828,7 @@ impl crate::driver::ClusterDriver for Client {
             let resp = self
                 .inner
                 .wrap_unary_call(
+                    Idempotency::Mutable,
                     etcdserverpb::cluster_client::ClusterClient::new,
                     async |c, r| c.member_promote(r).await,
                     request,

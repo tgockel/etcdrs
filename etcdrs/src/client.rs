@@ -122,18 +122,62 @@ fn is_transport_error(status: &tonic::Status) -> bool {
     // tonic::transport::Error is stored as the source.
     //
     // Note: like is_client_side_timeout, this cannot guarantee the request was not processed by
-    // the server before the connection dropped. etcd operations are safe to retry in practice.
+    // the server before the connection dropped -- this single status covers both "the h2 handshake
+    // never completed" and "the connection was reset after the request was fully written", and
+    // nothing in the status separates them. Only replay operations that tolerate it; see
+    // `Idempotency` and `is_connect_error`.
     use std::error::Error as _;
     status.code() == tonic::Code::Unknown && status.source().is_some() && status.message() == "transport error"
+}
+
+fn is_connect_error(status: &tonic::Status) -> bool {
+    // tonic builds a ConnectError only inside the connector -- TCP/UDS connect and TLS handshake --
+    // so finding one in the source chain proves no part of the request was written to a connection.
+    // That makes the call safe to replay even when it mutates state.
+    //
+    // A server cannot fake this: statuses decoded from gRPC response headers carry no source at
+    // all, so this cannot be reached by anything but a local connection failure. It is the
+    // structural equivalent of the "there is no address available" / "there is no connection
+    // available" string match in etcd's own client (client/v3/retry.go, isSafeRetryMutableRPC).
+    use std::error::Error as _;
+    let mut source = status.source();
+    while let Some(err) = source {
+        if err.is::<tonic::ConnectError>() {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
+/// Whether re-sending an RPC after an ambiguous failure is safe.
+///
+/// A failure that arrives after the request was written is ambiguous: the server may or may not
+/// have applied it. Replaying a read costs nothing, but replaying a mutation can apply a change
+/// twice or turn a success into a spurious `AlreadyExists`/`NotFound`, so the two are retried under
+/// different rules. See [`ClientInner::can_retry`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Idempotency {
+    /// The RPC does not modify server state (`KV/Range`, `Cluster/MemberList`, ...). Re-sending it
+    /// can only waste work.
+    Immutable,
+    /// The RPC modifies server state (`KV/Put`, `Cluster/MemberRemove`, ...). Re-sending it is only
+    /// safe when the request provably never reached a server.
+    Mutable,
 }
 
 impl ClientInner {
     /// Execute a unary gRPC call with retry and timeout logic.
     ///
+    /// `idempotency` declares whether the RPC being invoked mutates server state, which decides
+    /// how aggressively a failed attempt may be replayed. It cannot be inferred here, because the
+    /// method being called is opaque inside `call`.
+    ///
     /// Returns `Ok(response)` on success or `Err(tonic::Status)` on failure. Callers convert the
     /// status into their operation-specific error type via `map_err`.
     async fn wrap_unary_call<R, GrpcClient, Request>(
         &self,
+        idempotency: Idempotency,
         create_client: impl Fn(tonic::transport::Channel) -> GrpcClient,
         call: impl AsyncFn(&mut GrpcClient, tonic::Request<Request>) -> Result<tonic::Response<R>, tonic::Status>,
         request: Request,
@@ -170,6 +214,9 @@ impl ClientInner {
             match response {
                 Ok(r) => break Ok(r.into_inner()),
                 Err(e) => {
+                    // Auth failures replay regardless of idempotency: etcd authorizes a request
+                    // before applying it, so UNAUTHENTICATED proves the mutation did not take
+                    // effect and re-sending it with a fresh token cannot duplicate anything.
                     if Self::is_auth_error(&e)
                         && self.auth.is_some()
                         && self.refresh_auth_token(token_generation).await.is_ok()
@@ -177,7 +224,7 @@ impl ClientInner {
                     {
                         continue;
                     }
-                    if Self::can_retry(&e) && timing_allows_retry() {
+                    if Self::can_retry(&e, idempotency) && timing_allows_retry() {
                         continue;
                     }
                     return Err(e);
@@ -186,8 +233,20 @@ impl ClientInner {
         }
     }
 
-    fn can_retry(status: &tonic::Status) -> bool {
-        status.code() == tonic::Code::Unavailable || is_client_side_timeout(status) || is_transport_error(status)
+    fn can_retry(status: &tonic::Status, idempotency: Idempotency) -> bool {
+        match idempotency {
+            // Broader than etcd's own immutable rule, which retries on Unavailable alone: a killed
+            // etcd server surfaces through tonic as Unknown/"transport error" rather than
+            // Unavailable (see 7def038). Replaying a read is free either way.
+            Idempotency::Immutable => {
+                status.code() == tonic::Code::Unavailable
+                    || is_client_side_timeout(status)
+                    || is_transport_error(status)
+            }
+            // Every other failure may already have been applied by the server, and replaying it
+            // would violate write-at-most-once.
+            Idempotency::Mutable => is_connect_error(status),
+        }
     }
 
     /// Check if a gRPC status represents an authentication/authorization error.
@@ -200,5 +259,106 @@ impl ClientInner {
             status.code(),
             tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
         ) || (status.code() == tonic::Code::InvalidArgument && status.message().contains("user name"))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{Idempotency::*, *};
+
+    /// A status shaped like the one tonic produces when the connector cannot reach an endpoint.
+    /// `Status::from_error` walks the source chain and turns a `ConnectError` into `Unavailable`,
+    /// keeping the original error as the source, which is exactly what `is_connect_error` reads.
+    fn connect_failure() -> tonic::Status {
+        tonic::Status::from_error(Box::new(tonic::ConnectError(Box::new(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        )))))
+    }
+
+    /// A dropped connection: `Unknown` with a transport-layer source. Indistinguishable from a
+    /// half-open h2 handshake, which is why mutations must not replay it.
+    ///
+    /// `tonic::transport::Error` cannot be constructed outside tonic, so this stands in for it.
+    /// `Status::from_error` recognizes neither it nor its source chain, which is precisely how the
+    /// real error reaches the `Unknown` + attached-source shape that `is_transport_error` matches.
+    fn dropped_connection() -> tonic::Status {
+        #[derive(Debug)]
+        struct TransportError;
+
+        impl std::fmt::Display for TransportError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("transport error")
+            }
+        }
+
+        impl std::error::Error for TransportError {}
+
+        tonic::Status::from_error(Box::new(TransportError))
+    }
+
+    #[test]
+    fn connect_failure_is_recognized() {
+        let status = connect_failure();
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+        assert!(is_connect_error(&status), "{status:?}");
+    }
+
+    #[test]
+    fn never_sent_retries_for_both_classes() {
+        // Nothing was written to a connection, so even a mutation may be re-sent.
+        let status = connect_failure();
+        assert!(ClientInner::can_retry(&status, Immutable));
+        assert!(ClientInner::can_retry(&status, Mutable));
+    }
+
+    #[test]
+    fn dropped_connection_retries_only_reads() {
+        let status = dropped_connection();
+        assert!(is_transport_error(&status), "{status:?}");
+        assert!(!is_connect_error(&status), "{status:?}");
+        assert!(ClientInner::can_retry(&status, Immutable));
+        assert!(
+            !ClientInner::can_retry(&status, Mutable),
+            "a mutation may already have applied"
+        );
+    }
+
+    #[test]
+    fn server_sent_unavailable_retries_only_reads() {
+        // Decoded from response headers, so it carries no source. The server did answer, so a
+        // mutation cannot be assumed unapplied.
+        let status = tonic::Status::new(tonic::Code::Unavailable, "etcdserver: no leader");
+        assert!(!is_connect_error(&status), "{status:?}");
+        assert!(ClientInner::can_retry(&status, Immutable));
+        assert!(!ClientInner::can_retry(&status, Mutable));
+    }
+
+    #[test]
+    fn client_side_timeout_retries_only_reads() {
+        let status = tonic::Status::new(tonic::Code::Cancelled, "Timeout expired");
+        assert!(is_client_side_timeout(&status));
+        assert!(ClientInner::can_retry(&status, Immutable));
+        assert!(!ClientInner::can_retry(&status, Mutable));
+    }
+
+    #[test]
+    fn non_transient_errors_never_retry() {
+        for status in [
+            tonic::Status::new(tonic::Code::NotFound, "etcdserver: member not found"),
+            tonic::Status::new(tonic::Code::FailedPrecondition, "etcdserver: ID exists"),
+            tonic::Status::new(tonic::Code::InvalidArgument, "etcdserver: key is not provided"),
+        ] {
+            assert!(!ClientInner::can_retry(&status, Immutable), "{status:?}");
+            assert!(!ClientInner::can_retry(&status, Mutable), "{status:?}");
+        }
+    }
+
+    /// A server cannot talk the client into replaying a mutation by claiming to be a connect
+    /// failure: statuses decoded from response headers have no source to walk.
+    #[test]
+    fn server_cannot_forge_a_connect_failure() {
+        let status = tonic::Status::new(tonic::Code::Unavailable, "tcp connect error");
+        assert!(!is_connect_error(&status), "{status:?}");
+        assert!(!ClientInner::can_retry(&status, Mutable));
     }
 }

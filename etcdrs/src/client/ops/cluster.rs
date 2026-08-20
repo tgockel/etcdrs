@@ -687,7 +687,7 @@ pub enum ClusterErrorKind {
     LearnerNotReady,
     /// The cluster is not healthy enough to satisfy this reconfiguration.
     ///
-    /// This comes from the gRPC API as `FAILED_PRECONDITION` with "unhealthy cluster".
+    /// This comes from the gRPC API as `UNAVAILABLE` with "unhealthy cluster".
     UnhealthyCluster,
     /// There is an authentication or authorization error.
     ///
@@ -741,8 +741,6 @@ impl ClusterError {
                     ClusterErrorKind::LearnerNotReady
                 } else if msg.contains("not a learner") || msg.contains("can only promote a learner") {
                     ClusterErrorKind::MemberNotLearner
-                } else if msg.contains("unhealthy cluster") {
-                    ClusterErrorKind::UnhealthyCluster
                 } else {
                     ClusterErrorKind::Unknown
                 }
@@ -753,7 +751,17 @@ impl ClusterError {
             tonic::Code::InvalidArgument => ClusterErrorKind::Authentication,
             tonic::Code::ResourceExhausted => ClusterErrorKind::Exhausted,
             tonic::Code::DataLoss => ClusterErrorKind::DataLoss,
-            tonic::Code::Unavailable => ClusterErrorKind::Unavailable,
+            tonic::Code::Unavailable => {
+                // etcd reports a rejected strict-reconfig check as UNAVAILABLE, not
+                // FAILED_PRECONDITION (`ErrGRPCUnhealthy` in api/v3rpc/rpctypes/error.go), so the
+                // message is the only thing separating "this reconfiguration was refused" from an
+                // ordinary "the server is not reachable".
+                if status.message().contains("unhealthy cluster") {
+                    ClusterErrorKind::UnhealthyCluster
+                } else {
+                    ClusterErrorKind::Unavailable
+                }
+            }
             // Don't care who timed us out
             tonic::Code::Cancelled | tonic::Code::DeadlineExceeded => ClusterErrorKind::Timeout,
             _ => ClusterErrorKind::Unknown,

@@ -3,7 +3,7 @@ use futures_core::Stream;
 
 use crate::{
     AsRange, GetError, GetErrorKind, Prefix, ResponseHeader, Revision, TargetRange,
-    client::Client,
+    client::{Client, Idempotency},
     pb::{etcdserverpb, mvccpb},
     record::{AsKey, KeyWithMetadata, Record},
 };
@@ -209,6 +209,7 @@ fn stream_remaining_chunks(
         let ListContinuation { client, mut request } = continuation;
         loop {
             let resp = match client.inner.wrap_unary_call(
+                Idempotency::Immutable,
                 etcdserverpb::kv_client::KvClient::new,
                 async |c, r| c.range(r).await,
                 request.clone(),

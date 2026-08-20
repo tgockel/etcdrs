@@ -28,3 +28,6 @@ tokio = { workspace = true, default-features = false, features = ["rt", "time"] 
 [dev-dependencies]
 etcdrs-test = { path = ".", features = ["rstest"] }
 tokio = { workspace = true, default-features = false, features = ["macros", "rt", "time"] }
+# Used by tests/retry.rs to assert a failure really was a pre-send connect failure rather than
+# anything a server could have answered. Already in the tree via etcdrs.
+tonic.workspace = true

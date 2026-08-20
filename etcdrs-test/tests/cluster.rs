@@ -40,22 +40,80 @@ async fn linearizable_member_list(etcd_cluster: EtcdCluster) {
 #[tokio::test]
 async fn remove_member(etcd_cluster: EtcdCluster) {
     let client = Client::new(&etcd_cluster.connect_string()).unwrap();
+
+    // Warm the cluster up with a write so all peer-to-peer connections are active, exactly as
+    // add_and_promote_learner does: etcd's strict-reconfig check otherwise rejects the removal as
+    // "unhealthy cluster" if any peer hasn't recently exchanged messages.
+    client.put("warm").value("up").await.expect("warmup put should succeed");
+
     let initial = client.member_list().await.unwrap();
     let target = initial.members().last().expect("cluster should have members").id();
 
-    let after_remove = client
-        .member_remove(target)
-        .await
-        .expect("member_remove should succeed");
-    assert_eq!(after_remove.members().len(), 2);
-    assert!(
-        after_remove.members().iter().all(|m| m.id() != target),
-        "removed member should not appear: {:?}",
-        after_remove.members()
-    );
+    // Two failure shapes have to be told apart, because only one of them is safe to re-send.
+    //
+    // UnhealthyCluster is a definite rejection: etcd evaluated the reconfiguration and refused it
+    // before proposing anything, so nothing was applied and asking again once the cluster settles
+    // is correct.
+    //
+    // Anything else is ambiguous -- removing a member tears down peer connections, so the response
+    // can be lost after the removal was applied. Re-sending *that* would be the same mistake the
+    // client no longer makes: a removal still in flight legitimately shows up in a linearizable
+    // read, so a second request would race the first to a spurious MemberNotFound. Poll instead,
+    // and report an expired deadline as unresolved rather than as failure.
+    //
+    // MemberNotFound from a request the test itself has not repeated means the client replayed it
+    // internally, since `target` came from a live member_list. That is the regression this guards.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match client.member_remove(target).await {
+            Ok(after_remove) => {
+                assert_eq!(after_remove.members().len(), 2);
+                assert!(
+                    after_remove.members().iter().all(|m| m.id() != target),
+                    "removed member should not appear: {:?}",
+                    after_remove.members()
+                );
+                break;
+            }
+            Err(err) if err.kind() == ClusterErrorKind::UnhealthyCluster => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for the cluster to become healthy: {err:?}",
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(err) => {
+                assert_ne!(
+                    err.kind(),
+                    ClusterErrorKind::MemberNotFound,
+                    "member_remove was replayed after it had already applied: {err:?}",
+                );
+                loop {
+                    let listed = client.member_list().linearizable().await.unwrap();
+                    if listed.members().iter().all(|m| m.id() != target) {
+                        break; // the lost response was a success after all
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "member_remove returned {err:?} and the removal never committed, \
+                         so its outcome stayed unresolved",
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                break;
+            }
+        }
+    }
 
-    let listed = client.member_list().await.unwrap();
+    // Linearizable, because a plain member_list is answered from whichever peer the balancer picked
+    // and that peer may not have applied the configuration change yet.
+    let listed = client.member_list().linearizable().await.unwrap();
     assert_eq!(listed.members().len(), 2);
+    assert!(
+        listed.members().iter().all(|m| m.id() != target),
+        "removed member should not appear: {:?}",
+        listed.members()
+    );
 }
 
 #[rstest]
