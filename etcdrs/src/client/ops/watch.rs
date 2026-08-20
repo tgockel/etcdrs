@@ -588,7 +588,7 @@ impl std::async_iter::AsyncIterator for Watcher {
     type Item = Result<WatchEvent, WatchError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.stream).poll_next(cx)
+        Stream::poll_next(Pin::new(&mut self.stream), cx)
     }
 }
 

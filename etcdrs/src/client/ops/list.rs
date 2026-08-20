@@ -362,7 +362,7 @@ impl<R> futures_core::Stream for ListIterator<R> {
 }
 
 #[cfg(feature = "nightly-async-iterator")]
-impl<R, S: Stream<Item = Result<R, ListError>> + Unpin> std::async_iter::AsyncIterator for ListIterator<R, S> {
+impl<R> std::async_iter::AsyncIterator for ListIterator<R> {
     type Item = Result<R, GetError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {

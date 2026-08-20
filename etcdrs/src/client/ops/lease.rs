@@ -957,7 +957,7 @@ impl std::async_iter::AsyncIterator for LeaseKeeper {
     type Item = Result<KeepAliveResponse, KeepAliveError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.stream).poll_next(cx)
+        Stream::poll_next(Pin::new(&mut self.stream), cx)
     }
 }
 

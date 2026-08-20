@@ -13,7 +13,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v7
     - name: Test/Debug
       run: cargo test --verbose
     - name: Test/Release
@@ -24,3 +24,17 @@ jobs:
       run: cargo fmt --check
     - name: Clippy
       run: cargo clippy
+
+  # Name the feature rather than using --all-features, which would pull in `generate` and rebuild
+  # the checked-in protobuf bindings. That is a deliberate manual step, not something CI should do.
+  nightly-features:
+    name: nightly-async-iterator
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install nightly
+      run: rustup toolchain install nightly --profile minimal
+    - name: Check
+      run: cargo +nightly check --workspace --all-targets --features etcdrs/nightly-async-iterator --verbose
+    - name: Test
+      run: cargo +nightly test -p etcdrs --features nightly-async-iterator --verbose
