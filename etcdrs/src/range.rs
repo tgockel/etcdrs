@@ -102,10 +102,9 @@ impl<T: AsKey + ?Sized> AsRange for T {
 
 /// A decoded view of an etcd range request's `(key, range_end)` bytes.
 ///
-/// This is the inverse of [`AsRange::as_boundaries`]: given the wire bytes stored in a
-/// [`RangeRequest`][crate::pb::etcdserverpb::RangeRequest] (or any operation that carries the same
-/// encoding, such as a [`Delete`][crate::client::Delete]), it tells you what the operation
-/// addresses in human terms.
+/// This is the inverse of [`AsRange::as_boundaries`]: given the wire bytes an operation carries --
+/// a range read, or a [`Delete`][crate::client::Delete], which use the same encoding -- it tells you
+/// what that operation addresses in human terms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetRange<'a> {
     /// Every key in the store (wire: `key = [0]`, `range_end = [0]`).

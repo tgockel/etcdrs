@@ -27,6 +27,7 @@ use crate::{
     record::{AsKey, KeyWithMetadata, Metadata, Record},
 };
 
+/// # Watching
 impl Client {
     /// Create a [`WatchBuilder`] for establishing a watch stream.
     ///

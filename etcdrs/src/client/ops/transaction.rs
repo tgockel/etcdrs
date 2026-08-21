@@ -7,6 +7,7 @@ use crate::{
     record::{AsKey, AsValue},
 };
 
+/// # Transactions
 impl Client {
     /// Create a new transaction operation.
     ///

@@ -13,22 +13,37 @@ builder API. Operations can be awaited directly for one-shot use, or composed in
 [`Transaction`][client::Transaction]s without changing how they are built:
 
 ```rust,no_run
+use futures::StreamExt;
 # async {
 let client = etcdrs::Client::new("http://localhost:2379").unwrap();
 
 // Standalone
-client.put("hello").value("world").await.unwrap();
-let record = client.get("hello").await.unwrap();
+client.put("greeting/hello").value("world").await.unwrap();
+let record = client.get("greeting/hello").await.unwrap();
+
+// Ranged reads stream; a page limit is what makes later pages fetch as you consume them
+let mut entries = client.list_prefix("greeting/").limit(100).await.unwrap().into_stream();
+while let Some(entry) = entries.next().await {
+    println!("{:?}", entry.unwrap());
+}
 
 // The same builders work inside a transaction
 client.transaction()
-    .when([etcdrs::client::TransactionCheck::present("hello")])
-    .and_then([client.put("hello").value("updated").into()])
+    .when([etcdrs::client::TransactionCheck::present("greeting/hello")])
+    .and_then([client.put("greeting/hello").value("updated").into()])
     .commit()
     .await
     .unwrap();
 # };
 ```
+
+A [`List`][client::List] resolves to a [`ListView`][client::ListView], which
+[`into_stream`][client::ListView::into_stream] turns into a `Stream`. Without a
+[`limit`][client::List::limit] etcd answers the whole range in one response, and the stream simply
+walks it; with one, each request returns a page and the stream fetches the next as you consume it,
+pinning the revision so a scan stays consistent across them. On a nightly toolchain with
+[`nightly-async-iterator`](#feature-flags), `ListView` also implements `IntoAsyncIterator`, so it
+can be driven with `for await` instead.
 
 ### Type-Safe Responses
 

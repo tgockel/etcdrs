@@ -13,6 +13,7 @@ use crate::{
     record::{AsKey, AsValue, Record},
 };
 
+/// # Writing Keys
 impl Client {
     /// Put a new value for the `key`.
     ///

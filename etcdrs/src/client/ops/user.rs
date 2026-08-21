@@ -6,6 +6,7 @@ use std::{
 
 use crate::{Client, ResponseHeader, pb::etcdserverpb};
 
+/// # User Management
 impl Client {
     /// Add a new user to the cluster.
     ///

@@ -15,6 +15,7 @@ use std::{
     task::{Context, Poll},
 };
 
+/// # Listing Ranges
 impl Client {
     /// List the records associated with a `query`.
     ///

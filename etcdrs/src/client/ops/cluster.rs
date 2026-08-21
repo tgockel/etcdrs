@@ -6,6 +6,7 @@ use std::{
 
 use crate::{Client, ClusterResponseHeader, MemberId, pb::etcdserverpb};
 
+/// # Cluster Membership
 impl Client {
     /// List the members of the etcd cluster.
     ///

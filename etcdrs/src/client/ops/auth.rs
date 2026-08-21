@@ -6,6 +6,7 @@ use std::{
 
 use crate::{Client, ResponseHeader, client::ClientInner, pb::etcdserverpb};
 
+/// # Authentication
 impl Client {
     /// Enable authentication on the cluster.
     ///

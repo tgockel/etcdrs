@@ -12,6 +12,7 @@ use crate::{
     record::{AsKey, Record},
 };
 
+/// # Reading Keys
 impl Client {
     /// Get the contents of `key` from the database.
     ///

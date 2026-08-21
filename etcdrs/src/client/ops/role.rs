@@ -12,6 +12,7 @@ use crate::{
     range::{AsRange, TargetRange},
 };
 
+/// # Role Management
 impl Client {
     /// Add a new role to the cluster.
     pub fn role_add(&self, name: &str) -> RoleAdd<Self> {

@@ -11,40 +11,60 @@ pub use builder::{BuildError, ClientBuilder};
 mod driver;
 mod metrics;
 pub use metrics::{MetricsCollector, RequestCount, RequestCounter};
-mod ops;
-pub use ops::*;
 
+/// A connection to an etcd cluster.
+///
+/// Use [`new`][Client::new] for the common case of a connection string, or
+/// [`builder`][Client::builder] when credentials, a retry policy, or metrics need configuring.
+///
+/// ```no_run
+/// # async {
+/// let client = etcdrs::Client::new("http://localhost:2379").unwrap();
+/// client.put("hello").value("world").await.unwrap();
+/// let record = client.get("hello").await.unwrap();
+/// # };
+/// ```
+///
+/// The client wraps an [`Arc`] internally and every method takes `&self`, so cloning is cheap and
+/// one instance can be shared across tasks with no further synchronization.
+///
+/// Methods are grouped into the labeled sections below. Most return an operation builder that runs
+/// when it is `await`ed. The exceptions are worth knowing up front:
+/// [`transaction`][Client::transaction] runs on [`commit`][Transaction::commit],
+/// [`watch`][Client::watch] on [`start`][WatchBuilder::start], and
+/// [`watcher`][Client::watcher] and [`lease_keeper`][Client::lease_keeper] hand back a stream to
+/// poll rather than a future to await.
+///
+/// [`get`][Client::get], [`put`][Client::put], [`delete`][Client::delete] and a
+/// [`count_only`][List::count_only] [`list`][Client::list] also convert into a [`TransactionOp`],
+/// so the same builder serves standalone or inside a transaction. Running any of them is the
+/// [driver traits][crate::driver]' job rather than the client's, which is why the same operation
+/// structs also run against a cache, a mock, or a proxy.
+///
+/// See the [module-level documentation](self) for the operation model.
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<ClientInner>,
 }
 
-impl Client {
-    pub fn builder() -> ClientBuilder {
-        ClientBuilder::default()
-    }
-
-    /// Create a client from a connection string.
-    ///
-    /// The connection string is a comma-separated list of endpoint URIs, following the etcd
-    /// convention used by `etcdctl --endpoints`:
-    ///
-    /// ```text
-    /// http://host1:2379,http://host2:2379,http://host3:2379
-    /// ```
-    ///
-    /// A single URI is also accepted.
-    pub fn new(connection_string: &str) -> Result<Self, BuildError> {
-        Self::builder().connection_string(connection_string)?.build()
-    }
-}
+// The `Client` page lists these sections in the order the modules are declared, and lists any impl
+// written directly in this file after all of them -- which is why even the constructors live in a
+// submodule.
+mod construct;
+mod ops;
+pub use ops::*;
 
 struct Credentials {
     username: String,
     password: String,
 }
 
-/// Controls how long [`wrap_unary_call`][ClientInner::wrap_unary_call] retries transient failures.
+/// Controls how long a unary request is retried after a transient failure.
+///
+/// Streaming operations ignore it: [`watch`][Client::watch] and
+/// [`lease_keeper`][Client::lease_keeper] each retry `Unavailable` against a fixed five-second
+/// deadline of their own while establishing the stream, including under [`Never`][Self::Never],
+/// and neither re-establishes it once connected.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RetryPolicy {
     /// Retry until the given duration has elapsed since the call started.

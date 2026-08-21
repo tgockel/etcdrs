@@ -14,6 +14,7 @@ use crate::{
     record::{AsKey, Record},
 };
 
+/// # Deleting Keys
 impl Client {
     /// Delete the given `key` from the database.
     ///

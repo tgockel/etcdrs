@@ -13,6 +13,7 @@ use futures_core::Stream;
 
 use crate::{Client, LeaseId, ResponseHeader, pb::etcdserverpb};
 
+/// # Leases
 impl Client {
     /// Create a lease used to create ephemeral records.
     ///

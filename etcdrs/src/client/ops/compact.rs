@@ -6,6 +6,7 @@ use std::{
 
 use crate::{Client, ResponseHeader, Revision, pb::etcdserverpb};
 
+/// # Compaction
 impl Client {
     /// Compact the key-value store's revision history up to `revision`.
     ///
