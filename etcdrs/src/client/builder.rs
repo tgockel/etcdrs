@@ -114,9 +114,19 @@ impl ClientBuilder {
 
     /// Set credentials for authenticating with the etcd cluster.
     ///
-    /// When the client encounters an `UNAUTHENTICATED` error, it will use these credentials to
-    /// obtain an auth token via the `Authenticate` RPC, then retry the request. The token is cached
-    /// and reused for subsequent requests.
+    /// The token is obtained lazily: the first unary request goes out without one, and when the
+    /// server rejects it the client runs the `Authenticate` RPC with these credentials and replays
+    /// the request. The token is then cached and reused, and refreshed the same way if the server
+    /// later stops accepting it. Each request refreshes at most once.
+    ///
+    /// A `PERMISSION_DENIED` response is returned to the caller unchanged. It means the
+    /// authenticated user's roles do not cover the request, which re-authenticating cannot change.
+    ///
+    /// This describes the ordinary operations. [`authenticate`][Client::authenticate] is its own
+    /// exception: it sends one `Authenticate` RPC directly and hands the token back to you instead
+    /// of caching it here. [`watch`][Client::watch] and [`lease_keeper`][Client::lease_keeper]
+    /// attach no token at all, so they do not work against an auth-enabled cluster no matter what
+    /// is configured here.
     pub fn credentials(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
         self.auth = Some(AuthConfig::Credentials(Credentials {
             username: username.into(),

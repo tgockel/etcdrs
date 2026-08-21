@@ -472,7 +472,7 @@ impl crate::driver::AuthDriver for Client {
             };
             let resp = self
                 .inner
-                .authenticate(&creds.username, &creds.password)
+                .authenticate(&creds.username, &creds.password, None)
                 .await
                 .map_err(AuthError::from_status)?;
             let header = ResponseHeader::from_pb(resp.header.expect("AuthenticateResponse should have a valid header"));

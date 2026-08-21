@@ -64,12 +64,22 @@ struct Credentials {
 /// Streaming operations ignore it: [`watch`][Client::watch] and
 /// [`lease_keeper`][Client::lease_keeper] each retry `Unavailable` against a fixed five-second
 /// deadline of their own while establishing the stream, including under [`Never`][Self::Never],
-/// and neither re-establishes it once connected.
+/// and neither re-establishes it once connected. [`authenticate`][Client::authenticate] ignores it
+/// too, in the other direction: it is one RPC, never retried, and carries no deadline at all.
+///
+/// Acquiring an auth token is the remaining exception. A call the server refuses because it
+/// carried no token, or one the server will not accept, re-authenticates and replays once under
+/// every policy -- [`Never`][Self::Never] included, since otherwise a client would fail its first
+/// call against every auth-enabled cluster. That replay happens at most once per call and still
+/// carries what is left of the deadline where there is one, so a request the server keeps refusing
+/// cannot loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RetryPolicy {
     /// Retry until the given duration has elapsed since the call started.
     ///
-    /// The remaining time is also used as the per-request gRPC deadline sent to the server.
+    /// The time left in that budget is also the gRPC deadline sent with each request, recomputed
+    /// for every attempt. Once the budget is spent that deadline is zero, so a request dispatched
+    /// after it lapsed fails immediately rather than running unbounded.
     WithDeadline(std::time::Duration),
     /// Never retry; return the first error immediately.
     Never,
@@ -214,12 +224,16 @@ impl ClientInner {
             RetryPolicy::Forever => true,
             RetryPolicy::WithDeadline(_) => deadline.is_some_and(|d| std::time::Instant::now() <= d),
         };
+        // Zero rather than absent once the deadline has passed: an attempt sent with no
+        // `grpc-timeout` at all can outlive the budget indefinitely.
+        let remaining = || deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
         let mut client = create_client(self.channel.clone());
+        let mut token_refreshed = false;
         loop {
             let metric = metrics::MetricsSpan::new(&self.metrics);
             let mut call_request = tonic::Request::new(request.clone());
-            if let Some(remaining) = deadline.and_then(|d| d.checked_duration_since(std::time::Instant::now())) {
-                call_request.set_timeout(remaining);
+            if let Some(timeout) = remaining() {
+                call_request.set_timeout(timeout);
             }
             let mut token_generation = 0u64;
             if let Some(ref auth) = self.auth {
@@ -234,14 +248,19 @@ impl ClientInner {
             match response {
                 Ok(r) => break Ok(r.into_inner()),
                 Err(e) => {
-                    // Auth failures replay regardless of idempotency: etcd authorizes a request
-                    // before applying it, so UNAUTHENTICATED proves the mutation did not take
-                    // effect and re-sending it with a fresh token cannot duplicate anything.
-                    if Self::is_auth_error(&e)
+                    // Replaying after a refresh is safe for a mutation too: etcd settles the
+                    // token before it applies anything, so a refusal proves nothing was applied.
+                    //
+                    // The replay ignores the retry policy -- obtaining a token the server accepts
+                    // is not a retry of a transient failure -- but happens at most once, so a
+                    // request the server keeps refusing cannot loop. It still carries whatever is
+                    // left of the budget as its deadline.
+                    if !token_refreshed
                         && self.auth.is_some()
-                        && self.refresh_auth_token(token_generation).await.is_ok()
-                        && timing_allows_retry()
+                        && Self::is_stale_token_error(&e)
+                        && self.refresh_auth_token(token_generation, deadline).await.is_ok()
                     {
+                        token_refreshed = true;
                         continue;
                     }
                     if Self::can_retry(&e, idempotency) && timing_allows_retry() {
@@ -269,16 +288,31 @@ impl ClientInner {
         }
     }
 
-    /// Check if a gRPC status represents an authentication/authorization error.
+    /// Whether `status` says the token sent with the request was missing, invalid, or superseded.
     ///
-    /// etcd returns different codes depending on context: `UNAUTHENTICATED` for expired tokens,
-    /// `PERMISSION_DENIED` for insufficient permissions, and `INVALID_ARGUMENT` with auth-related
-    /// messages (e.g., "user name is empty") when no token is provided.
-    fn is_auth_error(status: &tonic::Status) -> bool {
-        matches!(
-            status.code(),
-            tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
-        ) || (status.code() == tonic::Code::InvalidArgument && status.message().contains("user name"))
+    /// etcd settles the state of the token before it can reach an authorization decision, and
+    /// gives each way that can go wrong its own error: `ErrInvalidAuthToken` for a token it does
+    /// not recognize or that has expired, `ErrUserEmpty` when no token was sent at all, and
+    /// `ErrAuthOldRevision` when the auth store was modified after this token was issued.
+    /// Re-authenticating fixes all three.
+    ///
+    /// `PERMISSION_DENIED` is deliberately absent. It is only reachable once the token has already
+    /// validated, and says the user's roles do not cover the request -- which a new token for that
+    /// same user cannot change. Matching it here made a denied request re-`Authenticate` and
+    /// replay for the whole retry budget.
+    ///
+    /// `UNAUTHENTICATED` is the only code `ErrInvalidAuthToken` uses, so it is matched on its own.
+    /// The other two share `INVALID_ARGUMENT` with unrelated errors (`ErrInvalidAuthMgmt`,
+    /// `ErrEmptyKey`, ...), so they are matched on the exact message, as etcd's own client does.
+    fn is_stale_token_error(status: &tonic::Status) -> bool {
+        match status.code() {
+            tonic::Code::Unauthenticated => true,
+            tonic::Code::InvalidArgument => matches!(
+                status.message(),
+                "etcdserver: user name is empty" | "etcdserver: revision of auth store is old"
+            ),
+            _ => false,
+        }
     }
 }
 
@@ -370,6 +404,51 @@ mod test {
         ] {
             assert!(!ClientInner::can_retry(&status, Immutable), "{status:?}");
             assert!(!ClientInner::can_retry(&status, Mutable), "{status:?}");
+        }
+    }
+
+    /// The status every credentialed client gets on its first call against an auth-enabled
+    /// cluster: it sent no token, so etcd never got as far as identifying a user.
+    #[test]
+    fn missing_token_is_a_stale_token() {
+        let status = tonic::Status::invalid_argument("etcdserver: user name is empty");
+        assert!(ClientInner::is_stale_token_error(&status));
+    }
+
+    #[test]
+    fn rejected_token_is_a_stale_token() {
+        let status = tonic::Status::unauthenticated("etcdserver: invalid auth token");
+        assert!(ClientInner::is_stale_token_error(&status));
+    }
+
+    /// The auth store was modified after this token was issued, so the permissions it was granted
+    /// under no longer describe the cluster. A new token carries the current revision.
+    #[test]
+    fn superseded_token_is_a_stale_token() {
+        let status = tonic::Status::invalid_argument("etcdserver: revision of auth store is old");
+        assert!(ClientInner::is_stale_token_error(&status));
+    }
+
+    /// The token was accepted and the user identified; they just cannot do this. Re-authenticating
+    /// returns a token for the same user with the same roles, so treating this as stale is an
+    /// `Authenticate` and a replay per attempt for as long as the retry budget lasts.
+    #[test]
+    fn permission_denied_is_not_a_stale_token() {
+        let status = tonic::Status::permission_denied("etcdserver: permission denied");
+        assert!(!ClientInner::is_stale_token_error(&status));
+        assert!(!ClientInner::can_retry(&status, Immutable));
+        assert!(!ClientInner::can_retry(&status, Mutable));
+    }
+
+    /// The two token errors that use `INVALID_ARGUMENT` share it with errors that have nothing to
+    /// do with auth, which is why they are matched on the message rather than the code.
+    #[test]
+    fn unrelated_invalid_arguments_are_not_stale_tokens() {
+        for status in [
+            tonic::Status::invalid_argument("etcdserver: invalid auth management"),
+            tonic::Status::invalid_argument("etcdserver: key is not provided"),
+        ] {
+            assert!(!ClientInner::is_stale_token_error(&status), "{status:?}");
         }
     }
 

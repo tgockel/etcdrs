@@ -1,3 +1,7 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use etcdrs::client::RequestCounter;
 use etcdrs::{Permission, Prefix, TargetRange};
 use etcdrs_test::{EtcdServer, etcd_server};
 use rstest::rstest;
@@ -18,6 +22,25 @@ fn client_with_credentials(etcd_server: &EtcdServer, user: &str, password: &str)
         .credentials(user, password)
         .build()
         .unwrap()
+}
+
+/// Helper: enable auth and add `eve`, who may read `pub/` and nothing else. Seeds `pub/x` and
+/// `secret/x`. Returns the root client, which the caller needs to disable auth again.
+async fn enable_auth_with_reader(etcd_server: &EtcdServer) -> etcdrs::Client {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+    enable_auth_with_root(&client).await;
+    let root = client_with_credentials(etcd_server, "root", "rootpw");
+
+    root.user_add("eve").password("evepw").await.unwrap();
+    root.role_add("reader").await.unwrap();
+    root.role_grant_permission("reader", Permission::read(Prefix("pub/")))
+        .await
+        .unwrap();
+    root.user_grant_role("eve", "reader").await.unwrap();
+
+    root.put("pub/x").value("visible").await.unwrap();
+    root.put("secret/x").value("hidden").await.unwrap();
+    root
 }
 
 #[rstest]
@@ -181,19 +204,7 @@ async fn role_permission_lifecycle(etcd_server: EtcdServer) {
 #[rstest]
 #[tokio::test]
 async fn permissions_enforced_end_to_end(etcd_server: EtcdServer) {
-    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
-    enable_auth_with_root(&client).await;
-    let root = client_with_credentials(&etcd_server, "root", "rootpw");
-
-    root.user_add("eve").password("evepw").await.unwrap();
-    root.role_add("reader").await.unwrap();
-    root.role_grant_permission("reader", Permission::read(Prefix("pub/")))
-        .await
-        .unwrap();
-    root.user_grant_role("eve", "reader").await.unwrap();
-
-    root.put("pub/x").value("visible").await.unwrap();
-    root.put("secret/x").value("hidden").await.unwrap();
+    let root = enable_auth_with_reader(&etcd_server).await;
 
     let eve = client_with_credentials(&etcd_server, "eve", "evepw");
     let record = eve.get("pub/x").await.unwrap().into_record().unwrap();
@@ -203,6 +214,71 @@ async fn permissions_enforced_end_to_end(etcd_server: EtcdServer) {
     assert_eq!(err.kind(), etcdrs::PutErrorKind::Authentication);
     let err = eve.get("secret/x").await.unwrap_err();
     assert_eq!(err.kind(), etcdrs::GetErrorKind::Authentication);
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
+/// A permission failure is an answer, not a transient fault: etcd settles the token and identifies
+/// the user before it can reach a permission decision, so re-authenticating hands back a token for
+/// the same user with the same roles and the same denial. The client used to treat every
+/// `PERMISSION_DENIED` as a stale token, which cost an `Authenticate` plus a replay per attempt for
+/// as long as the retry policy allowed, so this counts attempts rather than just checking the error.
+#[rstest]
+#[tokio::test]
+async fn denied_permission_is_not_retried(etcd_server: EtcdServer) {
+    let root = enable_auth_with_reader(&etcd_server).await;
+
+    let metrics = Arc::new(RequestCounter::default());
+    let eve = etcdrs::Client::builder()
+        .add_connection(etcd_server.connect_string())
+        .unwrap()
+        .credentials("eve", "evepw")
+        .metrics(metrics.clone())
+        .build()
+        .unwrap();
+
+    // The first call is the one that obtains the token: it goes out without one, the server
+    // refuses it, and the client authenticates and replays. Two attempts, and no more -- asserted
+    // here because a client that cannot get past this has no token to be denied with below, which
+    // would make the rest of the test pass for the wrong reason.
+    eve.get("pub/x").await.unwrap();
+    assert_eq!(metrics.get().requested(), 2, "{:?}", metrics.get());
+
+    let before = metrics.get().requested();
+    let err = eve.put("pub/x").value("nope").await.unwrap_err();
+    assert_eq!(err.kind(), etcdrs::PutErrorKind::Authentication);
+    assert_eq!(
+        metrics.get().requested() - before,
+        1,
+        "a denied request was replayed; {:?}",
+        metrics.get()
+    );
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
+/// The same denial under a policy with nothing to run it out. `RetryPolicy::Forever` used to turn
+/// it into an unbounded `Authenticate`-and-replay loop with no backoff.
+#[rstest]
+#[tokio::test]
+async fn denied_permission_terminates_under_retry_forever(etcd_server: EtcdServer) {
+    let root = enable_auth_with_reader(&etcd_server).await;
+
+    let eve = etcdrs::Client::builder()
+        .add_connection(etcd_server.connect_string())
+        .unwrap()
+        .credentials("eve", "evepw")
+        .retry_forever()
+        .build()
+        .unwrap();
+
+    let err = tokio::time::timeout(Duration::from_secs(10), eve.put("pub/x").value("nope"))
+        .await
+        .expect("a denied request should fail rather than retry forever")
+        .unwrap_err();
+    assert_eq!(err.kind(), etcdrs::PutErrorKind::Authentication);
 
     // Cleanup: disable auth
     root.auth_disable().await.unwrap();

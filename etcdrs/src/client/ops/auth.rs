@@ -433,19 +433,24 @@ impl ClientInner {
     /// This bypasses [`wrap_unary_call`][Self::wrap_unary_call] to avoid circular token refresh. It
     /// is used by both the public [`Client::authenticate`] method and the internal token refresh
     /// path.
+    ///
+    /// `timeout` is the deadline to send with the request. The refresh path passes what is left of
+    /// the calling request's budget, so a stalled `Authenticate` cannot outlive it.
     pub(crate) async fn authenticate(
         &self,
         name: &str,
         password: &str,
+        timeout: Option<std::time::Duration>,
     ) -> Result<etcdserverpb::AuthenticateResponse, tonic::Status> {
         let mut client = etcdserverpb::auth_client::AuthClient::new(self.channel.clone());
-        client
-            .authenticate(etcdserverpb::AuthenticateRequest {
-                name: name.into(),
-                password: password.into(),
-            })
-            .await
-            .map(|r| r.into_inner())
+        let mut request = tonic::Request::new(etcdserverpb::AuthenticateRequest {
+            name: name.into(),
+            password: password.into(),
+        });
+        if let Some(timeout) = timeout {
+            request.set_timeout(timeout);
+        }
+        client.authenticate(request).await.map(|r| r.into_inner())
     }
 
     /// Refresh the cached auth token using stored credentials.
@@ -453,7 +458,16 @@ impl ClientInner {
     /// `stale_generation` is the generation observed when the caller read the token that turned out
     /// to be stale. If another caller has already refreshed (advancing the generation), this call
     /// returns `Ok(())` without making a redundant `Authenticate` RPC.
-    pub(crate) async fn refresh_auth_token(&self, stale_generation: u64) -> Result<(), tonic::Status> {
+    ///
+    /// `deadline` bounds the `Authenticate` RPC. It is an instant rather than a duration because
+    /// waiting on `refresh` can take arbitrarily long: a refresher that fails without advancing the
+    /// generation leaves the next caller to authenticate itself, by which point a duration computed
+    /// before the wait would be stale. The remainder is recomputed once the wait is over.
+    pub(crate) async fn refresh_auth_token(
+        &self,
+        stale_generation: u64,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(), tonic::Status> {
         let auth = self
             .auth
             .as_ref()
@@ -466,7 +480,8 @@ impl ClientInner {
         let creds = auth.credentials.as_ref().ok_or_else(|| {
             tonic::Status::unauthenticated("auth token expired and no credentials available for re-authentication")
         })?;
-        let resp = self.authenticate(&creds.username, &creds.password).await?;
+        let timeout = deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
+        let resp = self.authenticate(&creds.username, &creds.password, timeout).await?;
         let token_value = resp
             .token
             .parse::<tonic::metadata::AsciiMetadataValue>()
