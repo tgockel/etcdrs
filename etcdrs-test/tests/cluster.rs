@@ -233,3 +233,137 @@ async fn update_member_peer_urls(etcd_cluster: EtcdCluster) {
         .expect("updated member should appear in response");
     assert_eq!(updated_member.peer_urls(), new_urls.as_slice());
 }
+
+// The tests below provoke rejections the client has to tell apart by message. They all use a
+// single-node cluster, which removes the retry the multi-peer tests need: the strict-reconfig
+// health check only looks at connections to *other* voting members, and there are none, so a
+// rejection here is always the one the test asked for.
+
+/// A member's ID is derived from its peer URLs, so re-announcing a peer URL collides on ID before
+/// it can collide on the URL itself.
+///
+/// The derivation also mixes in the wall-clock second the request arrived, so the two calls are
+/// aligned to the start of a second to keep them from straddling one -- which would produce a
+/// distinct ID and therefore `PeerUrlExists` instead.
+#[rstest]
+#[tokio::test]
+async fn member_add_of_a_known_peer_url_already_exists(#[with(1)] etcd_cluster: EtcdCluster) {
+    let client = Client::new(&etcd_cluster.connect_string()).unwrap();
+    let peer_url = etcd_cluster.new_joining_peer().peer_url();
+
+    let subsec = std::time::UNIX_EPOCH.elapsed().unwrap().subsec_nanos();
+    tokio::time::sleep(Duration::from_nanos(u64::from(1_000_000_000 - subsec))).await;
+
+    // A learner, because a voting member would leave the single node short of the quorum its own
+    // strict-reconfig check demands and the second call would be refused before it got this far.
+    client
+        .member_add([peer_url.clone()])
+        .is_learner(true)
+        .await
+        .expect("announcing the peer should succeed");
+
+    let err = client
+        .member_add([peer_url])
+        .is_learner(true)
+        .await
+        .expect_err("re-announcing the same peer should be refused");
+    assert_eq!(err.kind(), ClusterErrorKind::MemberAlreadyExists, "{err:?}");
+}
+
+/// etcd's `--max-learners` defaults to 1, so the second learner is refused. That check runs when
+/// the configuration change is applied, i.e. after the strict-reconfig check the first one passed.
+///
+/// The refusal has no kind of its own, because adding one would mean adding a variant to an
+/// exhaustive public enum that 0.1.0 already shipped. Pinning the message here is what lets the
+/// release that can add the kind find this test.
+#[rstest]
+#[tokio::test]
+async fn member_add_past_max_learners_is_unclassified(#[with(1)] etcd_cluster: EtcdCluster) {
+    let client = Client::new(&etcd_cluster.connect_string()).unwrap();
+
+    let first = etcd_cluster.new_joining_peer();
+    client
+        .member_add([first.peer_url()])
+        .is_learner(true)
+        .await
+        .expect("the first learner should be accepted");
+
+    let second = etcd_cluster.new_joining_peer();
+    let err = client
+        .member_add([second.peer_url()])
+        .is_learner(true)
+        .await
+        .expect_err("a second learner should be refused");
+    assert_eq!(err.kind(), ClusterErrorKind::Unknown, "{err:?}");
+    assert_eq!(
+        err.grpc_status().map(|s| s.message()),
+        Some("etcdserver: too many learner members in cluster"),
+        "{err:?}",
+    );
+}
+
+/// etcd refuses to add a voting member unless a quorum of the resulting voting set has started:
+/// `nstarted >= (1 + voting_members)/2 + 1`. A member counts as started only once it has reported a
+/// name, so a peer announced here and never launched stays unstarted indefinitely -- announcing one
+/// against a single-node cluster is enough to fail that check on the next add.
+///
+/// The refusal arrives as `UNKNOWN` rather than `FAILED_PRECONDITION`, because etcd routes it
+/// through a wrapper type that carries no gRPC code, which leaves the message as the only thing
+/// identifying it. The assertion on the message is what makes this test about *that* refusal
+/// rather than the `unhealthy cluster` one it shares a kind with.
+#[rstest]
+#[tokio::test]
+async fn member_add_without_enough_started_members_is_unhealthy(#[with(1)] etcd_cluster: EtcdCluster) {
+    let client = Client::new(&etcd_cluster.connect_string()).unwrap();
+
+    let first = etcd_cluster.new_joining_peer();
+    client
+        .member_add([first.peer_url()])
+        .await
+        .expect("announcing the first voting peer should succeed");
+
+    let second = etcd_cluster.new_joining_peer();
+    let err = client
+        .member_add([second.peer_url()])
+        .await
+        .expect_err("a second unstarted voting peer should be refused");
+    assert_eq!(err.kind(), ClusterErrorKind::UnhealthyCluster, "{err:?}");
+    assert_eq!(
+        err.grpc_status().map(|s| s.message()),
+        Some("etcdserver: re-configuration failed due to not enough started members"),
+        "{err:?}",
+    );
+}
+
+/// etcd words these two refusals as one sentence and its own extension: "can only promote a learner
+/// member", and "can only promote a learner member which is in sync with leader". Nothing but the
+/// text tells them apart, so both have to come from a real server or the classifier is only being
+/// checked against itself.
+#[rstest]
+#[tokio::test]
+async fn member_promote_tells_a_voter_from_a_lagging_learner(#[with(1)] etcd_cluster: EtcdCluster) {
+    let client = Client::new(&etcd_cluster.connect_string()).unwrap();
+
+    let voter = client.member_list().await.unwrap().members()[0].id();
+    let err = client
+        .member_promote(voter)
+        .await
+        .expect_err("promoting a voting member should be refused");
+    assert_eq!(err.kind(), ClusterErrorKind::MemberNotLearner, "{err:?}");
+
+    // A learner announced here and never launched has replicated nothing, which is as far behind
+    // the leader as a learner can be. Learners do not count toward quorum, so the node keeps its.
+    let joining = etcd_cluster.new_joining_peer();
+    let learner = client
+        .member_add([joining.peer_url()])
+        .is_learner(true)
+        .await
+        .expect("announcing the learner should succeed")
+        .member()
+        .id();
+    let err = client
+        .member_promote(learner)
+        .await
+        .expect_err("promoting a learner that has replicated nothing should be refused");
+    assert_eq!(err.kind(), ClusterErrorKind::LearnerNotReady, "{err:?}");
+}

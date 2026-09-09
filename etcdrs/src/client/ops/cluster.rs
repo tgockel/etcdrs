@@ -668,27 +668,32 @@ impl MemberPromoteResponse {
 pub enum ClusterErrorKind {
     /// The requested member was not found.
     ///
-    /// This comes from the gRPC API as `NOT_FOUND`, or `FAILED_PRECONDITION` with "member not found".
+    /// This comes from the gRPC API as `NOT_FOUND` with "etcdserver: member not found".
     MemberNotFound,
     /// A member with the requested ID already exists.
     ///
-    /// This comes from the gRPC API as `FAILED_PRECONDITION` with "ID exists".
+    /// This comes from the gRPC API as `FAILED_PRECONDITION` with "etcdserver: member ID already
+    /// exist".
     MemberAlreadyExists,
     /// One or more of the requested peer URLs are already in use by another member.
     ///
-    /// This comes from the gRPC API as `FAILED_PRECONDITION` with "Peer URLs already exists".
+    /// This comes from the gRPC API as `FAILED_PRECONDITION` with "etcdserver: Peer URLs already
+    /// exists".
     PeerUrlExists,
     /// Tried to promote a member that is not a learner.
     ///
-    /// This comes from the gRPC API as `FAILED_PRECONDITION` with "can only promote a learner".
+    /// This comes from the gRPC API as `FAILED_PRECONDITION` with "etcdserver: can only promote a
+    /// learner member".
     MemberNotLearner,
     /// Tried to promote a learner that is not yet caught up with the cluster leader.
     ///
-    /// This comes from the gRPC API as `FAILED_PRECONDITION` with "learner not ready".
+    /// This comes from the gRPC API as `FAILED_PRECONDITION` with "etcdserver: can only promote a
+    /// learner member which is in sync with leader".
     LearnerNotReady,
     /// The cluster is not healthy enough to satisfy this reconfiguration.
     ///
-    /// This comes from the gRPC API as `UNAVAILABLE` with "unhealthy cluster".
+    /// This comes from the gRPC API as `UNAVAILABLE` with "etcdserver: unhealthy cluster", or as
+    /// `UNKNOWN` with "etcdserver: re-configuration failed due to not enough started members".
     UnhealthyCluster,
     /// There is an authentication or authorization error.
     ///
@@ -728,43 +733,46 @@ define_op_error! {
 
 impl ClusterError {
     pub(crate) fn from_status(status: tonic::Status) -> Self {
-        let kind = match status.code() {
-            tonic::Code::NotFound => ClusterErrorKind::MemberNotFound,
-            tonic::Code::FailedPrecondition => {
-                let msg = status.message();
-                if msg.contains("member not found") || msg.contains("ID removed") {
-                    ClusterErrorKind::MemberNotFound
-                } else if msg.contains("ID exists") {
-                    ClusterErrorKind::MemberAlreadyExists
-                } else if msg.contains("Peer URLs already exists") || msg.contains("peerURL exists") {
-                    ClusterErrorKind::PeerUrlExists
-                } else if msg.contains("learner not ready") {
+        let kind = match (status.code(), status.message()) {
+            (tonic::Code::NotFound, _) => ClusterErrorKind::MemberNotFound,
+            // etcd sends every rejected membership change as one of these exact strings
+            // (`api/v3rpc/rpctypes/error.go`), so nothing weaker than an exact match is needed to
+            // tell them apart -- and nothing weaker would separate "can only promote a learner
+            // member" from "... which is in sync with leader", which is a different kind.
+            //
+            // "not enough started members" arrives as UNKNOWN rather than FAILED_PRECONDITION
+            // because `toGRPCErrorMap` routes it through `rpctypes.ErrMemberNotEnoughStarted`,
+            // which has no `GRPCStatus()` method for gRPC to read a code off. Accept it under
+            // either code: the text is what identifies it, and FAILED_PRECONDITION is evidently
+            // what etcd meant to send.
+            (tonic::Code::FailedPrecondition | tonic::Code::Unknown, message) => match message {
+                "etcdserver: member ID already exist" => ClusterErrorKind::MemberAlreadyExists,
+                "etcdserver: Peer URLs already exists" => ClusterErrorKind::PeerUrlExists,
+                "etcdserver: can only promote a learner member" => ClusterErrorKind::MemberNotLearner,
+                "etcdserver: can only promote a learner member which is in sync with leader" => {
                     ClusterErrorKind::LearnerNotReady
-                } else if msg.contains("not a learner") || msg.contains("can only promote a learner") {
-                    ClusterErrorKind::MemberNotLearner
-                } else {
-                    ClusterErrorKind::Unknown
                 }
-            }
-            tonic::Code::Unauthenticated => ClusterErrorKind::Authentication,
-            tonic::Code::PermissionDenied => ClusterErrorKind::Authentication,
-            // NOTE: Other "invalid arguments" won't be returned because we won't send bad arguments
-            tonic::Code::InvalidArgument => ClusterErrorKind::Authentication,
-            tonic::Code::ResourceExhausted => ClusterErrorKind::Exhausted,
-            tonic::Code::DataLoss => ClusterErrorKind::DataLoss,
-            tonic::Code::Unavailable => {
-                // etcd reports a rejected strict-reconfig check as UNAVAILABLE, not
-                // FAILED_PRECONDITION (`ErrGRPCUnhealthy` in api/v3rpc/rpctypes/error.go), so the
-                // message is the only thing separating "this reconfiguration was refused" from an
-                // ordinary "the server is not reachable".
-                if status.message().contains("unhealthy cluster") {
+                "etcdserver: re-configuration failed due to not enough started members" => {
                     ClusterErrorKind::UnhealthyCluster
-                } else {
-                    ClusterErrorKind::Unavailable
                 }
-            }
+                // "etcdserver: too many learner members in cluster" belongs here too, but the kind
+                // it needs cannot be added to an exhaustive enum in a released 0.1.x without
+                // breaking downstream matches. It stays `Unknown` until an incompatible release.
+                _ => ClusterErrorKind::Unknown,
+            },
+            (tonic::Code::Unauthenticated, _) => ClusterErrorKind::Authentication,
+            (tonic::Code::PermissionDenied, _) => ClusterErrorKind::Authentication,
+            // NOTE: Other "invalid arguments" won't be returned because we won't send bad arguments
+            (tonic::Code::InvalidArgument, _) => ClusterErrorKind::Authentication,
+            (tonic::Code::ResourceExhausted, _) => ClusterErrorKind::Exhausted,
+            (tonic::Code::DataLoss, _) => ClusterErrorKind::DataLoss,
+            // `ErrGRPCUnhealthy` is the one strict-reconfig refusal that keeps a code of its own,
+            // and it shares UNAVAILABLE with an unreachable server, so the message is again the only
+            // thing separating "this reconfiguration was refused" from "that server is not there".
+            (tonic::Code::Unavailable, "etcdserver: unhealthy cluster") => ClusterErrorKind::UnhealthyCluster,
+            (tonic::Code::Unavailable, _) => ClusterErrorKind::Unavailable,
             // Don't care who timed us out
-            tonic::Code::Cancelled | tonic::Code::DeadlineExceeded => ClusterErrorKind::Timeout,
+            (tonic::Code::Cancelled | tonic::Code::DeadlineExceeded, _) => ClusterErrorKind::Timeout,
             _ => ClusterErrorKind::Unknown,
         };
         Self::new(kind, "", Some(status))
@@ -778,3 +786,141 @@ const _: () = {
         _assert_send::<MemberAddFuture>();
     }
 };
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn kind_of(code: tonic::Code, message: &str) -> ClusterErrorKind {
+        ClusterError::from_status(tonic::Status::new(code, message)).kind()
+    }
+
+    /// Every rejection an etcd 3.7 server sends for a cluster-membership RPC, as observed against a
+    /// live server. These are the whole reason the classifier matches on the message at all.
+    #[test]
+    fn etcd_membership_rejections_are_classified() {
+        use ClusterErrorKind::*;
+        use tonic::Code;
+
+        for (code, message, expected) in [
+            (Code::NotFound, "etcdserver: member not found", MemberNotFound),
+            (
+                Code::FailedPrecondition,
+                "etcdserver: member ID already exist",
+                MemberAlreadyExists,
+            ),
+            (
+                Code::FailedPrecondition,
+                "etcdserver: Peer URLs already exists",
+                PeerUrlExists,
+            ),
+            (
+                Code::FailedPrecondition,
+                "etcdserver: can only promote a learner member",
+                MemberNotLearner,
+            ),
+            (
+                Code::FailedPrecondition,
+                "etcdserver: can only promote a learner member which is in sync with leader",
+                LearnerNotReady,
+            ),
+            (Code::Unavailable, "etcdserver: unhealthy cluster", UnhealthyCluster),
+            (
+                Code::Unknown,
+                "etcdserver: re-configuration failed due to not enough started members",
+                UnhealthyCluster,
+            ),
+        ] {
+            assert_eq!(kind_of(code, message), expected, "{code:?} {message:?}");
+        }
+    }
+
+    /// etcd refuses a learner past `--max-learners` with a message of its own, but giving it a kind
+    /// of its own would add a variant to an exhaustive public enum that 0.1.0 already shipped. The
+    /// message is pinned here so that the release which can add the kind only has to change the
+    /// expectation.
+    #[test]
+    fn too_many_learners_has_no_kind_of_its_own_yet() {
+        assert_eq!(
+            kind_of(
+                tonic::Code::FailedPrecondition,
+                "etcdserver: too many learner members in cluster"
+            ),
+            ClusterErrorKind::Unknown
+        );
+    }
+
+    /// The not-enough-started-members refusal is also accepted under the code etcd meant to send
+    /// it with, so a server that ever grows a `GRPCStatus()` for it keeps classifying.
+    #[test]
+    fn not_enough_started_members_is_accepted_under_either_code() {
+        let message = "etcdserver: re-configuration failed due to not enough started members";
+        assert_eq!(
+            kind_of(tonic::Code::FailedPrecondition, message),
+            ClusterErrorKind::UnhealthyCluster
+        );
+    }
+
+    /// Matching that refusal by text alone is only safe if an ordinary `UNKNOWN` -- what a dropped
+    /// connection looks like to tonic -- is left alone.
+    #[test]
+    fn unrelated_unknown_stays_unknown() {
+        assert_eq!(
+            kind_of(tonic::Code::Unknown, "transport error"),
+            ClusterErrorKind::Unknown
+        );
+    }
+
+    /// Likewise for `UNAVAILABLE`, which a refused reconfiguration shares with an unreachable
+    /// server.
+    #[test]
+    fn unrelated_unavailable_stays_unavailable() {
+        for message in ["transport error", "etcdserver: no leader"] {
+            assert_eq!(
+                kind_of(tonic::Code::Unavailable, message),
+                ClusterErrorKind::Unavailable,
+                "{message:?}"
+            );
+        }
+    }
+
+    /// Substrings that read like etcd errors but that etcd never sends -- among them the ones an
+    /// earlier version of this classifier matched on.
+    #[test]
+    fn messages_etcd_never_sends_are_unknown() {
+        for message in [
+            "etcdserver: ID exists",
+            "etcdserver: ID removed",
+            "etcdserver: peerURL exists",
+            "etcdserver: learner not ready",
+            "etcdserver: not a learner",
+        ] {
+            assert_eq!(
+                kind_of(tonic::Code::FailedPrecondition, message),
+                ClusterErrorKind::Unknown,
+                "{message:?}"
+            );
+        }
+    }
+
+    /// The codes answered on the code alone. The message is one that would classify under a
+    /// different code, proving it is not consulted here.
+    #[test]
+    fn code_only_classifications() {
+        use ClusterErrorKind::*;
+        use tonic::Code;
+
+        for (code, expected) in [
+            (Code::Unauthenticated, Authentication),
+            (Code::PermissionDenied, Authentication),
+            (Code::InvalidArgument, Authentication),
+            (Code::ResourceExhausted, Exhausted),
+            (Code::DataLoss, DataLoss),
+            (Code::Cancelled, Timeout),
+            (Code::DeadlineExceeded, Timeout),
+            (Code::Internal, Unknown),
+        ] {
+            assert_eq!(kind_of(code, "etcdserver: unhealthy cluster"), expected, "{code:?}");
+        }
+    }
+}
