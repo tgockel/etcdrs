@@ -70,7 +70,13 @@ impl Client {
         LeaseTimeToLive::new(lease_id).with_client(self.clone())
     }
 
-    /// List the IDs of all active leases in the cluster.
+    /// List the IDs of the leases the responding member knows about.
+    ///
+    /// etcd answers this from that member's own lease table, without a linearizable read and
+    /// without forwarding to the leader, and the request carries no option to ask for either. A
+    /// lease granted or revoked through a different member is therefore absent, or still listed,
+    /// until the responding member applies that change. Only
+    /// [`lease_time_to_live`][Client::lease_time_to_live] is answered by the leader.
     ///
     /// ```no_run
     /// # async {

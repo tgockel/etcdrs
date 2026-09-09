@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use etcdrs::{Client, GrantLeaseErrorKind, LeaseId, RevokeLeaseErrorKind};
-use etcdrs_test::{EtcdCluster, etcd_cluster};
+use etcdrs_test::{EtcdCluster, EtcdServer, etcd_cluster, etcd_server};
 use futures::StreamExt;
 use rstest::rstest;
 
@@ -79,10 +79,13 @@ async fn time_to_live_missing_lease(etcd_cluster: EtcdCluster) {
     assert_eq!(response.granted_ttl(), None);
 }
 
+/// Single-node deliberately: `Leases` is answered from the responding member's own lease table,
+/// so against a cluster the load balancer can route a listing to a member that has not applied
+/// the grant or the revoke yet. Do not move this to `etcd_cluster`.
 #[rstest]
 #[tokio::test]
-async fn leases_listing(etcd_cluster: EtcdCluster) {
-    let client = Client::new(&etcd_cluster.connect_string()).unwrap();
+async fn leases_listing(etcd_server: EtcdServer) {
+    let client = Client::new(&etcd_server.connect_string()).unwrap();
     let a = client
         .grant_lease()
         .ttl(Duration::from_secs(60))
