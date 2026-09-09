@@ -217,13 +217,9 @@ fn stream_remaining_chunks(
             ).await {
                 Ok(resp) => resp,
                 Err(status) => {
-                    let is_unavailable = status.code() == tonic::Code::Unavailable;
+                    // `wrap_unary_call` already applied the retry policy to this page.
                     yield Err(GetError::from_status(status));
-                    if is_unavailable {
-                        continue;
-                    } else {
-                        break;
-                    }
+                    break;
                 }
             };
 
@@ -289,6 +285,16 @@ impl<R> ListView<R> {
     ///
     /// The stream first yields items from the already-fetched first batch, then fetches and yields items from
     /// subsequent pages.
+    ///
+    /// ## Failure
+    /// A page that fails ends the scan. The failure is yielded as a single `Err` item, after which the stream is
+    /// finished and issues no further requests -- whether a failed request was worth retrying is the client's
+    /// [`RetryPolicy`][crate::RetryPolicy]'s decision, and by the time the error arrives here that decision was to
+    /// stop.
+    ///
+    /// There is no way to resume a scan from where it stopped, so a stream that ended in an error delivered only
+    /// part of the range. Reading the rest means starting a new [`list`][Client::list] from the beginning, at
+    /// whatever revision that one lands on.
     pub fn into_stream(self) -> ListIterator<R> {
         let first_kvs = self.first_batch_kvs;
 
@@ -468,3 +474,53 @@ const _: () = {
         _assert_send::<ListFuture<Result<ListView<KeyWithMetadata>, GetError>>>();
     }
 };
+
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+
+    use futures::StreamExt as _;
+
+    use super::*;
+    use crate::client::RequestCounter;
+
+    /// A failed continuation page is reported once and ends the scan.
+    ///
+    /// The client is aimed at port 0, which is never assigned to a socket, so the connector fails
+    /// every time with `Unavailable` -- the status the removed per-page retry looped on.
+    /// [`RetryPolicy::Never`][crate::RetryPolicy::Never] holds `wrap_unary_call` to one attempt,
+    /// which makes the request count a count of pages attempted.
+    ///
+    /// The stream is stepped item by item rather than drained, because the regression this guards
+    /// against is an unbounded sequence of requests for as long as the consumer keeps polling:
+    /// collecting the stream would never return against a version that retries pages itself.
+    #[tokio::test]
+    async fn a_failed_page_ends_the_scan() {
+        let metrics = Arc::new(RequestCounter::default());
+        let client = Client::builder()
+            .add_connection("http://127.0.0.1:0")
+            .unwrap()
+            .metrics(metrics.clone())
+            .retry_never()
+            .build()
+            .unwrap();
+        let continuation = ListContinuation {
+            client,
+            request: etcdserverpb::RangeRequest::default(),
+        };
+
+        let mut chunks = Box::pin(stream_remaining_chunks(continuation));
+        let err = chunks
+            .next()
+            .await
+            .expect("the failure should be reported to the consumer")
+            .expect_err("a range against an unconnectable address cannot succeed");
+        assert_eq!(err.kind(), GetErrorKind::Unavailable, "{err:?}");
+        assert_eq!(metrics.get().requested(), 1);
+
+        for poll in 1..=3 {
+            assert!(chunks.next().await.is_none(), "poll {poll} yielded another item");
+            assert_eq!(metrics.get().requested(), 1, "poll {poll} issued another request");
+        }
+    }
+}
