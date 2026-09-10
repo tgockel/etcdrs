@@ -302,6 +302,30 @@ async fn member_add_past_max_learners_is_unclassified(#[with(1)] etcd_cluster: E
     );
 }
 
+/// `member_add` passes its peer URLs straight to etcd's `types.NewURLs`, which refuses anything
+/// that is not an absolute URL. This is the one `INVALID_ARGUMENT` a caller can provoke, and it was
+/// read as an authentication failure for as long as the classifier answered on the code alone.
+///
+/// The refusal has no kind of its own, because adding one would mean adding a variant to an
+/// exhaustive public enum that 0.1.0 already shipped. Pinning the message here is what lets the
+/// release that can add the kind find this test.
+#[rstest]
+#[tokio::test]
+async fn member_add_with_a_bad_peer_url_is_unclassified(#[with(1)] etcd_cluster: EtcdCluster) {
+    let client = Client::new(&etcd_cluster.connect_string()).unwrap();
+
+    let err = client
+        .member_add(["not-a-url"])
+        .await
+        .expect_err("a peer URL with no scheme should be refused");
+    assert_eq!(err.kind(), ClusterErrorKind::Unknown, "{err:?}");
+    assert_eq!(
+        err.grpc_status().map(|s| s.message()),
+        Some("etcdserver: given member URLs are invalid"),
+        "{err:?}",
+    );
+}
+
 /// etcd refuses to add a voting member unless a quorum of the resulting voting set has started:
 /// `nstarted >= (1 + voting_members)/2 + 1`. A member counts as started only once it has reported a
 /// name, so a peer announced here and never launched stays unstarted indefinitely -- announcing one
