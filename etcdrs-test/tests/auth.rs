@@ -219,6 +219,49 @@ async fn permissions_enforced_end_to_end(etcd_server: EtcdServer) {
     root.auth_disable().await.unwrap();
 }
 
+/// An inclusive range ends at its key. `Permission::read("a"..="a")` used to be granted as
+/// `Prefix("a")`, so the role could read every key under `a`.
+#[rstest]
+#[tokio::test]
+async fn inclusive_permission_ends_at_its_key(etcd_server: EtcdServer) {
+    let root = enable_auth_with_reader(&etcd_server).await;
+    root.role_grant_permission("reader", Permission::read("a"..="a"))
+        .await
+        .unwrap();
+    root.put("a").value("visible").await.unwrap();
+    root.put("a/secret").value("hidden").await.unwrap();
+
+    let eve = client_with_credentials(&etcd_server, "eve", "evepw");
+    let record = eve.get("a").await.unwrap().into_record().unwrap();
+    assert_eq!(record.value(), &b"visible"[..]);
+    let err = eve.get("a/secret").await.unwrap_err();
+    assert_eq!(err.kind(), etcdrs::GetErrorKind::Authentication);
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
+/// A range that ends below every key addresses none. etcd checks a read of it at its lower bound,
+/// as it does for any empty range, and refuses to grant it. `Permission::read(..="")` used to be
+/// granted as every key.
+#[rstest]
+#[tokio::test]
+async fn ranges_over_no_keys_under_auth(etcd_server: EtcdServer) {
+    let root = enable_auth_with_reader(&etcd_server).await;
+
+    let eve = client_with_credentials(&etcd_server, "eve", "evepw");
+    assert_eq!(eve.list("pub/"..="").count_only().await.unwrap().count(), 0);
+
+    let err = root
+        .role_grant_permission("reader", Permission::read(..=""))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), etcdrs::RoleErrorKind::InvalidAuthManagement);
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
 /// A permission failure is an answer, not a transient fault: etcd settles the token and identifies
 /// the user before it can reach a permission decision, so re-authenticating hands back a token for
 /// the same user with the same roles and the same denial. The client used to treat every

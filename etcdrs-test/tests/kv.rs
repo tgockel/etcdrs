@@ -1,6 +1,6 @@
-use std::{sync::Arc, time::Duration};
+use std::{fmt::Debug, sync::Arc, time::Duration};
 
-use etcdrs::{CompactErrorKind, Revision, Version, WatchErrorKind};
+use etcdrs::{AsRange, CompactErrorKind, Revision, Version, WatchErrorKind};
 use etcdrs_test::{EtcdCluster, EtcdServer, etcd_cluster, etcd_server};
 use futures::StreamExt;
 use rstest::rstest;
@@ -28,15 +28,21 @@ async fn list_basics(etcd_server: EtcdServer) {
         .build()
         .unwrap();
 
-    let things = [("foo/a", b"a"), ("foo/b", b"b"), ("foo/c", b"c"), ("foo/d", b"d")];
+    let things = [
+        ("foo/a", b"a"),
+        ("foo/b", b"b"),
+        ("foo/c", b"c"),
+        ("foo/d", b"d"),
+        ("foo/d/e", b"e"),
+    ];
     for (key, value) in things.iter() {
         client.put(*key).value(*value).await.unwrap();
     }
-    assert_eq!(4, metrics.get().succeeded());
+    assert_eq!(5, metrics.get().succeeded());
 
     let count = client.list_prefix("foo/").count_only().await.unwrap().count();
     assert_eq!(count, things.len());
-    assert_eq!(5, metrics.get().succeeded());
+    assert_eq!(6, metrics.get().succeeded());
     let keys = client
         .list("foo/a"..="foo/d")
         .keys_only()
@@ -44,11 +50,11 @@ async fn list_basics(etcd_server: EtcdServer) {
         .await
         .unwrap()
         .into_stream()
-        .map(Result::unwrap)
+        .map(|key| key.unwrap().key().clone())
         .collect::<Vec<_>>()
         .await;
-    assert_eq!(count, keys.len());
-    assert_eq!(7, metrics.get().succeeded()); // NOTE: `.limit(2)` above takes 2 requests to list 4 records
+    assert_eq!(keys, ["foo/a", "foo/b", "foo/c", "foo/d"]);
+    assert_eq!(8, metrics.get().succeeded()); // NOTE: `.limit(2)` above takes 2 requests to list 4 records
 }
 
 #[rstest]
@@ -149,6 +155,42 @@ async fn delete_range_get_previous(etcd_server: EtcdServer) {
     assert_eq!(previous.len(), 3);
     let keys: Vec<&[u8]> = previous.iter().map(|r| &r.key()[..]).collect();
     assert_eq!(keys, vec![b"foo/a", b"foo/b", b"foo/c"]);
+}
+
+/// Helper: assert that `range` lists no keys and that deleting it deletes none.
+async fn assert_addresses_no_keys(client: &etcdrs::Client, range: impl AsRange + Clone + Debug) {
+    let listed = client
+        .list(range.clone())
+        .keys_only()
+        .await
+        .unwrap()
+        .into_stream()
+        .map(|key| key.unwrap().key().clone())
+        .collect::<Vec<_>>()
+        .await;
+    assert!(listed.is_empty(), "{range:?} listed {listed:?}");
+    let deleted = client.delete_range(range.clone()).await.unwrap().deleted();
+    assert_eq!(deleted, 0, "{range:?} deleted keys");
+}
+
+/// etcd has no empty key, so a range that ends at `..=""`, `..""` or `.."\0"` addresses no keys.
+/// Each of those ends used to be sent as the `range_end` that etcd reads as one key or as no upper
+/// bound.
+#[rstest]
+#[tokio::test]
+async fn upper_bound_below_every_key_addresses_no_keys(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+    for key in ["\0", "a", "b"] {
+        client.put(key).value(key).await.unwrap();
+    }
+
+    assert_addresses_no_keys(&client, ..="").await;
+    assert_addresses_no_keys(&client, .."").await;
+    assert_addresses_no_keys(&client, .."\0").await;
+    assert_addresses_no_keys(&client, "a"..="").await;
+    assert_addresses_no_keys(&client, "a".."").await;
+    assert_addresses_no_keys(&client, "a".."\0").await;
+    assert_eq!(client.list(..).count_only().await.unwrap().count(), 3);
 }
 
 #[rstest]

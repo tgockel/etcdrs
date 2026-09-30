@@ -62,11 +62,14 @@ impl Client {
         RoleGrantPermission::new(name, permission).with_client(self.clone())
     }
 
-    /// Revoke a previously granted permission from a role by its key set.
+    /// Revoke a previously granted permission from a role by its range.
     ///
-    /// The `range` must address the same key set the permission was
-    /// [granted][Client::role_grant_permission] over. Revoking a permission that was not granted
-    /// fails with [`RoleErrorKind::PermissionNotGranted`].
+    /// etcd revokes only a permission whose `key` and `range_end` equal the ones `range` encodes to,
+    /// so covering the same keys is not enough: `"a"` and `"a"..="a"` both cover only the key `a`,
+    /// but neither revokes a permission [granted][Client::role_grant_permission] with the other. To
+    /// see how a granted permission is encoded, read it back with [`role_get`][Client::role_get] and
+    /// call [`Permission::target_range`]. Revoking a permission that was not granted fails with
+    /// [`RoleErrorKind::PermissionNotGranted`].
     pub fn role_revoke_permission(&self, name: &str, range: impl AsRange) -> RoleRevokePermission<Self> {
         RoleRevokePermission::new(name, range).with_client(self.clone())
     }

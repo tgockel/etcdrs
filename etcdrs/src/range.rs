@@ -38,12 +38,16 @@ fn specify_boundaries(start_bound: Bound<&[u8]>, end_bound: Bound<&[u8]>) -> (By
         Bound::Excluded(val) => successor(val.as_key()).into(),
         Bound::Unbounded => Bytes::from_static(&[0]),
     };
-    let upper = match end_bound {
-        Bound::Included(val) => add_one(val.as_key()).into(),
-        Bound::Excluded(val) => Bytes::copy_from_slice(val.as_key()),
-        Bound::Unbounded => Bytes::from_static(&[0]),
-    };
-    (lower, upper)
+    match end_bound {
+        // etcd has no empty key, so these address no key. Neither `("", "")` nor `([0], [0])` is an empty span.
+        Bound::Included([]) | Bound::Excluded([] | [0]) => {
+            let lower = lower.max(Bytes::from_static(&[0, 0]));
+            (lower.clone(), lower)
+        }
+        Bound::Included(val) => (lower, successor(val.as_key()).into()),
+        Bound::Excluded(val) => (lower, Bytes::copy_from_slice(val.as_key())),
+        Bound::Unbounded => (lower, Bytes::from_static(&[0])),
+    }
 }
 
 fn range_to_boundaries<R: RangeBounds<impl AsKey>>(range: &R) -> (Bytes, Bytes) {
@@ -89,7 +93,10 @@ pub struct Prefix<T: ?Sized>(pub T);
 impl<T: AsKey + ?Sized> private::Sealed for Prefix<T> {}
 impl<T: AsKey + ?Sized> AsRange for Prefix<T> {
     fn as_boundaries(&self) -> (Bytes, Bytes) {
-        (Bytes::copy_from_slice(self.0.as_key()), add_one(self.0.as_key()).into())
+        (
+            Bytes::copy_from_slice(self.0.as_key()),
+            prefix_end(self.0.as_key()).into(),
+        )
     }
 }
 
@@ -131,10 +138,8 @@ impl<'a> TargetRange<'a> {
     }
 }
 
-/// Add one bit to the last element of `input`, carrying left on overflow.
-///
-/// This is used in range queries to specify "include this `input`".
-fn add_one(input: &[u8]) -> Vec<u8> {
+/// The `range_end` of a prefix query: the first key after every key that starts with `input`.
+fn prefix_end(input: &[u8]) -> Vec<u8> {
     let mut out = input.to_owned();
     while let Some(last) = out.last_mut() {
         if *last < u8::MAX {
@@ -161,7 +166,13 @@ pub(crate) fn successor(input: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TargetRange, add_one};
+    use super::{AsRange, TargetRange, prefix_end};
+
+    #[track_caller]
+    fn assert_wire(range: impl AsRange, expected: TargetRange<'_>) {
+        let (key, range_end) = range.as_boundaries();
+        assert_eq!(TargetRange::from_wire(&key, &range_end), expected);
+    }
 
     #[test]
     fn target_range_from_wire() {
@@ -175,7 +186,26 @@ mod tests {
     }
 
     #[test]
-    fn test_add_one() {
+    fn inclusive_upper_bound_ends_after_its_key() {
+        assert_wire("a"..="a", TargetRange::Span(b"a", b"a\0"));
+        assert_wire(..="b", TargetRange::Span(b"\0", b"b\0"));
+        assert_wire(..="\0", TargetRange::Span(b"\0", b"\0\0"));
+        assert_wire(..=b"\xff", TargetRange::Span(b"\0", b"\xff\0"));
+    }
+
+    #[test]
+    fn upper_bound_below_every_key_is_empty() {
+        assert_wire(..="", TargetRange::Span(b"\0\0", b"\0\0"));
+        assert_wire(.."", TargetRange::Span(b"\0\0", b"\0\0"));
+        assert_wire(.."\0", TargetRange::Span(b"\0\0", b"\0\0"));
+        assert_wire(""..="", TargetRange::Span(b"\0\0", b"\0\0"));
+        assert_wire("a"..="", TargetRange::Span(b"a", b"a"));
+        assert_wire("a".."", TargetRange::Span(b"a", b"a"));
+        assert_wire("a".."\0", TargetRange::Span(b"a", b"a"));
+    }
+
+    #[test]
+    fn test_prefix_end() {
         let cases: &[(&[u8], &[u8])] = &[
             (b"aa", b"ab"),
             (b"a\xff", b"b"),
@@ -183,7 +213,7 @@ mod tests {
             (b"\xff\xff\xff", b"\0"),
         ];
         for (input, expected) in cases {
-            let output = add_one(input);
+            let output = prefix_end(input);
             assert_eq!(*expected, output);
         }
     }
