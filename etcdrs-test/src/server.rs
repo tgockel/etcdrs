@@ -6,18 +6,32 @@ use std::{borrow::Cow, collections::HashMap, env, ffi, io, net, path, process};
 pub struct EtcdServer {
     config: EtcdServerConfig,
     runner: Option<EtcdRunner>,
+    created_working_dir: bool,
 }
 
 impl EtcdServer {
     pub fn with_config(config: EtcdServerConfig) -> Self {
-        Self { config, runner: None }
+        Self {
+            config,
+            runner: None,
+            created_working_dir: false,
+        }
     }
 
+    /// Start the etcd process.
+    ///
+    /// The first call creates the data directory, and fails with [`io::ErrorKind::AlreadyExists`] if it already
+    /// exists. Later calls reuse it, so data persists across [`stop`][`EtcdServer::stop`].
     pub fn start(&mut self) -> io::Result<()> {
         if self.runner.is_some() {
             return Err(io::Error::other(
                 "server is already running -- you must stop() it first",
             ));
+        }
+
+        if !self.created_working_dir {
+            create_working_dir(&self.config.working_dir)?;
+            self.created_working_dir = true;
         }
 
         let client_port = self.config.client_port;
@@ -210,31 +224,28 @@ pub struct EtcdClusterConfig {
 
 impl EtcdClusterConfig {
     pub fn with_generated_peers(count: usize) -> Self {
+        Self::with_peers(count, EtcdServerConfig::new_single_temporary)
+    }
+
+    fn with_peers(count: usize, mut new_peer: impl FnMut() -> EtcdServerConfig) -> Self {
         let cluster_token = format!("cluster-{}", get_random_name(4));
-        let mut configs: Vec<_> = (0..count)
-            .map(|_| {
-                let mut config = EtcdServerConfig::new_single_temporary();
-                config.cluster_token = Some(cluster_token.clone());
-                config
-            })
-            .collect();
+        let mut configs = HashMap::new();
+        while configs.len() < count {
+            let mut config = new_peer();
+            config.cluster_token = Some(cluster_token.clone());
+            configs.insert(config.name.clone(), config);
+        }
         let initial_cluster_string = configs
-            .iter()
+            .values()
             .map(|config| format!("{}=http://127.0.0.1:{}", config.name.0, config.peer_port))
             .collect::<Vec<_>>()
             .join(",");
 
-        for config in configs.iter_mut() {
+        for config in configs.values_mut() {
             config.initial_cluster = Some(initial_cluster_string.clone());
         }
 
-        Self {
-            cluster_token,
-            configs: configs
-                .into_iter()
-                .map(|config| (config.name.clone(), config))
-                .collect(),
-        }
+        Self { cluster_token, configs }
     }
 
     pub fn build(self) -> EtcdCluster {
@@ -253,7 +264,7 @@ struct ServerName(String);
 
 impl ServerName {
     pub fn generate() -> Self {
-        Self(format!("etcd-srvr-{}", get_random_name(4)))
+        Self(format!("etcd-srvr-{}", get_random_name(12)))
     }
 }
 
@@ -307,6 +318,24 @@ fn keep_test_dir() -> bool {
     }
 }
 
+fn create_working_dir(path: &path::Path) -> io::Result<()> {
+    // etcd creates its data dir 0700, and warns on every start about one that is not.
+    #[cfg(unix)]
+    let created = {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    };
+    #[cfg(not(unix))]
+    let created = std::fs::create_dir(path);
+
+    created.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to create etcd data dir {path:?}: {error}"),
+        )
+    })
+}
+
 struct EtcdRunner {
     proc: process::Child,
 }
@@ -327,12 +356,61 @@ impl Drop for EtcdServer {
     fn drop(&mut self) {
         drop(self.runner.take());
 
-        if !std::thread::panicking()
+        if self.created_working_dir
+            && !std::thread::panicking()
             && !keep_test_dir()
             && let Err(error) = std::fs::remove_dir_all(&self.config.working_dir)
             && error.kind() != io::ErrorKind::NotFound
         {
             eprintln!("Failed to remove etcd data dir {:?}: {error}", self.config.working_dir);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_start_refuses_an_existing_data_dir() {
+        let config = EtcdServerConfig::new_single_temporary();
+        let dir = config.working_dir.clone();
+        std::fs::create_dir(&dir).unwrap();
+        let leftover = dir.join("leftover");
+        std::fs::write(&leftover, "").unwrap();
+
+        // `EtcdServerConfig::start` drops the server when its start fails, so this also runs its `Drop`.
+        let Err(error) = config.start() else {
+            panic!("start() should refuse the existing data dir {dir:?}");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert!(
+            leftover.exists(),
+            "the refused server removed a data dir it did not create"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn generated_peers_skip_a_repeated_name() {
+        let repeated = EtcdServerConfig::new_single_temporary();
+        let mut drawn = [repeated.clone(), repeated].into_iter();
+        let cluster = EtcdClusterConfig::with_peers(2, || {
+            drawn.next().unwrap_or_else(EtcdServerConfig::new_single_temporary)
+        });
+
+        let mut expected: Vec<_> = cluster
+            .configs
+            .values()
+            .map(|config| format!("{}={}", config.name.0, config.peer_url()))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(expected.len(), 2, "{expected:?}");
+        for config in cluster.configs.values() {
+            let mut members: Vec<_> = config.initial_cluster.as_deref().unwrap().split(',').collect();
+            members.sort_unstable();
+            assert_eq!(members, expected);
         }
     }
 }
