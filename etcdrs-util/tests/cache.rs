@@ -465,3 +465,29 @@ async fn compaction_recovery_converges(mut etcd_server: EtcdServer) {
 
     eventually_cached(&cache, &metrics, "foo/k", Some(b"v20")).await;
 }
+
+/// etcd lists an inverted range as empty but refuses to watch it. The cache unseeds that range and
+/// retries it on its own, and the range beside it keeps its watch.
+#[rstest]
+#[tokio::test]
+async fn refused_range_is_retried_without_stopping_others(etcd_server: EtcdServer) {
+    let external = Client::new(&etcd_server.connect_string()).unwrap();
+    external.put("foo/a").value("v1").await.unwrap();
+
+    let (client, metrics) = counting_client(&etcd_server);
+    let cache = CacheClient::builder(client)
+        .cache(Prefix("foo/"))
+        .cache("b".."a")
+        .build();
+    eventually_cached(&cache, &metrics, "foo/a", Some(b"v1")).await;
+
+    external.put("foo/a").value("v2").await.unwrap();
+    eventually_cached(&cache, &metrics, "foo/a", Some(b"v2")).await;
+
+    eventually(async || cache.coherent_revision("b".."a").is_none().then_some(())).await;
+
+    // Nothing reads through the cache from here on, so each request it makes is a re-listing of the
+    // refused range ahead of re-adding its watch.
+    let before = metrics.get().requested();
+    eventually(async || (metrics.get().requested() > before).then_some(())).await;
+}

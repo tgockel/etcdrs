@@ -1,6 +1,7 @@
 use std::{
     backtrace::Backtrace,
     borrow::Cow,
+    collections::VecDeque,
     fmt,
     num::NonZeroI64,
     ops::{Deref, DerefMut},
@@ -376,7 +377,8 @@ impl WatchBuilder<Client> {
     ///
     /// The gRPC stream is established lazily on the first poll of the returned [`Watcher`]. All
     /// targets accumulated through the builder are sent as `WatchCreateRequest` messages at that
-    /// time. Creation confirmations are consumed internally by the stream.
+    /// time. Successful creation confirmations are consumed internally by the stream; a refusal is
+    /// yielded as an error (see [`Watcher::add`]).
     ///
     /// The builder may have zero targets — the resulting [`Watcher`] simply waits for watches to
     /// be added via [`Watcher::add`].
@@ -412,7 +414,7 @@ impl WatchBuilder<Client> {
             // Establish the gRPC stream, retrying on Unavailable (the server may not be reachable
             // yet when the channel was created with `connect_lazy`).
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let mut response_stream = loop {
+            let (mut response_stream, unanswered_creates) = loop {
                 let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
                 for req in &initial_specs {
                     let _ = sender.send(req.clone());
@@ -420,10 +422,14 @@ impl WatchBuilder<Client> {
                 // Install this sender so WatchSender.add/cancel/progress reach the gRPC stream.
                 *shared_sender_for_stream.lock().unwrap() = Some(sender);
 
-                let request_stream = ReceiverStream { inner: receiver };
+                let unanswered_creates = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+                let request_stream = ReceiverStream {
+                    inner: receiver,
+                    unanswered_creates: unanswered_creates.clone(),
+                };
                 let mut watch_client = etcdserverpb::watch_client::WatchClient::new(channel.clone());
                 match watch_client.watch(request_stream).await {
-                    Ok(resp) => break resp.into_inner(),
+                    Ok(resp) => break (resp.into_inner(), unanswered_creates),
                     Err(status)
                         if status.code() == tonic::Code::Unavailable
                             && std::time::Instant::now() <= deadline =>
@@ -439,9 +445,14 @@ impl WatchBuilder<Client> {
 
             loop {
                 match response_stream.message().await {
-                    Ok(Some(resp)) => {
+                    Ok(Some(mut resp)) => {
                         if resp.created {
-                            continue;
+                            // Creates are answered in the order they were sent, and a refusal
+                            // carries watch ID -1 instead of the ID it refuses.
+                            resp.watch_id = unanswered_creates.lock().unwrap().pop_front().unwrap_or(resp.watch_id);
+                            if !resp.canceled {
+                                continue;
+                            }
                         }
                         for item in convert_response(resp) {
                             yield item;
@@ -530,6 +541,12 @@ impl Watcher {
     /// appear immediately -- the server confirms creation with a response that the stream silently
     /// consumes, then begins delivering events for the new watch.
     ///
+    /// If the server refuses to create the watch, the stream yields an error with
+    /// [`WatchErrorKind::Canceled`] instead, carrying this [`WatchId`] and the server's
+    /// [`cancel_reason`][WatchError::cancel_reason]. etcd refuses a watch whose range is empty or
+    /// inverted, whose [`start_revision`][Watch::start_revision] is negative, or whose range the
+    /// client may not read. Other watches on this watcher are unaffected.
+    ///
     /// Construct the [`Watch`] with [`Watch::new`]:
     ///
     /// ```no_run
@@ -548,6 +565,9 @@ impl Watcher {
     /// events that were already in-flight before the server processed the cancellation. The stream
     /// will eventually yield an error with [`WatchErrorKind::Canceled`] for this watch, confirming the
     /// cancellation. Other watches on this watcher are unaffected.
+    ///
+    /// The server ignores a cancellation of a watch it refused to create (see [`add`][Self::add]),
+    /// so for such a watch the refusal is the only [`WatchErrorKind::Canceled`] error.
     pub fn cancel(&self, watch_id: WatchId) {
         self.sender.cancel(watch_id);
     }
@@ -680,16 +700,25 @@ impl std::async_iter::AsyncIterator for WatchStream {
     }
 }
 
-/// Wraps a [`tokio::sync::mpsc::UnboundedReceiver`] as a [`Stream`].
+/// Wraps a [`tokio::sync::mpsc::UnboundedReceiver`] as a [`Stream`], recording the watch ID of each
+/// create request as the transport takes it.
 struct ReceiverStream {
     inner: tokio::sync::mpsc::UnboundedReceiver<etcdserverpb::WatchRequest>,
+    /// The watch IDs of the create requests taken so far that etcd has not answered, oldest first.
+    unanswered_creates: Arc<std::sync::Mutex<VecDeque<i64>>>,
 }
 
 impl Stream for ReceiverStream {
     type Item = etcdserverpb::WatchRequest;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.inner.poll_recv(cx)
+        let polled = self.inner.poll_recv(cx);
+        if let Poll::Ready(Some(request)) = &polled
+            && let Some(PbRequestUnion::CreateRequest(create)) = &request.request_union
+        {
+            self.unanswered_creates.lock().unwrap().push_back(create.watch_id);
+        }
+        polled
     }
 }
 
@@ -699,7 +728,8 @@ pub enum WatchErrorKind {
     /// The watch was compacted — the requested revision is older than the server's compacted
     /// revision.
     Compacted,
-    /// The watch was canceled.
+    /// The watch was canceled by [`Watcher::cancel`], or the server refused to create it.
+    /// [`WatchError::cancel_reason`] carries the server's reason for a refusal.
     Canceled,
     /// The server returned an invalid or unexpected response.
     InvalidResponse,

@@ -1,20 +1,24 @@
 use std::time::Duration;
 
 use etcdrs::client::{Watch, WatchEvent};
+use etcdrs::{Revision, WatchError, WatchErrorKind, WatchId};
 use etcdrs_test::{EtcdServer, etcd_server};
 use futures::StreamExt;
 use rstest::rstest;
+
+/// Helper: the next item from a watcher, with a timeout.
+async fn next_item(watcher: &mut etcdrs::client::Watcher) -> Result<WatchEvent, WatchError> {
+    tokio::time::timeout(Duration::from_secs(5), watcher.next())
+        .await
+        .expect("timed out waiting for watch event")
+        .expect("watch stream ended unexpectedly")
+}
 
 /// Helper: collect the next `n` events from a watcher, with a timeout.
 async fn next_events(watcher: &mut etcdrs::client::Watcher, n: usize) -> Vec<WatchEvent> {
     let mut events = Vec::with_capacity(n);
     for _ in 0..n {
-        let event = tokio::time::timeout(Duration::from_secs(5), watcher.next())
-            .await
-            .expect("timed out waiting for watch event")
-            .expect("watch stream ended unexpectedly")
-            .expect("watch stream yielded an error");
-        events.push(event);
+        events.push(next_item(watcher).await.expect("watch stream yielded an error"));
     }
     events
 }
@@ -267,4 +271,75 @@ async fn watch_request_progress(etcd_server: EtcdServer) {
         panic!("expected Progress, got {event:?}");
     };
     assert!(revision >= rev);
+}
+
+/// etcd refuses a watch with one response that is both `created` and `canceled`, for watch ID -1.
+/// The stream used to skip every `created` response, so a refused watch that was the watcher's only
+/// one left `next()` pending forever.
+#[rstest]
+#[case::inverted_range(Watch::new("b".."a"), "mvcc: watcher range is empty")]
+#[case::negative_start_revision(
+    Watch::new("refused").start_revision(Revision::new(-1).unwrap()),
+    "etcdserver: mvcc: required revision has been compacted"
+)]
+#[tokio::test]
+async fn watch_refused_alone(etcd_server: EtcdServer, #[case] refused: Watch, #[case] reason: &str) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+
+    let mut watcher = client.watch().add(refused).start();
+
+    let error = next_item(&mut watcher).await.expect_err("expected the refusal");
+    assert_eq!(error.kind(), WatchErrorKind::Canceled);
+    // Watches given to the builder are numbered from 1.
+    assert_eq!(error.watch_id(), WatchId::new(1));
+    assert_eq!(error.cancel_reason(), Some(reason));
+}
+
+/// A refusal answers the oldest create request etcd has not answered yet. It used to be dropped, so
+/// the ID that `add` returned never got an error. The other watches keep delivering events.
+#[rstest]
+#[case::inverted_range(Watch::new("b".."a"), "mvcc: watcher range is empty")]
+#[case::negative_start_revision(
+    Watch::new("refused").start_revision(Revision::new(-1).unwrap()),
+    "etcdserver: mvcc: required revision has been compacted"
+)]
+#[tokio::test]
+async fn watch_refused_beside_live_watch(etcd_server: EtcdServer, #[case] refused: Watch, #[case] reason: &str) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+
+    client.put("wr/live").value("1").await.unwrap();
+    let live_rev = revision_of(&client, "wr/live").await;
+    client.put("wr/other").value("1").await.unwrap();
+    let other_rev = revision_of(&client, "wr/other").await;
+
+    let mut watcher = client.watch().key("wr/live").start_revision(live_rev).start();
+    let events = next_events(&mut watcher, 1).await;
+    let WatchEvent::Put { watch_id: live_id, .. } = events[0] else {
+        panic!("expected Put, got {:?}", events[0]);
+    };
+
+    // Refused first, so the refusal is not for the most recent create.
+    let refused_id = watcher.add(refused);
+    let other_id = watcher.add(Watch::new("wr/other").start_revision(other_rev));
+
+    // etcd answers creates in order, and holds a watch's events until its create is answered.
+    let error = next_item(&mut watcher).await.expect_err("expected the refusal");
+    assert_eq!(error.kind(), WatchErrorKind::Canceled);
+    assert_eq!(error.watch_id(), Some(refused_id));
+    assert_eq!(error.cancel_reason(), Some(reason));
+
+    let events = next_events(&mut watcher, 1).await;
+    let WatchEvent::Put { record, watch_id, .. } = &events[0] else {
+        panic!("expected Put, got {:?}", events[0]);
+    };
+    assert_eq!(*watch_id, other_id);
+    assert_eq!(record.key(), &b"wr/other"[..]);
+
+    client.put("wr/live").value("2").await.unwrap();
+    let events = next_events(&mut watcher, 1).await;
+    let WatchEvent::Put { record, watch_id, .. } = &events[0] else {
+        panic!("expected Put, got {:?}", events[0]);
+    };
+    assert_eq!(*watch_id, live_id);
+    assert_eq!(record.value(), &b"2"[..]);
 }

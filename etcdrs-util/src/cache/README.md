@@ -64,7 +64,10 @@ Consequences:
   proven fresh costs one ordinary server round trip.
 - **Re-warming.** When a gated read passes through, the cache asks the watch for a progress
   notification (debounced). One notification re-proves freshness for every range on the stream, so
-  quiet ranges return to local serving about one round trip after the disturbance.
+  quiet ranges return to local serving about one round trip after the disturbance. A range whose
+  watch was re-added after compaction or a refused watch is the exception: until the stream is next
+  re-established, it re-warms only through its own watch events and per-watch progress
+  notifications.
 - **External writers do not gate.** Writes made by other clients bump nothing here; they simply
   arrive through the watch within its normal propagation delay. The gate defends the revisions
   *this* client has observed, not global freshness.
@@ -99,6 +102,10 @@ is automatic:
   observes a newer revision, at which point reads pass through like an uncached client.
 - **Compaction** past a watch's resume point: that range is re-listed at the current revision and
   its watch re-added; other ranges are unaffected.
+- **Refused watches**: etcd refuses to watch an empty or inverted range, or one the client may not
+  read. That range drops its snapshot, so its reads pass through, and the task re-lists it and
+  re-adds its watch after 100ms, doubling the delay each time it is refused again or cannot be
+  re-listed, up to 30s. Other ranges keep their watches.
 
 Dropping the last `CacheClient` handle aborts the background task, which cancels its watches.
 

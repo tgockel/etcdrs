@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,6 +10,9 @@ use super::{RangeState, Shared};
 
 /// Delay between retries of a failed seed and between watcher generations.
 const RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Longest delay between retries of a refused watch, which start at [`RETRY_DELAY`] and double.
+const MAX_REFUSAL_DELAY: Duration = Duration::from_secs(30);
 
 /// Background task that seeds the cached ranges and keeps them coherent with the store via a
 /// watch.
@@ -102,10 +105,35 @@ async fn seed_range(shared: &Shared, index: usize) -> Result<ResponseHeader, Get
 /// Consume one watcher generation's stream until it dies.
 ///
 /// `routing` maps live watch IDs to range indexes. It is the source of truth for which watches
-/// are healthy: a compacted watch is removed before its range is reseeded and re-added, so
-/// stream-wide progress notifications cannot advance a range whose watch is dead.
+/// are healthy: a compacted or refused watch is removed before its range is reseeded and re-added,
+/// so stream-wide progress notifications cannot advance a range whose watch is dead.
 async fn watch_generation(shared: &Shared, mut stream: WatchStream, mut routing: HashMap<WatchId, usize>) {
-    while let Some(first) = stream.next().await {
+    // Retries of refused ranges as (due, range index), and each range's delay for its next retry.
+    let mut retries = BTreeSet::new();
+    let mut delays = vec![RETRY_DELAY; shared.ranges.len()];
+
+    loop {
+        // Checked on every pass, not only on timeout: the timeout below never fires while the
+        // stream always has an item ready.
+        while let Some(&(due, index)) = retries.first()
+            && due <= tokio::time::Instant::now()
+        {
+            retries.pop_first();
+            match seed_range(shared, index).await {
+                Ok(header) => rewatch(shared, &mut routing, index, header),
+                Err(_) => schedule_retry(&mut retries, &mut delays, index),
+            }
+        }
+
+        let next = match retries.first() {
+            Some(&(due, _)) => match tokio::time::timeout_at(due, stream.next()).await {
+                Ok(next) => next,
+                Err(_) => continue,
+            },
+            None => stream.next().await,
+        };
+        let Some(first) = next else { return };
+
         // Drain everything already available so all events of one watch response -- typically one
         // revision, e.g. a multi-key transaction -- are applied under a single lock. A reader can
         // then never observe a prefix of a revision's events under that revision's header.
@@ -125,15 +153,11 @@ async fn watch_generation(shared: &Shared, mut stream: WatchStream, mut routing:
             // missed events is impossible, so take a fresh snapshot and watch from there. The
             // range keeps serving its stale-but-honest snapshot until the swap.
             let header = seed_range_until_success(shared, index).await;
-            let new_id = {
-                let progress = shared.progress.lock().unwrap();
-                progress
-                    .sender
-                    .as_ref()
-                    .expect("sender is installed for the duration of the generation")
-                    .add(shared.ranges[index].watch(next_revision(header.revision())))
-            };
-            routing.insert(new_id, index);
+            rewatch(shared, &mut routing, index, header);
+        }
+
+        for index in outcome.refused {
+            schedule_retry(&mut retries, &mut delays, index);
         }
 
         if outcome.fatal {
@@ -142,11 +166,32 @@ async fn watch_generation(shared: &Shared, mut stream: WatchStream, mut routing:
     }
 }
 
+/// Schedule a retry of refused range `index` after its delay, doubling the delay for the next one.
+fn schedule_retry(retries: &mut BTreeSet<(tokio::time::Instant, usize)>, delays: &mut [Duration], index: usize) {
+    retries.insert((tokio::time::Instant::now() + delays[index], index));
+    delays[index] = (delays[index] * 2).min(MAX_REFUSAL_DELAY);
+}
+
+/// Watch range `index` from just past `header`'s revision on the generation's stream.
+fn rewatch(shared: &Shared, routing: &mut HashMap<WatchId, usize>, index: usize, header: ResponseHeader) {
+    let progress = shared.progress.lock().unwrap();
+    let sender = progress
+        .sender
+        .as_ref()
+        .expect("sender is installed for the duration of the generation");
+    routing.insert(
+        sender.add(shared.ranges[index].watch(next_revision(header.revision()))),
+        index,
+    );
+}
+
 /// The result of applying one batch of stream items.
 #[derive(Default)]
 struct BatchOutcome {
     /// Ranges whose watches were compacted and need a reseed + re-add.
     compacted: Vec<usize>,
+    /// Ranges whose watches the server refused; they are unseeded and need a later reseed + re-add.
+    refused: Vec<usize>,
     /// A stream-wide progress notification arrived; the read path's progress-request debounce
     /// should reset so the next gated read may request again immediately.
     stream_progressed: bool,
@@ -201,8 +246,12 @@ fn apply_batch(
                     // revision. etcd responds to manual progress requests with watch ID -1, which
                     // etcdrs surfaces as-is (only 0 maps to `None`), so treat both the same.
                     _ => {
-                        for &index in routing.values() {
-                            advance_header(&mut state[index], header);
+                        // Only the watches the generation started with, IDs 1..=N: etcd may have
+                        // answered this request before a watch added since then existed.
+                        for (&id, &index) in routing.iter() {
+                            if id.get() <= shared.ranges.len() as i64 {
+                                advance_header(&mut state[index], header);
+                            }
                         }
                         outcome.stream_progressed = true;
                     }
@@ -214,6 +263,16 @@ fn apply_batch(
                     && let Some(index) = routing.remove(&id)
                 {
                     outcome.compacted.push(index);
+                }
+                continue;
+            }
+            Err(error) if error.kind() == WatchErrorKind::Canceled => {
+                // The cache never cancels its watches, so the server refused to create this one.
+                if let Some(id) = error.watch_id()
+                    && let Some(index) = routing.remove(&id)
+                {
+                    state[index] = RangeState::default();
+                    outcome.refused.push(index);
                 }
                 continue;
             }
@@ -252,4 +311,60 @@ fn next_revision(revision: Revision) -> Revision {
         .checked_add(1)
         .and_then(Revision::new)
         .expect("store revision overflowed i64")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicI64;
+
+    use etcdrs::client::{WatchEvent, WatchId};
+    use etcdrs::{Client, Prefix};
+    use etcdrs_test::{EtcdServer, etcd_server};
+    use rstest::rstest;
+
+    use super::super::range_spec::RangeSpec;
+    use super::super::{ProgressControl, RangeState, Shared};
+    use super::apply_batch;
+
+    /// A stream-wide progress reply can arrive after a watch is re-added but have been computed
+    /// before etcd created it, so it must not advance that watch's range. It used to, which labeled
+    /// the range's fresh snapshot as current before its watch had replayed anything.
+    #[rstest]
+    #[tokio::test]
+    async fn stream_wide_progress_skips_watches_added_during_the_generation(etcd_server: EtcdServer) {
+        let client = Client::new(&etcd_server.connect_string()).unwrap();
+        let seeded = *client.put("k").value("1").await.unwrap().header();
+        let later = *client.put("k").value("2").await.unwrap().header();
+        let shared = Shared {
+            client,
+            ranges: vec![RangeSpec::from_range(Prefix("a/")), RangeSpec::from_range(Prefix("b/"))],
+            state: Mutex::new(vec![
+                RangeState {
+                    store: Default::default(),
+                    header: Some(seeded),
+                },
+                RangeState {
+                    store: Default::default(),
+                    header: Some(seeded),
+                },
+            ]),
+            last_known: AtomicI64::new(0),
+            progress: Mutex::new(ProgressControl::default()),
+        };
+        // Range 0 keeps the generation's first watch; range 1's watch was re-added as watch 3.
+        let mut routing = HashMap::from([(WatchId::new(1).unwrap(), 0), (WatchId::new(3).unwrap(), 1)]);
+
+        let progress = WatchEvent::Progress {
+            header: later,
+            watch_id: WatchId::new(-1),
+            revision: later.revision(),
+        };
+        apply_batch(&shared, &mut routing, vec![Ok(progress)]);
+
+        let state = shared.state.lock().unwrap();
+        assert_eq!(state[0].header, Some(later));
+        assert_eq!(state[1].header, Some(seeded));
+    }
 }
