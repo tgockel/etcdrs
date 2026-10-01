@@ -262,6 +262,37 @@ async fn ranges_over_no_keys_under_auth(etcd_server: EtcdServer) {
     root.auth_disable().await.unwrap();
 }
 
+/// The empty prefix is every key, so a permission over it is the permission over `..`. It used to
+/// be sent from the empty key, which etcd refuses to grant.
+#[rstest]
+#[tokio::test]
+async fn empty_prefix_permission_covers_every_key(etcd_server: EtcdServer) {
+    assert_eq!(Permission::read(Prefix("")), Permission::read(..));
+    assert_eq!(Permission::read(Prefix("")).target_range(), TargetRange::All);
+
+    let root = enable_auth_with_reader(&etcd_server).await;
+    root.role_grant_permission("reader", Permission::read(Prefix("")))
+        .await
+        .unwrap();
+    let eve = client_with_credentials(&etcd_server, "eve", "evepw");
+    let record = eve.get("secret/x").await.unwrap().into_record().unwrap();
+    assert_eq!(record.value(), &b"hidden"[..]);
+
+    root.role_revoke_permission("reader", ""..).await.unwrap();
+    let role = root.role_get("reader").await.unwrap();
+    assert_eq!(role.permissions(), [Permission::read(Prefix("pub/"))]);
+
+    // The single key `""` is no key at all.
+    let err = root
+        .role_grant_permission("reader", Permission::read(""))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), etcdrs::RoleErrorKind::InvalidAuthManagement);
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
 /// A permission failure is an answer, not a transient fault: etcd settles the token and identifies
 /// the user before it can reach a permission decision, so re-authenticating hands back a token for
 /// the same user with the same roles and the same denial. The client used to treat every

@@ -1,7 +1,5 @@
 use std::{sync::Arc, time::Duration};
 
-use bytes::Bytes;
-
 use crate::{
     Client, ClusterResponseHeader, GetError, GetErrorKind, KeyWithMetadata, LeaseId, Record, ResponseHeader,
     client::{
@@ -33,11 +31,6 @@ async fn fetch_first_list_batch(
     client: Client,
     mut request: etcdserverpb::RangeRequest,
 ) -> Result<(ResponseHeader, Vec<mvccpb::KeyValue>, Option<ListContinuation>), GetError> {
-    if request.key.is_empty() && request.range_end.is_empty() {
-        request.key = Bytes::from_static(&[0]);
-        request.range_end = Bytes::from_static(&[0]);
-    }
-
     let resp = client
         .inner
         .wrap_unary_call(

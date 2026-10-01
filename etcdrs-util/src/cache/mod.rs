@@ -222,6 +222,7 @@ impl CacheClientBuilder {
     /// Add a key, range, or prefix whose contents should live in the cache.
     ///
     /// Overlapping ranges are allowed but each maintains an independent copy of the overlap.
+    /// etcd has no empty key, so `cache("")` caches no keys, while `cache(..)` caches every key.
     pub fn cache(mut self, range: impl AsRange) -> Self {
         self.ranges.push(RangeSpec::from_range(range));
         self

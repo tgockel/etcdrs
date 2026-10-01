@@ -88,6 +88,7 @@ impl Default for List<(), Record> {
             request: etcdserverpb::RangeRequest::default(),
             _return: marker::PhantomData,
         }
+        .range(..)
     }
 }
 
@@ -483,6 +484,15 @@ mod test {
 
     use super::*;
     use crate::client::RequestCounter;
+
+    /// A default list is every key, as [`List::range`] says. It used to be the empty key, which only the list driver
+    /// turned into every key, so counting it failed.
+    #[test]
+    fn default_lists_every_key() {
+        assert_eq!(List::default().target_range(), TargetRange::All);
+        assert_eq!(List::default().keys_only().target_range(), TargetRange::All);
+        assert_eq!(List::default().count_only().target_range(), TargetRange::All);
+    }
 
     /// A failed continuation page is reported once and ends the scan.
     ///

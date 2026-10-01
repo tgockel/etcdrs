@@ -28,6 +28,10 @@ impl RangeSpec {
         let (lower, upper) = range.as_boundaries();
         match TargetRange::from_wire(&lower, &upper) {
             TargetRange::All => RangeSpec::All,
+            // etcd refuses to list the key `""`, so seeding it would retry forever and block every
+            // later range. Cache an empty span instead, spelled out because etcdrs 0.1.1, which this
+            // crate still accepts, encodes `..=""` as every key.
+            TargetRange::Single([]) => RangeSpec::Span(Bytes::from_static(b"\0\0"), Bytes::from_static(b"\0\0")),
             TargetRange::Single(_) => RangeSpec::Single(lower),
             TargetRange::ToEnd(_) => RangeSpec::From(lower),
             TargetRange::Span(..) => RangeSpec::Span(lower, upper),
@@ -49,7 +53,8 @@ impl RangeSpec {
     /// Whether `key` falls within this range.
     pub(crate) fn contains_key(&self, key: &[u8]) -> bool {
         match self {
-            RangeSpec::All => true,
+            // etcd has no empty key, so a get of it must reach etcd to be refused.
+            RangeSpec::All => !key.is_empty(),
             RangeSpec::Single(single) => key == single,
             RangeSpec::Span(lower, upper) => key >= lower.as_ref() && key < upper.as_ref(),
             RangeSpec::From(lower) => key >= lower.as_ref(),
@@ -159,6 +164,27 @@ mod tests {
         assert_eq!(spec("a".."b"), RangeSpec::Span(bytes("a"), bytes("b")));
         assert_eq!(spec("a"..), RangeSpec::From(bytes("a")));
         assert_eq!(spec(Prefix("foo/")), RangeSpec::Span(bytes("foo/"), bytes("foo0")));
+    }
+
+    /// A range from `""` used to start at the empty key, which etcd refuses to list, so it could
+    /// never be seeded.
+    #[test]
+    fn ranges_from_the_empty_key_start_at_the_first_key() {
+        assert_eq!(spec(Prefix("")), RangeSpec::All);
+        assert_eq!(spec(""..), RangeSpec::All);
+        assert_eq!(spec("".."b"), RangeSpec::Span(bytes("\0"), bytes("b")));
+        assert!(spec(..).contains_span(&spec("".."b")));
+    }
+
+    /// etcd has no empty key, so `""` is cached as a range of no keys, and no range holds it.
+    #[test]
+    fn empty_key_is_no_key() {
+        let empty = spec("");
+        for key in [&b""[..], b"\0", b"foo"] {
+            assert!(!empty.contains_key(key), "{key:?}");
+        }
+        assert_eq!(empty.seed_list().target_range(), TargetRange::Span(b"\0\0", b"\0\0"));
+        assert!(!spec(..).contains_key(b""));
     }
 
     #[test]

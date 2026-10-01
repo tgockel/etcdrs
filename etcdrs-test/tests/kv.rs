@@ -1,6 +1,6 @@
 use std::{fmt::Debug, sync::Arc, time::Duration};
 
-use etcdrs::{AsRange, CompactErrorKind, Revision, Version, WatchErrorKind};
+use etcdrs::{AsRange, CompactErrorKind, OperationError, Prefix, Revision, Version, WatchErrorKind, client::List};
 use etcdrs_test::{EtcdCluster, EtcdServer, etcd_cluster, etcd_server};
 use futures::StreamExt;
 use rstest::rstest;
@@ -191,6 +191,108 @@ async fn upper_bound_below_every_key_addresses_no_keys(etcd_server: EtcdServer) 
     assert_addresses_no_keys(&client, "a".."").await;
     assert_addresses_no_keys(&client, "a".."\0").await;
     assert_eq!(client.list(..).count_only().await.unwrap().count(), 3);
+}
+
+/// Helper: assert that `range` lists and counts exactly the `expected` keys.
+async fn assert_lists(client: &etcdrs::Client, range: impl AsRange + Clone + Debug, expected: &[&str]) {
+    // One key per page, so every page after the first starts just past the key that ended the
+    // one before.
+    let listed = client
+        .list(range.clone())
+        .keys_only()
+        .limit(1)
+        .await
+        .unwrap()
+        .into_stream()
+        .map(|key| key.unwrap().key().clone())
+        .collect::<Vec<_>>()
+        .await;
+    assert_eq!(listed, expected, "{range:?} listed the wrong keys");
+    let counted = client.list(range.clone()).count_only().await.unwrap().count();
+    assert_eq!(counted, expected.len(), "{range:?} counted the wrong keys");
+}
+
+/// Helper: assert that etcd refused `result` for naming the empty key.
+#[track_caller]
+fn assert_key_not_provided<T>(result: Result<T, impl OperationError>) {
+    let Err(err) = result else {
+        panic!("a request for the empty key succeeded");
+    };
+    assert_eq!(
+        err.grpc_status().map(|s| s.message()),
+        Some("etcdserver: key is not provided"),
+        "{err:?}"
+    );
+}
+
+/// etcd has no empty key, so a range from `""` starts at the first key, `"\0"`, and the empty
+/// prefix is every key. Each of these used to be sent from the empty key, which etcd refuses.
+#[rstest]
+#[tokio::test]
+async fn ranges_from_the_empty_key_start_at_the_first_key(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+    let keys = ["\0", "a", "b"];
+    for key in keys {
+        client.put(key).value(key).await.unwrap();
+    }
+
+    assert_lists(&client, Prefix(""), &keys).await;
+    assert_lists(&client, "".., &keys).await;
+    assert_lists(&client, "".."b", &["\0", "a"]).await;
+    assert_lists(&client, ""..="a", &["\0", "a"]).await;
+
+    assert_eq!(client.delete_range("".."b").await.unwrap().deleted(), 2);
+    assert_eq!(client.delete_range(""..).await.unwrap().deleted(), 1);
+    for key in keys {
+        client.put(key).value(key).await.unwrap();
+    }
+    assert_eq!(client.delete_prefix("").await.unwrap().deleted(), keys.len());
+}
+
+/// A default `List` is every key, as `List::range` says. It used to be the empty key, which only
+/// the list driver turned into every key, so counting it failed.
+#[rstest]
+#[tokio::test]
+async fn default_list_addresses_every_key(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+    for key in ["\0", "a", "b"] {
+        client.put(key).value(key).await.unwrap();
+    }
+
+    let listed = List::default()
+        .with_client(client.clone())
+        .keys_only()
+        .await
+        .unwrap()
+        .into_stream()
+        .map(|key| key.unwrap().key().clone())
+        .collect::<Vec<_>>()
+        .await;
+    assert_eq!(listed, ["\0", "a", "b"]);
+    let counted = List::default()
+        .with_client(client.clone())
+        .count_only()
+        .await
+        .unwrap()
+        .count();
+    assert_eq!(counted, 3);
+}
+
+/// etcd has no empty key and refuses every request for one. Listing it used to list every key
+/// instead, because the list driver turned the empty key into the whole keyspace.
+#[rstest]
+#[tokio::test]
+async fn the_empty_key_is_refused(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+    client.put("a").value("a").await.unwrap();
+
+    assert_key_not_provided(client.get("").await);
+    assert_key_not_provided(client.list("").await);
+    assert_key_not_provided(client.list("").keys_only().await);
+    assert_key_not_provided(client.list("").count_only().await);
+    assert_key_not_provided(client.delete("").await);
+    assert_key_not_provided(client.delete_range("").await);
+    assert_eq!(client.list(..).count_only().await.unwrap().count(), 1);
 }
 
 #[rstest]

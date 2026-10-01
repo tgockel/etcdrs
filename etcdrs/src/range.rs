@@ -34,12 +34,13 @@ pub trait AsRange: private::Sealed {
 
 fn specify_boundaries(start_bound: Bound<&[u8]>, end_bound: Bound<&[u8]>) -> (Bytes, Bytes) {
     let lower = match start_bound {
+        // etcd refuses an empty `key`, so a range from `""` starts at the first key.
+        Bound::Included([]) | Bound::Unbounded => Bytes::from_static(&[0]),
         Bound::Included(val) => Bytes::copy_from_slice(val.as_key()),
         Bound::Excluded(val) => successor(val.as_key()).into(),
-        Bound::Unbounded => Bytes::from_static(&[0]),
     };
     match end_bound {
-        // etcd has no empty key, so these address no key. Neither `("", "")` nor `([0], [0])` is an empty span.
+        // etcd has no empty key, so these address no key. `([0], [0])` is every key, not an empty span.
         Bound::Included([]) | Bound::Excluded([] | [0]) => {
             let lower = lower.max(Bytes::from_static(&[0, 0]));
             (lower.clone(), lower)
@@ -93,10 +94,11 @@ pub struct Prefix<T: ?Sized>(pub T);
 impl<T: AsKey + ?Sized> private::Sealed for Prefix<T> {}
 impl<T: AsKey + ?Sized> AsRange for Prefix<T> {
     fn as_boundaries(&self) -> (Bytes, Bytes) {
-        (
-            Bytes::copy_from_slice(self.0.as_key()),
-            prefix_end(self.0.as_key()).into(),
-        )
+        match self.0.as_key() {
+            // Every key starts with `""`, but etcd refuses a range that starts there.
+            [] => (..).as_boundaries(),
+            prefix => (Bytes::copy_from_slice(prefix), prefix_end(prefix).into()),
+        }
     }
 }
 
@@ -166,7 +168,7 @@ pub(crate) fn successor(input: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AsRange, TargetRange, prefix_end};
+    use super::{AsRange, Prefix, TargetRange, prefix_end};
 
     #[track_caller]
     fn assert_wire(range: impl AsRange, expected: TargetRange<'_>) {
@@ -202,6 +204,16 @@ mod tests {
         assert_wire("a"..="", TargetRange::Span(b"a", b"a"));
         assert_wire("a".."", TargetRange::Span(b"a", b"a"));
         assert_wire("a".."\0", TargetRange::Span(b"a", b"a"));
+    }
+
+    /// The single key `""` is sent as it is, for etcd to refuse.
+    #[test]
+    fn empty_lower_bound_starts_at_the_first_key() {
+        assert_wire("".., TargetRange::All);
+        assert_wire(Prefix(""), TargetRange::All);
+        assert_wire("".."b", TargetRange::Span(b"\0", b"b"));
+        assert_wire(""..="b", TargetRange::Span(b"\0", b"b\0"));
+        assert_wire("", TargetRange::Single(b""));
     }
 
     #[test]

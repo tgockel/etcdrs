@@ -63,7 +63,8 @@ impl Client {
 
     /// Delete all keys matching the given `prefix`.
     ///
-    /// This is the same as calling [`delete_range`][Self::delete_range] with a [`Prefix`] query.
+    /// This is the same as calling [`delete_range`][Self::delete_range] with a [`Prefix`] query. An empty prefix
+    /// deletes every key.
     ///
     /// ```no_run
     /// # async {

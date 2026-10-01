@@ -491,3 +491,82 @@ async fn refused_range_is_retried_without_stopping_others(etcd_server: EtcdServe
     let before = metrics.get().requested();
     eventually(async || (metrics.get().requested() > before).then_some(())).await;
 }
+
+/// The empty prefix is every key. It used to be listed from the empty key, which etcd refuses, so
+/// the range never seeded. Ranges seed in order before the watch starts, so neither did any range
+/// configured after it, and nothing was watched.
+#[rstest]
+#[tokio::test]
+async fn empty_prefix_caches_every_key(etcd_server: EtcdServer) {
+    let external = Client::new(&etcd_server.connect_string()).unwrap();
+    external.put("\0").value("first").await.unwrap();
+    external.put("foo/a").value("v1").await.unwrap();
+
+    let (client, metrics) = counting_client(&etcd_server);
+    let cache = CacheClient::builder(client)
+        .cache_prefix("")
+        .cache(Prefix("foo/"))
+        .build();
+    eventually_cached(&cache, &metrics, "\0", Some(b"first")).await;
+    // A get is served by the first range that holds its key, so only `coherent_revision` shows
+    // the second one seeded.
+    eventually(async || cache.coherent_revision(Prefix("foo/")).map(|_| ())).await;
+    assert!(cache.coherent_revision(..).is_some());
+    assert!(cache.coherent_revision(""..).is_some());
+
+    external.put("new").value("n1").await.unwrap();
+    eventually_cached(&cache, &metrics, "new", Some(b"n1")).await;
+
+    let count = eventually(async || {
+        let before = metrics.get().requested();
+        let count = cache.list_prefix("").count_only().await.unwrap().count();
+        (metrics.get().requested() == before).then_some(count)
+    })
+    .await;
+    assert_eq!(count, 3);
+}
+
+/// etcd has no empty key, so no cached range holds it, and a get of it reaches etcd to be refused
+/// as it would be without the cache. A range of every key used to answer it from the cache as an
+/// absent key.
+#[rstest]
+#[tokio::test]
+async fn empty_key_get_passes_through(etcd_server: EtcdServer) {
+    let external = Client::new(&etcd_server.connect_string()).unwrap();
+    external.put("a").value("v1").await.unwrap();
+
+    let (client, metrics) = counting_client(&etcd_server);
+    let cache = CacheClient::builder(client).cache(..).build();
+    eventually_cached(&cache, &metrics, "a", Some(b"v1")).await;
+
+    let err = cache.get("").await.unwrap_err();
+    assert_eq!(
+        err.grpc_status().map(|s| s.message()),
+        Some("etcdserver: key is not provided"),
+        "{err:?}"
+    );
+}
+
+/// etcd has no empty key, so caching it caches no keys. Its range used to be seeded with every key
+/// and watched only at `"\0"`. Seeding it now would list the empty key, which etcd refuses, so it
+/// would never seed, and neither would any range configured after it.
+#[rstest]
+#[tokio::test]
+async fn empty_key_caches_no_keys(etcd_server: EtcdServer) {
+    let external = Client::new(&etcd_server.connect_string()).unwrap();
+    external.put("foo/a").value("v1").await.unwrap();
+
+    let (client, metrics) = counting_client(&etcd_server);
+    let cache = CacheClient::builder(client).cache("").cache(Prefix("foo/")).build();
+    eventually_cached(&cache, &metrics, "foo/a", Some(b"v1")).await;
+
+    let err = cache.get("").await.unwrap_err();
+    assert_eq!(
+        err.grpc_status().map(|s| s.message()),
+        Some("etcdserver: key is not provided"),
+        "{err:?}"
+    );
+
+    external.put("foo/a").value("v2").await.unwrap();
+    eventually_cached(&cache, &metrics, "foo/a", Some(b"v2")).await;
+}
