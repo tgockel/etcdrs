@@ -1,6 +1,6 @@
 //! Utilities for running an etcd server.
 
-use std::{borrow::Cow, collections::HashMap, env, ffi, io, net, path, process};
+use std::{borrow::Cow, collections::HashMap, env, ffi, io, net, path, process, sync::Arc};
 
 #[cfg(feature = "rstest")]
 pub(crate) mod fixtures;
@@ -118,23 +118,37 @@ pub struct EtcdServerConfig {
     cluster_token: Option<String>,
     initial_cluster: Option<String>,
     cluster_state: Option<ClusterState>,
+    /// While open, these keep the OS from giving out `client_port` and `peer_port` as free ports.
+    _reserved_ports: Option<Arc<[socket2::Socket; 2]>>,
 }
 
 impl EtcdServerConfig {
     /// Create a configuration that uses random ports and a generated temporary directory.
     ///
     /// This is the quickest way to create an empty etcd server.
+    ///
+    /// On Linux, both ports stay bound, without listening, until this config, its clones and the servers built from
+    /// them are all dropped. Until then, the OS does not give them out as free ports, even while etcd is stopped, and
+    /// etcd can still bind them. Where the OS would not let etcd bind a port held this way, as on macOS and Windows,
+    /// the ports are released before this returns, so something else can take one before etcd binds it.
     pub fn new_single_temporary() -> Self {
         let name = ServerName::generate();
         let working_dir = env::temp_dir().join(&name.0);
+        // Both sockets are open at once, so the ports differ.
+        let (client, client_port) = reserve_tcp_port().unwrap();
+        let (peer, peer_port) = reserve_tcp_port().unwrap();
+        // etcd's listeners set SO_REUSEADDR exactly where std's do, so this binds where etcd could.
+        let etcd_can_bind = |port| net::TcpListener::bind((net::Ipv4Addr::LOCALHOST, port)).is_ok();
+        let reserved_ports = (etcd_can_bind(client_port) && etcd_can_bind(peer_port)).then(|| Arc::new([client, peer]));
         Self {
             name,
             working_dir,
-            client_port: get_random_unused_tcp_port().unwrap(),
-            peer_port: get_random_unused_tcp_port().unwrap(),
+            client_port,
+            peer_port,
             cluster_token: None,
             initial_cluster: None,
             cluster_state: None,
+            _reserved_ports: reserved_ports,
         }
     }
 
@@ -285,10 +299,15 @@ fn get_random_name(length: usize) -> String {
         .collect()
 }
 
-/// Get an OS-assigned random TCP port.
-fn get_random_unused_tcp_port() -> io::Result<u16> {
-    let listener = net::TcpListener::bind("127.0.0.1:0")?;
-    listener.local_addr().map(|a| a.port())
+/// Bind a socket to an OS-assigned TCP port on 127.0.0.1, without listening on it.
+fn reserve_tcp_port() -> io::Result<(socket2::Socket, u16)> {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+    socket.bind(&net::SocketAddr::from((net::Ipv4Addr::LOCALHOST, 0)).into())?;
+    // Set only after the bind, so the OS picks a port that no other socket holds, whatever SO_REUSEADDR means on this
+    // OS. On Linux, a listener that also sets it, as etcd's does, can then bind the port while this socket holds it.
+    socket.set_reuse_address(true)?;
+    let port = socket.local_addr()?.as_socket().unwrap().port();
+    Ok((socket, port))
 }
 
 /// Get the path to `etcd`.
@@ -418,5 +437,28 @@ mod tests {
             members.sort_unstable();
             assert_eq!(members, expected);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn temporary_ports_differ_and_stay_reserved_for_etcd() {
+        let config = EtcdServerConfig::new_single_temporary();
+        assert_ne!(config.client_port, config.peer_port);
+        for port in [config.client_port, config.peer_port] {
+            let address = net::SocketAddr::from((net::Ipv4Addr::LOCALHOST, port));
+            let plain = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            let error = plain.bind(&address.into()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AddrInUse, "port {port}: {error}");
+            net::TcpListener::bind(address).unwrap();
+        }
+    }
+
+    #[test]
+    fn public_types_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<EtcdServerConfig>();
+        assert_send_sync::<EtcdServer>();
+        assert_send_sync::<EtcdClusterConfig>();
+        assert_send_sync::<EtcdCluster>();
     }
 }
