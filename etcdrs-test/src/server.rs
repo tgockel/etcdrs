@@ -2,6 +2,9 @@
 
 use std::{borrow::Cow, collections::HashMap, env, ffi, io, net, path, process};
 
+#[cfg(feature = "rstest")]
+pub(crate) mod fixtures;
+
 /// A single instance of an etcd server.
 pub struct EtcdServer {
     config: EtcdServerConfig,
@@ -22,6 +25,9 @@ impl EtcdServer {
     ///
     /// The first call creates the data directory, and fails with [`io::ErrorKind::AlreadyExists`] if it already
     /// exists. Later calls reuse it, so data persists across [`stop`][`EtcdServer::stop`].
+    ///
+    /// This returns once etcd is spawned, without waiting for it to bind its ports, so etcd can still exit right
+    /// after, for example when one of them is taken.
     pub fn start(&mut self) -> io::Result<()> {
         if self.runner.is_some() {
             return Err(io::Error::other(

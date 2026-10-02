@@ -11,6 +11,10 @@ With the `rstest` feature enabled, this crate provides two fixtures:
 - `etcd_cluster` -- a multi-node [`EtcdCluster`] (3 peers by default) for testing replication and
   failover.
 
+Both fixtures return once a linearizable member list names exactly the servers they started. If one
+of those etcd processes exits first, for example because another process took one of its ports, the
+fixture starts over with new ports and names, up to three attempts in all.
+
 ```rust,ignore
 use etcdrs_test::{etcd_server, EtcdServer};
 use rstest::rstest;
