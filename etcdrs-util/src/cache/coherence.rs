@@ -29,9 +29,7 @@ pub(crate) async fn run(shared: Arc<Shared>) {
     loop {
         seed_unseeded_ranges(&shared).await;
 
-        // Every range must be passed as an initial spec: requests sent through `Watcher::add`
-        // before the stream's first poll are silently dropped, and only initial specs are re-sent
-        // when establishment retries. Initial specs are assigned watch IDs 1..=N in order.
+        // Initial specs are assigned watch IDs 1..=N in order.
         let mut builder = shared.client.watch();
         {
             let state = shared.state.lock().unwrap();

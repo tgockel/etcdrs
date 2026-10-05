@@ -7,7 +7,7 @@ use std::{
     ops::{Deref, DerefMut},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicI64, Ordering},
     },
     task::{Context, Poll},
@@ -377,51 +377,41 @@ impl WatchBuilder<Client> {
     ///
     /// The gRPC stream is established lazily on the first poll of the returned [`Watcher`]. All
     /// targets accumulated through the builder are sent as `WatchCreateRequest` messages at that
-    /// time. Successful creation confirmations are consumed internally by the stream; a refusal is
-    /// yielded as an error (see [`Watcher::add`]).
+    /// time, followed by any requests already made through the [`Watcher`]. Successful creation
+    /// confirmations are consumed internally by the stream; a refusal is yielded as an error (see
+    /// [`Watcher::add`]).
     ///
     /// The builder may have zero targets — the resulting [`Watcher`] simply waits for watches to
     /// be added via [`Watcher::add`].
     ///
-    /// Because the watch is not active until the stream is first polled, events that occur between
+    /// Because a watch is not active until the stream is first polled, events that occur between
     /// calling `start` and the first poll may be missed. Use
     /// [`start_revision`][Watch::start_revision] to watch from a known point in history if you need
     /// to guarantee delivery.
     pub(crate) fn start_client_watch(self) -> Watcher {
         let channel = self.client.inner.channel.clone();
-        let next_id = Arc::new(AtomicI64::new(1));
-
-        // Assign IDs to initial specs (stable across connection retries).
-        let initial_specs: Vec<etcdserverpb::WatchRequest> = self
-            .specs
-            .into_iter()
-            .map(|mut spec| {
-                spec.watch_id = next_id.fetch_add(1, Ordering::Relaxed);
-                etcdserverpb::WatchRequest {
-                    request_union: Some(PbRequestUnion::CreateRequest(spec)),
-                }
-            })
-            .collect();
-
-        // The shared sender lives behind an Arc<Mutex<>> so the stream can swap it on retry while
-        // WatchSender continues to reference the same Arc.
-        let shared_sender: Arc<
-            std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<etcdserverpb::WatchRequest>>>,
-        > = Arc::new(std::sync::Mutex::new(None));
-        let shared_sender_for_stream = shared_sender.clone();
+        let requests = Arc::new(std::sync::Mutex::new(Requests {
+            attempt: None,
+            replay: Some(Vec::new()),
+        }));
+        let sender = WatchSender {
+            requests: Arc::downgrade(&requests),
+            next_id: AtomicI64::new(1),
+        };
+        // Watches given to the builder are numbered 1..=N, in order.
+        for spec in self.specs {
+            sender.add(Watch {
+                watcher: (),
+                current: spec,
+            });
+        }
 
         let inner = async_stream::stream! {
             // Establish the gRPC stream, retrying on Unavailable (the server may not be reachable
             // yet when the channel was created with `connect_lazy`).
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let (mut response_stream, unanswered_creates) = loop {
-                let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-                for req in &initial_specs {
-                    let _ = sender.send(req.clone());
-                }
-                // Install this sender so WatchSender.add/cancel/progress reach the gRPC stream.
-                *shared_sender_for_stream.lock().unwrap() = Some(sender);
-
+                let receiver = requests.lock().unwrap().new_attempt();
                 let unanswered_creates = Arc::new(std::sync::Mutex::new(VecDeque::new()));
                 let request_stream = ReceiverStream {
                     inner: receiver,
@@ -429,7 +419,10 @@ impl WatchBuilder<Client> {
                 };
                 let mut watch_client = etcdserverpb::watch_client::WatchClient::new(channel.clone());
                 match watch_client.watch(request_stream).await {
-                    Ok(resp) => break (resp.into_inner(), unanswered_creates),
+                    Ok(resp) => {
+                        requests.lock().unwrap().replay = None;
+                        break (resp.into_inner(), unanswered_creates);
+                    }
                     Err(status)
                         if status.code() == tonic::Code::Unavailable
                             && std::time::Instant::now() <= deadline =>
@@ -437,6 +430,9 @@ impl WatchBuilder<Client> {
                         continue;
                     }
                     Err(status) => {
+                        // A consumer may stop polling at this error, so drop `requests` now rather
+                        // than at the return.
+                        drop(requests);
                         yield Err(WatchError::from_status(status));
                         return;
                     }
@@ -468,10 +464,7 @@ impl WatchBuilder<Client> {
         };
 
         Watcher {
-            sender: WatchSender {
-                sender: shared_sender,
-                next_id,
-            },
+            sender,
             stream: WatchStream { inner: Box::new(inner) },
         }
     }
@@ -516,6 +509,10 @@ impl<C: crate::driver::WatchDriver> Watch<WatchBuilder<C>> {
 ///
 /// Use [`into_parts`][Self::into_parts] to split the watcher when you need to send control messages
 /// concurrently with consuming the stream (e.g. from separate tasks).
+///
+/// Control messages sent before the stream is first polled are sent once it is established. A watch
+/// starts when etcd receives its request, so set [`start_revision`][Watch::start_revision] on a
+/// watch that must not miss earlier events.
 ///
 /// ## Cleanup
 ///
@@ -619,14 +616,15 @@ impl std::async_iter::AsyncIterator for Watcher {
 /// Because the server processes these asynchronously, there is a window between calling a control
 /// method and the server acting on it.
 pub struct WatchSender {
-    sender: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<etcdserverpb::WatchRequest>>>>,
-    next_id: Arc<AtomicI64>,
+    /// `Weak`, so that requests sent after the stream is dropped are not kept.
+    requests: Weak<std::sync::Mutex<Requests>>,
+    next_id: AtomicI64,
 }
 
 impl WatchSender {
     fn send(&self, request: etcdserverpb::WatchRequest) {
-        if let Some(sender) = self.sender.lock().unwrap().as_ref() {
-            let _ = sender.send(request);
+        if let Some(requests) = self.requests.upgrade() {
+            requests.lock().unwrap().send(request);
         }
     }
 
@@ -697,6 +695,39 @@ impl std::async_iter::AsyncIterator for WatchStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll_next_impl(cx).map(Result::transpose)
+    }
+}
+
+/// Where a [`WatchSender`] sends requests, shared with the stream.
+///
+/// Each attempt to establish the stream gets its own channel, because the transport of a failed
+/// attempt can keep taking requests from its channel until the server resets the stream.
+struct Requests {
+    /// The current attempt's channel, or `None` before the first attempt.
+    attempt: Option<tokio::sync::mpsc::UnboundedSender<etcdserverpb::WatchRequest>>,
+    /// Every request sent so far, oldest first, until the stream is established. A failed attempt
+    /// loses whatever its transport took, so each attempt's channel starts with all of them.
+    replay: Option<Vec<etcdserverpb::WatchRequest>>,
+}
+
+impl Requests {
+    fn send(&mut self, request: etcdserverpb::WatchRequest) {
+        if let Some(replay) = &mut self.replay {
+            replay.push(request.clone());
+        }
+        if let Some(attempt) = &self.attempt {
+            let _ = attempt.send(request);
+        }
+    }
+
+    /// Start a channel for a new attempt with every request sent so far, and send later ones to it.
+    fn new_attempt(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<etcdserverpb::WatchRequest> {
+        let (attempt, receiver) = tokio::sync::mpsc::unbounded_channel();
+        for request in self.replay.iter().flatten() {
+            let _ = attempt.send(request.clone());
+        }
+        self.attempt = Some(attempt);
+        receiver
     }
 }
 

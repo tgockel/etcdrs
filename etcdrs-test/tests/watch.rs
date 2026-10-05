@@ -343,3 +343,134 @@ async fn watch_refused_beside_live_watch(etcd_server: EtcdServer, #[case] refuse
     assert_eq!(*watch_id, live_id);
     assert_eq!(record.value(), &b"2"[..]);
 }
+
+/// A watch added before the stream's first poll, on a watcher with no other watch. The request used
+/// to be dropped, so `next()` never returned.
+#[rstest]
+#[tokio::test]
+async fn watch_add_before_first_poll(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+
+    client.put("early/add").value("1").await.unwrap();
+    let rev = revision_of(&client, "early/add").await;
+
+    let mut watcher = client.watch().start();
+    let id = watcher.add(Watch::new("early/add").start_revision(rev));
+
+    let events = next_events(&mut watcher, 1).await;
+    let WatchEvent::Put { record, watch_id, .. } = &events[0] else {
+        panic!("expected Put, got {:?}", events[0]);
+    };
+    assert_eq!(*watch_id, id);
+    assert_eq!(record.key(), &b"early/add"[..]);
+}
+
+/// A watch added and canceled before the stream's first poll. Both requests used to be dropped, so
+/// the cancellation never arrived.
+#[rstest]
+#[tokio::test]
+async fn watch_cancel_before_first_poll(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+
+    let mut watcher = client.watch().key("early/keep").start();
+    let canceled_id = watcher.add(Watch::new("early/cancel"));
+    watcher.cancel(canceled_id);
+
+    let error = next_item(&mut watcher).await.expect_err("expected the cancellation");
+    assert_eq!(error.kind(), WatchErrorKind::Canceled);
+    assert_eq!(error.watch_id(), Some(canceled_id));
+
+    // etcd answers creates and cancels in the order it receives them, so the first watch exists.
+    client.put("early/keep").value("1").await.unwrap();
+    let events = next_events(&mut watcher, 1).await;
+    let WatchEvent::Put { record, .. } = &events[0] else {
+        panic!("expected Put, got {:?}", events[0]);
+    };
+    assert_eq!(record.key(), &b"early/keep"[..]);
+}
+
+/// A progress request before the stream's first poll. It used to be dropped, so no progress
+/// notification arrived.
+#[rstest]
+#[tokio::test]
+async fn watch_request_progress_before_first_poll(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+
+    client.put("early/progress").value("1").await.unwrap();
+    let rev = revision_of(&client, "early/progress").await;
+
+    // etcd ignores a progress request while any watch on the stream is still catching up, and
+    // answers none on a stream without watches. A watch with no start revision starts caught up.
+    let mut watcher = client.watch().key("early/progress").start();
+    watcher.request_progress();
+
+    let event = next_item(&mut watcher).await.expect("watch stream yielded an error");
+    let WatchEvent::Progress { revision, .. } = event else {
+        panic!("expected Progress, got {event:?}");
+    };
+    assert!(revision >= rev);
+}
+
+/// A watch added through [`into_parts`][etcdrs::client::Watcher::into_parts] before the task that
+/// polls the stream first runs. The request used to be dropped.
+#[rstest]
+#[tokio::test]
+async fn watch_add_from_another_task_before_first_poll(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+
+    client.put("early/task").value("1").await.unwrap();
+    let rev = revision_of(&client, "early/task").await;
+
+    let (sender, mut stream) = client.watch().start().into_parts();
+    let first = tokio::spawn(async move { stream.next().await });
+    // The test runtime has one thread, so the task cannot poll the stream before `add` runs.
+    let id = sender.add(Watch::new("early/task").start_revision(rev));
+
+    let event = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("timed out waiting for watch event")
+        .unwrap()
+        .expect("watch stream ended unexpectedly")
+        .expect("watch stream yielded an error");
+    let WatchEvent::Put { record, watch_id, .. } = &event else {
+        panic!("expected Put, got {event:?}");
+    };
+    assert_eq!(*watch_id, id);
+    assert_eq!(record.key(), &b"early/task"[..]);
+}
+
+/// A watch added while the stream retries connecting. A failed attempt used to take the request
+/// with it, and the next attempt sent only the watches given to the builder.
+#[rstest]
+#[tokio::test]
+async fn watch_add_while_establishing(mut etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+    client.put("early/retry").value("1").await.unwrap();
+    let rev = revision_of(&client, "early/retry").await;
+    etcd_server.stop().unwrap();
+
+    // Every attempt of a client that never connected fails with `Unavailable`, which the stream
+    // retries. On the first client's dead connection, an attempt can fail with `Unknown` instead.
+    let unconnected = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+    let mut watcher = unconnected.watch().start();
+    let pending = tokio::time::timeout(Duration::from_millis(100), watcher.next()).await;
+    assert!(pending.is_err(), "expected nothing while etcd is down, got {pending:?}");
+
+    let id = watcher.add(Watch::new("early/retry").start_revision(rev));
+    // The attempt in flight when `add` ran fails too.
+    let pending = tokio::time::timeout(Duration::from_millis(100), watcher.next()).await;
+    assert!(pending.is_err(), "expected nothing while etcd is down, got {pending:?}");
+
+    etcd_server.start().unwrap();
+    // A restarted etcd takes about a second to elect itself, and longer on a loaded machine.
+    let event = tokio::time::timeout(Duration::from_secs(30), watcher.next())
+        .await
+        .expect("timed out waiting for watch event")
+        .expect("watch stream ended unexpectedly")
+        .expect("watch stream yielded an error");
+    let WatchEvent::Put { record, watch_id, .. } = &event else {
+        panic!("expected Put, got {event:?}");
+    };
+    assert_eq!(*watch_id, id);
+    assert_eq!(record.key(), &b"early/retry"[..]);
+}
