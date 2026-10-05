@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use etcdrs::client::{GetResponse, Put, RequestCounter};
+use etcdrs::client::{ClientBuilder, GetResponse, Put, RequestCounter};
 use etcdrs::{Client, Prefix};
 use etcdrs_test::{EtcdServer, etcd_server};
 use etcdrs_util::cache::CacheClient;
@@ -12,14 +12,38 @@ use rstest::rstest;
 /// traffic (including progress requests) does not pass through the unary metrics hook, so the
 /// counter isolates exactly the request kinds the cache is supposed to save.
 fn counting_client(server: &EtcdServer) -> (Client, Arc<RequestCounter>) {
+    count_requests(Client::builder().add_connection(server.connect_string()).unwrap())
+}
+
+/// [`counting_client`], authenticated as `user`.
+fn counting_client_as(server: &EtcdServer, user: &str, password: &str) -> (Client, Arc<RequestCounter>) {
+    count_requests(
+        Client::builder()
+            .add_connection(server.connect_string())
+            .unwrap()
+            .credentials(user, password),
+    )
+}
+
+fn count_requests(builder: ClientBuilder) -> (Client, Arc<RequestCounter>) {
     let metrics = Arc::new(RequestCounter::default());
-    let client = Client::builder()
+    (builder.metrics(metrics.clone()).build().unwrap(), metrics)
+}
+
+/// Create the root user with the root role, enable authentication, and return a client with root's
+/// credentials, which the caller needs to disable auth again.
+async fn enable_auth(server: &EtcdServer) -> Client {
+    let client = Client::new(&server.connect_string()).unwrap();
+    client.user_add("root").password("rootpw").await.unwrap();
+    client.role_add("root").await.unwrap();
+    client.user_grant_role("root", "root").await.unwrap();
+    client.auth_enable().await.unwrap();
+    Client::builder()
         .add_connection(server.connect_string())
         .unwrap()
-        .metrics(metrics.clone())
+        .credentials("root", "rootpw")
         .build()
-        .unwrap();
-    (client, metrics)
+        .unwrap()
 }
 
 /// Poll `condition` until it returns `Some`, panicking after 30 seconds.
@@ -57,6 +81,19 @@ async fn eventually_cached(
         (served_locally && value_matches).then_some(response)
     })
     .await
+}
+
+/// Read `key` through the cache every 50 ms for 500 ms, asserting every read is served from the
+/// cache with the `expected` value. A range that is seeded only between a re-list and the refusal
+/// of its watch can pass [`eventually_cached`], but not this.
+async fn assert_stays_cached(cache: &CacheClient, metrics: &RequestCounter, key: &str, expected: Option<&[u8]>) {
+    for _ in 0..10 {
+        let before = metrics.get().requested();
+        let response = cache.get(key).await.expect("get failed");
+        assert_eq!(metrics.get().requested(), before, "{key} was read from the server");
+        assert_eq!(response.record().map(|record| record.value().as_ref()), expected);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[rstest]
@@ -569,4 +606,24 @@ async fn empty_key_caches_no_keys(etcd_server: EtcdServer) {
 
     external.put("foo/a").value("v2").await.unwrap();
     eventually_cached(&cache, &metrics, "foo/a", Some(b"v2")).await;
+}
+
+/// The watch used to carry no token, so etcd refused it under auth: the range kept being re-listed,
+/// and nearly every read passed through.
+#[rstest]
+#[tokio::test]
+async fn caches_under_auth(etcd_server: EtcdServer) {
+    let root = enable_auth(&etcd_server).await;
+    root.put("foo/a").value("v1").await.unwrap();
+
+    let (client, metrics) = counting_client_as(&etcd_server, "root", "rootpw");
+    let cache = CacheClient::builder(client).cache(Prefix("foo/")).build();
+    eventually_cached(&cache, &metrics, "foo/a", Some(b"v1")).await;
+
+    root.put("foo/a").value("v2").await.unwrap();
+    eventually_cached(&cache, &metrics, "foo/a", Some(b"v2")).await;
+    assert_stays_cached(&cache, &metrics, "foo/a", Some(b"v2")).await;
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
 }

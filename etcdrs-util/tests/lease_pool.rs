@@ -99,3 +99,44 @@ async fn drop_stops_keepalive(etcd_server: EtcdServer) {
     }
     panic!("key should have expired after dropping the pool");
 }
+
+/// The keep-alive stream used to carry no token, so etcd ended it at its first keep-alive, the pool
+/// reconnected every 100 ms, and its leases expired. Root's tokens are revoked partway as well: a
+/// stream that reconnected with the client's revoked token would not get past etcd either.
+#[rstest]
+#[tokio::test]
+async fn keep_alive_under_auth(etcd_server: EtcdServer) {
+    let setup = Client::new(&etcd_server.connect_string()).unwrap();
+    setup.user_add("root").password("rootpw").await.unwrap();
+    setup.role_add("root").await.unwrap();
+    setup.user_grant_role("root", "root").await.unwrap();
+    setup.auth_enable().await.unwrap();
+    let root = || {
+        Client::builder()
+            .add_connection(etcd_server.connect_string())
+            .unwrap()
+            .credentials("root", "rootpw")
+            .build()
+            .unwrap()
+    };
+    let (admin, client) = (root(), root());
+    let pool = LeasePool::new(client.clone());
+
+    let lease_id = pool.get_lease(Duration::from_secs(2)).await.unwrap();
+    client.put("ka/auth").value("val").lease(lease_id).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // etcd revokes a user's tokens whenever their password changes, even to the one they have.
+    admin.user_change_password("root", "rootpw").await.unwrap();
+
+    // Wait well past the original 2s TTL — the pool should keep the lease alive.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let record = admin.get("ka/auth").await.unwrap();
+    assert!(
+        record.record().is_some(),
+        "key should still exist due to pool keep-alive"
+    );
+
+    // Cleanup: disable auth
+    admin.auth_disable().await.unwrap();
+}

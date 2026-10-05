@@ -473,8 +473,26 @@ impl ClientInner {
             .as_ref()
             .ok_or_else(|| tonic::Status::unauthenticated("no auth configured"))?;
         let _guard = auth.refresh.lock().await;
-        // Another caller may have refreshed while we waited for the lock.
-        if auth.token.read().await.0 != stale_generation {
+        self.refresh_auth_token_unserialized(stale_generation, deadline).await
+    }
+
+    /// [`refresh_auth_token`][Self::refresh_auth_token] without waiting for other refreshes, which
+    /// can then run alongside it.
+    ///
+    /// Streams refresh this way. A stream's consumer can stop polling it at any `.await` without
+    /// dropping it, and a stream stopped while it held or was being handed `refresh` would stall
+    /// every other refresh on the client until it was polled again.
+    pub(crate) async fn refresh_auth_token_unserialized(
+        &self,
+        stale_generation: u64,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(), tonic::Status> {
+        let auth = self
+            .auth
+            .as_ref()
+            .ok_or_else(|| tonic::Status::unauthenticated("no auth configured"))?;
+        // Another caller may have refreshed already.
+        if auth.token.read().unwrap().0 != stale_generation {
             return Ok(());
         }
         let creds = auth.credentials.as_ref().ok_or_else(|| {
@@ -486,7 +504,10 @@ impl ClientInner {
             .token
             .parse::<tonic::metadata::AsciiMetadataValue>()
             .map_err(|_| tonic::Status::internal("server returned an invalid auth token"))?;
-        *auth.token.write().await = (stale_generation + 1, Some(token_value));
+        let mut token = auth.token.write().unwrap();
+        if token.0 == stale_generation {
+            *token = (stale_generation + 1, Some(token_value));
+        }
         Ok(())
     }
 }

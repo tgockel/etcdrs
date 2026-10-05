@@ -67,8 +67,11 @@ wrap a client to build caching layers, mock clients, instrumentation, or proxies
 ### Authentication
 
 [`ClientBuilder`][client::ClientBuilder] supports username/password
-[`credentials`][client::ClientBuilder::credentials] with automatic re-authentication when the
-server returns `UNAUTHENTICATED`. Tokens are cached and refreshed transparently.
+[`credentials`][client::ClientBuilder::credentials]. The client authenticates when it first needs
+a token, sends the token with every request and stream, and authenticates again whenever etcd
+stops accepting it. One exception: once etcd has created a watch on a
+[`Watcher`][client::Watcher], the watcher keeps the token its stream opened with, so etcd refuses
+a watch added after that token stops working. Start a new `Watcher` for it.
 
 ## Feature Flags
 

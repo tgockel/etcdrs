@@ -122,11 +122,17 @@ impl ClientBuilder {
     /// A `PERMISSION_DENIED` response is returned to the caller unchanged. It means the
     /// authenticated user's roles do not cover the request, which re-authenticating cannot change.
     ///
-    /// This describes the ordinary operations. [`authenticate`][Client::authenticate] is its own
-    /// exception: it sends one `Authenticate` RPC directly and hands the token back to you instead
-    /// of caching it here. [`watch`][Client::watch] and [`lease_keeper`][Client::lease_keeper]
-    /// attach no token at all, so they do not work against an auth-enabled cluster no matter what
-    /// is configured here.
+    /// [`watch`][Client::watch] and [`lease_keeper`][Client::lease_keeper] send the cached token
+    /// once, when their stream opens, authenticating first if no token is cached. etcd checks it
+    /// each time the stream creates a watch or keeps a lease alive, so it can stop accepting the
+    /// token while the stream is open, for example once the token goes unused for five minutes
+    /// (etcd's default) or its user's password changes. A [`LeaseKeeper`][super::LeaseKeeper] then
+    /// reopens its stream with a refreshed token and sends again the keep-alives etcd did not
+    /// answer. A [`Watcher`][super::Watcher] does the same until etcd has answered one of its
+    /// watches; [`Watcher::add`][super::Watcher::add] describes what happens after that.
+    ///
+    /// [`authenticate`][Client::authenticate] is an exception: it sends one `Authenticate` RPC
+    /// directly and hands the token back to you instead of caching it here.
     pub fn credentials(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
         self.auth = Some(AuthConfig::Credentials(Credentials {
             username: username.into(),
@@ -137,8 +143,10 @@ impl ClientBuilder {
 
     /// Set a pre-obtained auth token for authenticating with the etcd cluster.
     ///
-    /// The token is injected into all requests. If the token expires, the client cannot refresh it
-    /// automatically; use [`credentials`][Self::credentials] instead for automatic token management.
+    /// The token is injected into all requests, and sent when a [`watch`][Client::watch] or
+    /// [`lease_keeper`][Client::lease_keeper] stream opens. If the token expires, the client cannot
+    /// refresh it automatically: requests and keep-alives fail, and etcd refuses the watches created
+    /// after that. Use [`credentials`][Self::credentials] instead for automatic token management.
     pub fn auth_token(mut self, token: impl Into<String>) -> Result<Self, BuildError> {
         let value = token
             .into()
@@ -184,12 +192,12 @@ impl ClientBuilder {
         let auth = auth.map(|config| match config {
             AuthConfig::Credentials(creds) => AuthState {
                 credentials: Some(creds),
-                token: tokio::sync::RwLock::new((0, None)),
+                token: std::sync::RwLock::new((0, None)),
                 refresh: tokio::sync::Mutex::new(()),
             },
             AuthConfig::Token(token) => AuthState {
                 credentials: None,
-                token: tokio::sync::RwLock::new((0, Some(token))),
+                token: std::sync::RwLock::new((0, Some(token))),
                 refresh: tokio::sync::Mutex::new(()),
             },
         });

@@ -64,8 +64,9 @@ struct Credentials {
 /// Streaming operations ignore it: [`watch`][Client::watch] and
 /// [`lease_keeper`][Client::lease_keeper] each retry `Unavailable` against a fixed five-second
 /// deadline of their own while establishing the stream, including under [`Never`][Self::Never],
-/// and neither re-establishes it once connected. [`authenticate`][Client::authenticate] ignores it
-/// too, in the other direction: it is one RPC, never retried, and carries no deadline at all.
+/// and re-establish it once connected only to replace an auth token the server stopped accepting
+/// (see [`ClientBuilder::credentials`]). [`authenticate`][Client::authenticate] ignores it too, in
+/// the other direction: it is one RPC, never retried, and carries no deadline at all.
 ///
 /// Acquiring an auth token is the remaining exception. A call the server refuses because it
 /// carried no token, or one the server will not accept, re-authenticates and replays once under
@@ -104,8 +105,10 @@ struct AuthState {
     /// The cached auth token and a generation counter. The generation is incremented each time the
     /// token is refreshed, allowing concurrent callers to detect stale tokens without a separate
     /// invalidation step.
-    token: tokio::sync::RwLock<(u64, Option<tonic::metadata::AsciiMetadataValue>)>,
-    /// Serializes refresh attempts so only one `Authenticate` RPC runs at a time.
+    ///
+    /// Never held across an `.await`, which a stream could be suspended at indefinitely.
+    token: std::sync::RwLock<(u64, Option<tonic::metadata::AsciiMetadataValue>)>,
+    /// Serializes the refreshes of unary calls so only one `Authenticate` RPC runs at a time.
     refresh: tokio::sync::Mutex<()>,
 }
 
@@ -235,14 +238,7 @@ impl ClientInner {
             if let Some(timeout) = remaining() {
                 call_request.set_timeout(timeout);
             }
-            let mut token_generation = 0u64;
-            if let Some(ref auth) = self.auth {
-                let state = auth.token.read().await;
-                if let Some(ref token) = state.1 {
-                    call_request.metadata_mut().insert("token", token.clone());
-                }
-                token_generation = state.0;
-            }
+            let token_generation = self.attach_token(&mut call_request);
             let response = call(&mut client, call_request).await;
             metric.complete(response.is_ok());
             match response {
@@ -270,6 +266,38 @@ impl ClientInner {
                 }
             }
         }
+    }
+
+    /// Attach the cached auth token to `request`, returning the generation of the token attached.
+    fn attach_token<T>(&self, request: &mut tonic::Request<T>) -> u64 {
+        let Some(auth) = &self.auth else {
+            return 0;
+        };
+        let state = auth.token.read().unwrap();
+        if let Some(token) = &state.1 {
+            request.metadata_mut().insert("token", token.clone());
+        }
+        state.0
+    }
+
+    /// [`attach_token`][Self::attach_token] for the request that opens a stream, first
+    /// authenticating with the configured credentials if no token is cached.
+    ///
+    /// A failed `Authenticate` is ignored: against a cluster without auth enabled it always fails,
+    /// and the stream works without a token.
+    async fn attach_stream_token<T>(&self, request: &mut tonic::Request<T>, deadline: std::time::Instant) -> u64 {
+        if let Some(auth) = &self.auth
+            && auth.credentials.is_some()
+        {
+            let (generation, cached) = {
+                let state = auth.token.read().unwrap();
+                (state.0, state.1.is_some())
+            };
+            if !cached {
+                let _ = self.refresh_auth_token_unserialized(generation, Some(deadline)).await;
+            }
+        }
+        self.attach_token(request)
     }
 
     fn can_retry(status: &tonic::Status, idempotency: Idempotency) -> bool {
@@ -313,6 +341,17 @@ impl ClientInner {
             ),
             _ => false,
         }
+    }
+
+    /// [`is_stale_token_error`][Self::is_stale_token_error] for the reason etcd gives when it
+    /// refuses to create a watch: the statuses it matches, in grpc-go's text form.
+    fn is_stale_token_refusal(reason: &str) -> bool {
+        matches!(
+            reason,
+            "rpc error: code = Unauthenticated desc = etcdserver: invalid auth token"
+                | "rpc error: code = InvalidArgument desc = etcdserver: user name is empty"
+                | "rpc error: code = InvalidArgument desc = etcdserver: revision of auth store is old"
+        )
     }
 }
 
@@ -450,6 +489,55 @@ mod test {
         ] {
             assert!(!ClientInner::is_stale_token_error(&status), "{status:?}");
         }
+    }
+
+    /// etcd refuses to create a watch with the text of the status the refusal stands for, so the
+    /// stale-token refusals are the stale-token statuses written out.
+    #[test]
+    fn stale_token_refusals_are_recognized() {
+        for reason in [
+            "rpc error: code = Unauthenticated desc = etcdserver: invalid auth token",
+            "rpc error: code = InvalidArgument desc = etcdserver: user name is empty",
+            "rpc error: code = InvalidArgument desc = etcdserver: revision of auth store is old",
+        ] {
+            assert!(ClientInner::is_stale_token_refusal(reason), "{reason}");
+        }
+    }
+
+    #[test]
+    fn other_refusals_are_not_stale_tokens() {
+        for reason in [
+            "rpc error: code = PermissionDenied desc = etcdserver: permission denied",
+            "mvcc: watcher range is empty",
+            "etcdserver: mvcc: required revision has been compacted",
+            "rpc error: code = InvalidArgument desc = etcdserver: key is not provided",
+            "rpc error: code = Unauthenticated",
+            "",
+        ] {
+            assert!(!ClientInner::is_stale_token_refusal(reason), "{reason}");
+        }
+    }
+
+    /// A stream's consumer can stop polling it partway through `Authenticate` without dropping it.
+    /// A stream that held the refresh lock there would hold up every other refresh on the client
+    /// until it was polled again, forever if one of them ran on the task that polls the stream.
+    #[tokio::test]
+    async fn streams_authenticate_without_the_refresh_lock() {
+        // Accepts connections and never answers, so `Authenticate` stays in flight.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = Client::builder()
+            .add_connection(format!("http://{}", listener.local_addr().unwrap()))
+            .unwrap()
+            .credentials("root", "rootpw")
+            .build()
+            .unwrap();
+
+        let mut request = tonic::Request::new(());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut attach = std::pin::pin!(client.inner.attach_stream_token(&mut request, deadline));
+        let polled = std::future::poll_fn(|cx| std::task::Poll::Ready(attach.as_mut().poll(cx))).await;
+        assert!(polled.is_pending());
+        assert!(client.inner.auth.as_ref().unwrap().refresh.try_lock().is_ok());
     }
 
     /// A server cannot talk the client into replaying a mutation by claiming to be a connect

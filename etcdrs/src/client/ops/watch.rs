@@ -18,7 +18,7 @@ use futures_core::Stream;
 
 use crate::{
     AsRange, LeaseId, Prefix, ResponseHeader, Revision, Version,
-    client::{Client, record_from_pb},
+    client::{Client, ClientInner, record_from_pb},
     pb::{
         etcdserverpb::{
             self, watch_create_request::FilterType as PbFilterType, watch_request::RequestUnion as PbRequestUnion,
@@ -388,8 +388,11 @@ impl WatchBuilder<Client> {
     /// calling `start` and the first poll may be missed. Use
     /// [`start_revision`][Watch::start_revision] to watch from a known point in history if you need
     /// to guarantee delivery.
+    ///
+    /// The stream carries the client's auth token. See [`Watcher::add`] for what happens when etcd
+    /// stops accepting it.
     pub(crate) fn start_client_watch(self) -> Watcher {
-        let channel = self.client.inner.channel.clone();
+        let client = self.client.inner;
         let requests = Arc::new(std::sync::Mutex::new(Requests {
             attempt: None,
             replay: Some(Vec::new()),
@@ -407,57 +410,76 @@ impl WatchBuilder<Client> {
         }
 
         let inner = async_stream::stream! {
-            // Establish the gRPC stream, retrying on Unavailable (the server may not be reachable
-            // yet when the channel was created with `connect_lazy`).
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let (mut response_stream, unanswered_creates) = loop {
-                let receiver = requests.lock().unwrap().new_attempt();
-                let unanswered_creates = Arc::new(std::sync::Mutex::new(VecDeque::new()));
-                let request_stream = ReceiverStream {
-                    inner: receiver,
-                    unanswered_creates: unanswered_creates.clone(),
+            // Whether this attempt replaced one whose token etcd refused. A second refusal is
+            // final.
+            let mut refreshed = false;
+            'open: loop {
+                // Establish the gRPC stream, retrying on Unavailable (the server may not be
+                // reachable yet when the channel was created with `connect_lazy`).
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let (mut response_stream, unanswered_creates, generation) = loop {
+                    let receiver = requests.lock().unwrap().new_attempt();
+                    let unanswered_creates = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+                    let mut request = tonic::Request::new(ReceiverStream {
+                        inner: receiver,
+                        unanswered_creates: unanswered_creates.clone(),
+                    });
+                    let generation = client.attach_stream_token(&mut request, deadline).await;
+                    let mut watch_client = etcdserverpb::watch_client::WatchClient::new(client.channel.clone());
+                    match watch_client.watch(request).await {
+                        Ok(resp) => break (resp.into_inner(), unanswered_creates, generation),
+                        Err(status)
+                            if status.code() == tonic::Code::Unavailable
+                                && std::time::Instant::now() <= deadline =>
+                        {
+                            continue;
+                        }
+                        Err(status) => {
+                            // A consumer may stop polling at this error, so drop `requests` now
+                            // rather than at the return.
+                            drop(requests);
+                            yield Err(WatchError::from_status(status));
+                            return;
+                        }
+                    }
                 };
-                let mut watch_client = etcdserverpb::watch_client::WatchClient::new(channel.clone());
-                match watch_client.watch(request_stream).await {
-                    Ok(resp) => {
-                        requests.lock().unwrap().replay = None;
-                        break (resp.into_inner(), unanswered_creates);
-                    }
-                    Err(status)
-                        if status.code() == tonic::Code::Unavailable
-                            && std::time::Instant::now() <= deadline =>
-                    {
-                        continue;
-                    }
-                    Err(status) => {
-                        // A consumer may stop polling at this error, so drop `requests` now rather
-                        // than at the return.
-                        drop(requests);
-                        yield Err(WatchError::from_status(status));
-                        return;
-                    }
-                }
-            };
 
-            loop {
-                match response_stream.message().await {
-                    Ok(Some(mut resp)) => {
-                        if resp.created {
-                            // Creates are answered in the order they were sent, and a refusal
-                            // carries watch ID -1 instead of the ID it refuses.
-                            resp.watch_id = unanswered_creates.lock().unwrap().pop_front().unwrap_or(resp.watch_id);
-                            if !resp.canceled {
-                                continue;
+                loop {
+                    match response_stream.message().await {
+                        Ok(Some(mut resp)) => {
+                            if resp.created {
+                                // Creates are answered in the order they were sent, and a refusal
+                                // carries watch ID -1 instead of the ID it refuses.
+                                resp.watch_id = unanswered_creates.lock().unwrap().pop_front().unwrap_or(resp.watch_id);
+                                if !refreshed
+                                    && ClientInner::is_stale_token_refusal(&resp.cancel_reason)
+                                    && requests.lock().unwrap().replay.is_some()
+                                    && client
+                                        .refresh_auth_token_unserialized(
+                                            generation,
+                                            Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+                                        )
+                                        .await
+                                        .is_ok()
+                                {
+                                    refreshed = true;
+                                    continue 'open;
+                                }
+                                requests.lock().unwrap().replay = None;
+                                if !resp.canceled {
+                                    continue;
+                                }
+                            }
+                            for item in convert_response(resp) {
+                                yield item;
                             }
                         }
-                        for item in convert_response(resp) {
-                            yield item;
+                        Ok(None) => return,
+                        Err(status) => {
+                            drop(requests);
+                            yield Err(WatchError::from_status(status));
+                            return;
                         }
-                    }
-                    Ok(None) => break,
-                    Err(status) => {
-                        yield Err(WatchError::from_status(status));
-                        break;
                     }
                 }
             }
@@ -543,6 +565,16 @@ impl Watcher {
     /// [`cancel_reason`][WatchError::cancel_reason]. etcd refuses a watch whose range is empty or
     /// inverted, whose [`start_revision`][Watch::start_revision] is negative, or whose range the
     /// client may not read. Other watches on this watcher are unaffected.
+    ///
+    /// etcd also refuses a watch once it stops accepting the auth token the watcher's stream
+    /// opened with, for example after the token went unused for five minutes (etcd's default) or
+    /// its user's password changed. Until etcd has answered one of the watcher's watches, the
+    /// watcher replaces its stream with one that carries a refreshed token, and yields nothing.
+    /// After that, replacing the stream would drop the watches etcd created, so the refusal is
+    /// yielded like any other, with a reason such as
+    /// `rpc error: code = Unauthenticated desc = etcdserver: invalid auth token`, and the watches
+    /// already created keep delivering events. To add the watch, start a new [`Watcher`]: it
+    /// replaces a stale token as described.
     ///
     /// Construct the [`Watch`] with [`Watch::new`]:
     ///
@@ -705,7 +737,8 @@ impl std::async_iter::AsyncIterator for WatchStream {
 struct Requests {
     /// The current attempt's channel, or `None` before the first attempt.
     attempt: Option<tokio::sync::mpsc::UnboundedSender<etcdserverpb::WatchRequest>>,
-    /// Every request sent so far, oldest first, until the stream is established. A failed attempt
+    /// Every request sent so far, oldest first, while the stream may still be replaced: until etcd
+    /// accepts a create on it, or refuses one with a refusal the stream yields. A replaced attempt
     /// loses whatever its transport took, so each attempt's channel starts with all of them.
     replay: Option<Vec<etcdserverpb::WatchRequest>>,
 }

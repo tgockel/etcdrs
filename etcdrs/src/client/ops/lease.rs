@@ -1,10 +1,11 @@
 use std::{
+    collections::VecDeque,
     future::{Future, IntoFuture},
     marker::PhantomData,
     ops::{Deref, DerefMut},
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
     time::Duration,
 };
 
@@ -95,6 +96,11 @@ impl Client {
     /// The gRPC stream is established lazily on the first poll of the returned [`LeaseKeeper`].
     /// Use [`keep_alive`][LeaseKeeper::keep_alive] to send keep-alive requests for specific
     /// leases, and consume the stream to receive responses.
+    ///
+    /// The stream ends after its first error, unless etcd stopped accepting the auth token it
+    /// carries: it then reopens with a refreshed token (see
+    /// [`ClientBuilder::credentials`][crate::client::ClientBuilder::credentials]) and sends again
+    /// the keep-alives etcd did not answer.
     ///
     /// ```no_run
     /// use futures::StreamExt;
@@ -1036,19 +1042,76 @@ impl std::async_iter::AsyncIterator for KeepAliveStream {
     }
 }
 
-/// Wraps a shared [`tokio::sync::mpsc::UnboundedReceiver`] as a [`Stream`].
-///
-/// The receiver is behind an `Arc<Mutex<>>` so that the stream can be reconstructed on connection
-/// retry without losing messages buffered in the channel.
+/// The keep-alive requests a [`KeepAliveSender`] sends, shared by every stream its
+/// [`LeaseKeeper`] opens.
+pub(crate) struct KeepAliveRequests {
+    receiver: tokio::sync::mpsc::UnboundedReceiver<etcdserverpb::LeaseKeepAliveRequest>,
+    /// The requests taken from `receiver` that etcd has not answered, oldest first.
+    unanswered: VecDeque<etcdserverpb::LeaseKeepAliveRequest>,
+    /// How many of `unanswered` the current stream has sent.
+    sent: usize,
+    /// The current stream's number. No other stream may take requests: the transport of a stream
+    /// that failed keeps polling it until the server resets the stream.
+    stream: u64,
+}
+
+impl KeepAliveRequests {
+    pub(crate) fn new(receiver: tokio::sync::mpsc::UnboundedReceiver<etcdserverpb::LeaseKeepAliveRequest>) -> Self {
+        Self {
+            receiver,
+            unanswered: VecDeque::new(),
+            sent: 0,
+            stream: 0,
+        }
+    }
+
+    /// Record etcd's answer to the oldest request it has not answered. etcd answers keep-alives
+    /// one at a time, in the order it receives them.
+    pub(crate) fn answered(&mut self) {
+        self.unanswered.pop_front();
+        self.sent = self
+            .sent
+            .checked_sub(1)
+            .expect("etcd should answer only the keep-alives it was sent");
+    }
+}
+
+/// The requests of one keep-alive stream: every request etcd has not answered, then new ones.
 pub(crate) struct KeepAliveReceiverStream {
-    pub(crate) inner: Arc<std::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<etcdserverpb::LeaseKeepAliveRequest>>>,
+    requests: Arc<std::sync::Mutex<KeepAliveRequests>>,
+    stream: u64,
+}
+
+impl KeepAliveReceiverStream {
+    /// Start a new stream, which ends every earlier one.
+    pub(crate) fn new(requests: &Arc<std::sync::Mutex<KeepAliveRequests>>) -> Self {
+        let mut state = requests.lock().unwrap();
+        state.stream += 1;
+        state.sent = 0;
+        Self {
+            requests: requests.clone(),
+            stream: state.stream,
+        }
+    }
 }
 
 impl Stream for KeepAliveReceiverStream {
     type Item = etcdserverpb::LeaseKeepAliveRequest;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.inner.lock().unwrap().poll_recv(cx)
+        let mut requests = self.requests.lock().unwrap();
+        if requests.stream != self.stream {
+            return Poll::Ready(None);
+        }
+        if requests.sent == requests.unanswered.len() {
+            let Some(request) = ready!(requests.receiver.poll_recv(cx)) else {
+                return Poll::Ready(None);
+            };
+            requests.unanswered.push_back(request);
+        }
+        let request = requests.unanswered[requests.sent];
+        requests.sent += 1;
+        Poll::Ready(Some(request))
     }
 }
 
@@ -1125,3 +1188,85 @@ const _: () = {
         _assert_send::<LeasesFuture>();
     }
 };
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn requests() -> (KeepAliveSender, Arc<std::sync::Mutex<KeepAliveRequests>>) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let requests = Arc::new(std::sync::Mutex::new(KeepAliveRequests::new(receiver)));
+        (KeepAliveSender::new(sender), requests)
+    }
+
+    /// The lease ID of the next request `stream` takes.
+    fn take(stream: &mut KeepAliveReceiverStream) -> Poll<Option<i64>> {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        Pin::new(stream)
+            .poll_next(&mut cx)
+            .map(|request| request.map(|request| request.id))
+    }
+
+    fn keep_alive(sender: &KeepAliveSender, id: i64) {
+        sender.keep_alive(LeaseId::new(id).unwrap());
+    }
+
+    /// A stream that failed takes nothing more, and the next sends what etcd never answered before
+    /// anything new.
+    #[test]
+    fn a_new_stream_sends_what_etcd_never_answered_first() {
+        let (sender, requests) = requests();
+        let mut failed = KeepAliveReceiverStream::new(&requests);
+        for id in 1..=3 {
+            keep_alive(&sender, id);
+        }
+        assert_eq!(take(&mut failed), Poll::Ready(Some(1)));
+        assert_eq!(take(&mut failed), Poll::Ready(Some(2)));
+        requests.lock().unwrap().answered();
+
+        let mut next = KeepAliveReceiverStream::new(&requests);
+        // The transport of a failed stream keeps polling it until the server resets the stream.
+        assert_eq!(take(&mut failed), Poll::Ready(None));
+        keep_alive(&sender, 4);
+        assert_eq!(take(&mut next), Poll::Ready(Some(2)));
+        assert_eq!(take(&mut next), Poll::Ready(Some(3)));
+        assert_eq!(take(&mut next), Poll::Ready(Some(4)));
+        assert_eq!(take(&mut next), Poll::Pending);
+    }
+
+    /// A stream can fail again before it has sent everything an earlier one left unanswered.
+    #[test]
+    fn a_stream_that_fails_while_sending_again_keeps_the_order() {
+        let (sender, requests) = requests();
+        let mut first = KeepAliveReceiverStream::new(&requests);
+        for id in 1..=3 {
+            keep_alive(&sender, id);
+            assert_eq!(take(&mut first), Poll::Ready(Some(id)));
+        }
+
+        let mut second = KeepAliveReceiverStream::new(&requests);
+        assert_eq!(take(&mut second), Poll::Ready(Some(1)));
+        requests.lock().unwrap().answered();
+        assert_eq!(take(&mut second), Poll::Ready(Some(2)));
+
+        let mut third = KeepAliveReceiverStream::new(&requests);
+        assert_eq!(take(&mut third), Poll::Ready(Some(2)));
+        assert_eq!(take(&mut third), Poll::Ready(Some(3)));
+        assert_eq!(take(&mut third), Poll::Pending);
+    }
+
+    /// Dropping the sender still ends the request stream, once it has sent what etcd never
+    /// answered.
+    #[test]
+    fn dropping_the_sender_ends_the_stream() {
+        let (sender, requests) = requests();
+        let mut first = KeepAliveReceiverStream::new(&requests);
+        keep_alive(&sender, 1);
+        assert_eq!(take(&mut first), Poll::Ready(Some(1)));
+        drop(sender);
+
+        let mut second = KeepAliveReceiverStream::new(&requests);
+        assert_eq!(take(&mut second), Poll::Ready(Some(1)));
+        assert_eq!(take(&mut second), Poll::Ready(None));
+    }
+}

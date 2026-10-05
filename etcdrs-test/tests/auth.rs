@@ -1,9 +1,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use etcdrs::client::RequestCounter;
-use etcdrs::{Permission, Prefix, TargetRange};
+use etcdrs::client::{KeepAliveResponse, LeaseKeeper, RequestCounter, Watch, WatchEvent, Watcher};
+use etcdrs::{
+    KeepAliveError, KeepAliveErrorKind, Permission, Prefix, Record, TargetRange, WatchError, WatchErrorKind, WatchId,
+};
 use etcdrs_test::{EtcdServer, etcd_server};
+use futures::StreamExt;
 use rstest::rstest;
 
 /// Helper: create the root user with the root role and enable authentication.
@@ -24,12 +27,29 @@ fn client_with_credentials(etcd_server: &EtcdServer, user: &str, password: &str)
         .unwrap()
 }
 
+/// Helper: a client that sends a pre-obtained `token`.
+fn client_with_token(etcd_server: &EtcdServer, token: &str) -> etcdrs::Client {
+    etcdrs::Client::builder()
+        .add_connection(etcd_server.connect_string())
+        .unwrap()
+        .auth_token(token)
+        .unwrap()
+        .build()
+        .unwrap()
+}
+
+/// Helper: enable auth and return a client with root's credentials, which the caller needs to
+/// disable auth again.
+async fn enable_auth(etcd_server: &EtcdServer) -> etcdrs::Client {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+    enable_auth_with_root(&client).await;
+    client_with_credentials(etcd_server, "root", "rootpw")
+}
+
 /// Helper: enable auth and add `eve`, who may read `pub/` and nothing else. Seeds `pub/x` and
 /// `secret/x`. Returns the root client, which the caller needs to disable auth again.
 async fn enable_auth_with_reader(etcd_server: &EtcdServer) -> etcdrs::Client {
-    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
-    enable_auth_with_root(&client).await;
-    let root = client_with_credentials(etcd_server, "root", "rootpw");
+    let root = enable_auth(etcd_server).await;
 
     root.user_add("eve").password("evepw").await.unwrap();
     root.role_add("reader").await.unwrap();
@@ -41,6 +61,52 @@ async fn enable_auth_with_reader(etcd_server: &EtcdServer) -> etcdrs::Client {
     root.put("pub/x").value("visible").await.unwrap();
     root.put("secret/x").value("hidden").await.unwrap();
     root
+}
+
+/// Helper: revoke every token root holds. etcd revokes a user's tokens whenever their password
+/// changes, even to the password they already have.
+async fn revoke_root_tokens(root: &etcdrs::Client) {
+    root.user_change_password("root", "rootpw").await.unwrap();
+}
+
+/// How a test client authenticates as root.
+#[derive(Clone, Copy, Debug)]
+enum RootAuth {
+    Credentials,
+    Token,
+}
+
+/// Helper: a client that authenticates as root the way `auth` says, with a token from `root` for
+/// [`RootAuth::Token`].
+async fn root_client(etcd_server: &EtcdServer, root: &etcdrs::Client, auth: RootAuth) -> etcdrs::Client {
+    match auth {
+        RootAuth::Credentials => client_with_credentials(etcd_server, "root", "rootpw"),
+        RootAuth::Token => client_with_token(etcd_server, root.authenticate().await.unwrap().token()),
+    }
+}
+
+/// Helper: the next item from a watcher, with a timeout.
+async fn next_watch_item(watcher: &mut Watcher) -> Result<WatchEvent, WatchError> {
+    tokio::time::timeout(Duration::from_secs(5), watcher.next())
+        .await
+        .expect("timed out waiting for watch event")
+        .expect("watch stream ended unexpectedly")
+}
+
+/// Helper: the watch ID and record of the next event from a watcher, which must be a put.
+async fn next_put(watcher: &mut Watcher) -> (WatchId, Record) {
+    match next_watch_item(watcher).await {
+        Ok(WatchEvent::Put { watch_id, record, .. }) => (watch_id, record),
+        other => panic!("expected a put, got {other:?}"),
+    }
+}
+
+/// Helper: the next item from a lease keeper, with a timeout.
+async fn next_keep_alive(keeper: &mut LeaseKeeper) -> Result<KeepAliveResponse, KeepAliveError> {
+    tokio::time::timeout(Duration::from_secs(5), keeper.next())
+        .await
+        .expect("timed out waiting for keep-alive response")
+        .expect("keep-alive stream ended unexpectedly")
 }
 
 #[rstest]
@@ -390,4 +456,317 @@ async fn role_already_exists(etcd_server: EtcdServer) {
     client.role_add("myrole").await.unwrap();
     let err = client.role_add("myrole").await.unwrap_err();
     assert_eq!(err.kind(), etcdrs::RoleErrorKind::RoleAlreadyExists);
+}
+
+/// Watch and keep-alive streams used to open with no token, so etcd refused every watch and ended
+/// every keep-alive stream with "user name is empty".
+#[rstest]
+#[case::credentials(RootAuth::Credentials)]
+#[case::token(RootAuth::Token)]
+#[tokio::test]
+async fn watch_under_auth(etcd_server: EtcdServer, #[case] auth: RootAuth) {
+    let root = enable_auth(&etcd_server).await;
+    let revision = root.put("w").value("1").await.unwrap().header().revision();
+    let client = root_client(&etcd_server, &root, auth).await;
+
+    let mut watcher = client.watch().key("w").start_revision(revision).start();
+    let (_, record) = next_put(&mut watcher).await;
+    assert_eq!(record.value(), &b"1"[..]);
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
+#[rstest]
+#[case::credentials(RootAuth::Credentials)]
+#[case::token(RootAuth::Token)]
+#[tokio::test]
+async fn keep_alive_under_auth(etcd_server: EtcdServer, #[case] auth: RootAuth) {
+    let root = enable_auth(&etcd_server).await;
+    let lease = root.grant_lease().ttl(Duration::from_secs(60)).await.unwrap().lease_id;
+    let client = root_client(&etcd_server, &root, auth).await;
+
+    let mut keeper = client.lease_keeper();
+    keeper.keep_alive(lease);
+    let response = next_keep_alive(&mut keeper).await.unwrap();
+    assert_eq!(response.lease_id, lease);
+    assert!(response.ttl.is_some(), "{response:?}");
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
+/// A client can hold a token etcd no longer accepts, and etcd checks a watch stream's token only
+/// when it creates a watch. A watcher that opened its stream with such a token replaces the stream
+/// with one that carries a refreshed token.
+#[rstest]
+#[tokio::test]
+async fn watch_opened_with_a_revoked_token(etcd_server: EtcdServer) {
+    let root = enable_auth(&etcd_server).await;
+    let client = client_with_credentials(&etcd_server, "root", "rootpw");
+    // Caches the token the watcher opens its stream with.
+    let revision = client.put("w").value("1").await.unwrap().header().revision();
+    revoke_root_tokens(&root).await;
+
+    let mut watcher = client.watch().key("w").start_revision(revision).start();
+    let (_, record) = next_put(&mut watcher).await;
+    assert_eq!(record.value(), &b"1"[..]);
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
+/// The token of an open watch stream can stop working before etcd creates any watch on it.
+#[rstest]
+#[tokio::test]
+async fn watch_added_after_its_token_was_revoked(etcd_server: EtcdServer) {
+    let root = enable_auth(&etcd_server).await;
+    let client = client_with_credentials(&etcd_server, "root", "rootpw");
+    let revision = client.put("w").value("1").await.unwrap().header().revision();
+
+    let mut watcher = client.watch().start();
+    // Opens the stream with the cached token.
+    let pending = tokio::time::timeout(Duration::from_millis(100), watcher.next()).await;
+    assert!(
+        pending.is_err(),
+        "expected nothing from a watcher with no watch, got {pending:?}"
+    );
+    revoke_root_tokens(&root).await;
+
+    let id = watcher.add(Watch::new("w").start_revision(revision));
+    let (watch_id, record) = next_put(&mut watcher).await;
+    assert_eq!(watch_id, id);
+    assert_eq!(record.value(), &b"1"[..]);
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
+/// etcd keeps delivering the watches it created after the token of their stream stops working, so
+/// a watcher with a live watch keeps its stream, and etcd refuses the watches added to it.
+#[rstest]
+#[tokio::test]
+async fn revoked_token_refuses_watches_beside_a_live_one(etcd_server: EtcdServer) {
+    let root = enable_auth(&etcd_server).await;
+    let client = client_with_credentials(&etcd_server, "root", "rootpw");
+    let live_revision = client.put("live").value("1").await.unwrap().header().revision();
+    let refused_revision = client.put("refused").value("1").await.unwrap().header().revision();
+
+    let mut watcher = client.watch().key("live").start_revision(live_revision).start();
+    let (live_id, _) = next_put(&mut watcher).await;
+    revoke_root_tokens(&root).await;
+
+    let refused_id = watcher.add(Watch::new("refused").start_revision(refused_revision));
+    let error = next_watch_item(&mut watcher).await.expect_err("expected the refusal");
+    assert_eq!(error.kind(), WatchErrorKind::Canceled);
+    assert_eq!(error.watch_id(), Some(refused_id));
+    assert_eq!(
+        error.cancel_reason(),
+        Some("rpc error: code = Unauthenticated desc = etcdserver: invalid auth token")
+    );
+
+    root.put("live").value("2").await.unwrap();
+    let (watch_id, record) = next_put(&mut watcher).await;
+    assert_eq!(watch_id, live_id);
+    assert_eq!(record.value(), &b"2"[..]);
+
+    // The client still holds the revoked token, which a new watcher replaces.
+    let mut watcher = client.watch().key("refused").start_revision(refused_revision).start();
+    let (_, record) = next_put(&mut watcher).await;
+    assert_eq!(record.key(), &b"refused"[..]);
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
+/// etcd refuses the first keep-alive on a stream whose token it does not accept by failing the call
+/// that opens the stream.
+#[rstest]
+#[tokio::test]
+async fn keep_alive_opened_with_a_revoked_token(etcd_server: EtcdServer) {
+    let root = enable_auth(&etcd_server).await;
+    let client = client_with_credentials(&etcd_server, "root", "rootpw");
+    // Caches the token the keeper opens its stream with.
+    let lease = client
+        .grant_lease()
+        .ttl(Duration::from_secs(60))
+        .await
+        .unwrap()
+        .lease_id;
+    revoke_root_tokens(&root).await;
+
+    let mut keeper = client.lease_keeper();
+    keeper.keep_alive(lease);
+    assert_eq!(next_keep_alive(&mut keeper).await.unwrap().lease_id, lease);
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
+/// etcd checks a keep-alive stream's token on every keep-alive, and ends the stream at the first it
+/// refuses. The keeper reopens it and sends again what etcd did not answer, in order and once.
+#[rstest]
+#[tokio::test]
+async fn keep_alive_outlives_its_token(etcd_server: EtcdServer) {
+    let root = enable_auth(&etcd_server).await;
+    let client = client_with_credentials(&etcd_server, "root", "rootpw");
+    let first = client
+        .grant_lease()
+        .ttl(Duration::from_secs(60))
+        .await
+        .unwrap()
+        .lease_id;
+    let second = client
+        .grant_lease()
+        .ttl(Duration::from_secs(60))
+        .await
+        .unwrap()
+        .lease_id;
+
+    let mut keeper = client.lease_keeper();
+    keeper.keep_alive(first);
+    assert_eq!(next_keep_alive(&mut keeper).await.unwrap().lease_id, first);
+    revoke_root_tokens(&root).await;
+
+    keeper.keep_alive(first);
+    keeper.keep_alive(second);
+    assert_eq!(next_keep_alive(&mut keeper).await.unwrap().lease_id, first);
+    assert_eq!(next_keep_alive(&mut keeper).await.unwrap().lease_id, second);
+    let extra = tokio::time::timeout(Duration::from_millis(200), keeper.next()).await;
+    assert!(extra.is_err(), "expected no more answers, got {extra:?}");
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
+/// A pre-obtained token cannot be refreshed. Once etcd stops accepting it, it refuses the watches
+/// a stream creates and ends a keep-alive stream.
+#[rstest]
+#[tokio::test]
+async fn revoked_pre_obtained_token_fails_streams(etcd_server: EtcdServer) {
+    let root = enable_auth(&etcd_server).await;
+    let revision = root.put("w").value("1").await.unwrap().header().revision();
+    let lease = root.grant_lease().ttl(Duration::from_secs(60)).await.unwrap().lease_id;
+    let client = client_with_token(&etcd_server, root.authenticate().await.unwrap().token());
+    revoke_root_tokens(&root).await;
+
+    let mut watcher = client.watch().key("w").start_revision(revision).start();
+    let error = next_watch_item(&mut watcher).await.expect_err("expected the refusal");
+    assert_eq!(error.kind(), WatchErrorKind::Canceled);
+    assert_eq!(
+        error.cancel_reason(),
+        Some("rpc error: code = Unauthenticated desc = etcdserver: invalid auth token")
+    );
+
+    let mut keeper = client.lease_keeper();
+    keeper.keep_alive(lease);
+    let error = next_keep_alive(&mut keeper).await.expect_err("expected the refusal");
+    assert_eq!(error.kind(), KeepAliveErrorKind::Authentication);
+    let end = tokio::time::timeout(Duration::from_secs(5), keeper.next()).await;
+    assert!(matches!(end, Ok(None)), "expected the keeper to end, got {end:?}");
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
+/// A stream whose client cannot authenticate opens without a token, and etcd's refusal ends it at
+/// once.
+#[rstest]
+#[tokio::test]
+async fn wrong_credentials_fail_streams(etcd_server: EtcdServer) {
+    let root = enable_auth(&etcd_server).await;
+    let lease = root.grant_lease().ttl(Duration::from_secs(60)).await.unwrap().lease_id;
+    let client = client_with_credentials(&etcd_server, "root", "wrong");
+
+    let mut watcher = client.watch().key("w").start();
+    let error = next_watch_item(&mut watcher).await.expect_err("expected the refusal");
+    assert_eq!(error.kind(), WatchErrorKind::Canceled);
+    assert_eq!(
+        error.cancel_reason(),
+        Some("rpc error: code = InvalidArgument desc = etcdserver: user name is empty")
+    );
+
+    let mut keeper = client.lease_keeper();
+    keeper.keep_alive(lease);
+    let error = next_keep_alive(&mut keeper).await.expect_err("expected the refusal");
+    assert_eq!(error.kind(), KeepAliveErrorKind::Authentication);
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
+/// A client authenticates before it opens a stream, and etcd refuses to authenticate anyone while
+/// auth is disabled. The streams work without a token.
+#[rstest]
+#[tokio::test]
+async fn credentials_without_auth_enabled(etcd_server: EtcdServer) {
+    let plain = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+    let revision = plain.put("w").value("1").await.unwrap().header().revision();
+    let lease = plain.grant_lease().ttl(Duration::from_secs(60)).await.unwrap().lease_id;
+    let client = client_with_credentials(&etcd_server, "root", "rootpw");
+
+    let mut watcher = client.watch().key("w").start_revision(revision).start();
+    let (_, record) = next_put(&mut watcher).await;
+    assert_eq!(record.value(), &b"1"[..]);
+
+    let mut keeper = client.lease_keeper();
+    keeper.keep_alive(lease);
+    assert_eq!(next_keep_alive(&mut keeper).await.unwrap().lease_id, lease);
+}
+
+/// etcd refuses a watch over a range the client may not read. #21 left this cause out of its
+/// refusal tests because no watch carried a token then.
+#[rstest]
+#[tokio::test]
+async fn watch_refused_without_permission_alone(etcd_server: EtcdServer) {
+    let root = enable_auth_with_reader(&etcd_server).await;
+    let eve = client_with_credentials(&etcd_server, "eve", "evepw");
+
+    let mut watcher = eve.watch().key("secret/x").start();
+    let error = next_watch_item(&mut watcher).await.expect_err("expected the refusal");
+    assert_eq!(error.kind(), WatchErrorKind::Canceled);
+    // Watches given to the builder are numbered from 1.
+    assert_eq!(error.watch_id(), WatchId::new(1));
+    assert_eq!(
+        error.cancel_reason(),
+        Some("rpc error: code = PermissionDenied desc = etcdserver: permission denied")
+    );
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn watch_refused_without_permission_beside_live_watch(etcd_server: EtcdServer) {
+    let root = enable_auth_with_reader(&etcd_server).await;
+    let revision = root
+        .get("pub/x")
+        .await
+        .unwrap()
+        .into_record()
+        .unwrap()
+        .metadata()
+        .modified_revision;
+    let eve = client_with_credentials(&etcd_server, "eve", "evepw");
+
+    let mut watcher = eve.watch().key("pub/x").start_revision(revision).start();
+    let (live_id, _) = next_put(&mut watcher).await;
+
+    let refused_id = watcher.add(Watch::new("secret/x"));
+    let error = next_watch_item(&mut watcher).await.expect_err("expected the refusal");
+    assert_eq!(error.kind(), WatchErrorKind::Canceled);
+    assert_eq!(error.watch_id(), Some(refused_id));
+    assert_eq!(
+        error.cancel_reason(),
+        Some("rpc error: code = PermissionDenied desc = etcdserver: permission denied")
+    );
+
+    root.put("pub/x").value("again").await.unwrap();
+    let (watch_id, record) = next_put(&mut watcher).await;
+    assert_eq!(watch_id, live_id);
+    assert_eq!(record.value(), &b"again"[..]);
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
 }

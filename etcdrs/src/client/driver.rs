@@ -5,24 +5,24 @@ use crate::{
     client::{
         AuthDisable, AuthDisableFuture, AuthDisableResponse, AuthEnable, AuthEnableFuture, AuthEnableResponse,
         AuthError, AuthErrorKind, AuthStatus, AuthStatusFuture, AuthStatusResponse, Authenticate, AuthenticateFuture,
-        AuthenticateResponse, ClusterError, Compact, CompactError, CompactFuture, CompactResponse, CountResponse,
-        Delete, DeleteError, DeleteFuture, DeleteResponse, Get, GetFuture, GetResponse, GrantLease, GrantLeaseError,
-        GrantLeaseErrorKind, GrantLeaseFuture, GrantLeaseResponse, Idempotency, KeepAliveError,
-        KeepAliveReceiverStream, KeepAliveResponse, KeepAliveSender, KeepAliveStream, LeaseInfo, LeaseKeeper,
-        LeaseTimeToLive, LeaseTimeToLiveError, LeaseTimeToLiveFuture, LeaseTimeToLiveResponse, Leases, LeasesError,
-        LeasesFuture, LeasesResponse, List, ListContinuation, ListFuture, ListView, Member, MemberAdd, MemberAddFuture,
-        MemberAddResponse, MemberList, MemberListFuture, MemberListResponse, MemberPromote, MemberPromoteFuture,
-        MemberPromoteResponse, MemberRemove, MemberRemoveFuture, MemberRemoveResponse, MemberUpdate,
-        MemberUpdateFuture, MemberUpdateResponse, Permission, Put, PutError, PutFuture, PutResponse, RevokeLease,
-        RevokeLeaseError, RevokeLeaseFuture, RevokeLeaseResponse, RoleAdd, RoleAddFuture, RoleAddResponse, RoleDelete,
-        RoleDeleteFuture, RoleDeleteResponse, RoleError, RoleGet, RoleGetFuture, RoleGetResponse, RoleGrantPermission,
-        RoleGrantPermissionFuture, RoleGrantPermissionResponse, RoleList, RoleListFuture, RoleListResponse,
-        RoleRevokePermission, RoleRevokePermissionFuture, RoleRevokePermissionResponse, Transaction, TransactionError,
-        TransactionFuture, TransactionOpKind, TransactionResponse, UserAdd, UserAddFuture, UserAddResponse,
-        UserChangePassword, UserChangePasswordFuture, UserChangePasswordResponse, UserDelete, UserDeleteFuture,
-        UserDeleteResponse, UserError, UserGet, UserGetFuture, UserGetResponse, UserGrantRole, UserGrantRoleFuture,
-        UserGrantRoleResponse, UserList, UserListFuture, UserListResponse, UserRevokeRole, UserRevokeRoleFuture,
-        UserRevokeRoleResponse, WatchBuilder, Watcher,
+        AuthenticateResponse, ClientInner, ClusterError, Compact, CompactError, CompactFuture, CompactResponse,
+        CountResponse, Delete, DeleteError, DeleteFuture, DeleteResponse, Get, GetFuture, GetResponse, GrantLease,
+        GrantLeaseError, GrantLeaseErrorKind, GrantLeaseFuture, GrantLeaseResponse, Idempotency, KeepAliveError,
+        KeepAliveReceiverStream, KeepAliveRequests, KeepAliveResponse, KeepAliveSender, KeepAliveStream, LeaseInfo,
+        LeaseKeeper, LeaseTimeToLive, LeaseTimeToLiveError, LeaseTimeToLiveFuture, LeaseTimeToLiveResponse, Leases,
+        LeasesError, LeasesFuture, LeasesResponse, List, ListContinuation, ListFuture, ListView, Member, MemberAdd,
+        MemberAddFuture, MemberAddResponse, MemberList, MemberListFuture, MemberListResponse, MemberPromote,
+        MemberPromoteFuture, MemberPromoteResponse, MemberRemove, MemberRemoveFuture, MemberRemoveResponse,
+        MemberUpdate, MemberUpdateFuture, MemberUpdateResponse, Permission, Put, PutError, PutFuture, PutResponse,
+        RevokeLease, RevokeLeaseError, RevokeLeaseFuture, RevokeLeaseResponse, RoleAdd, RoleAddFuture, RoleAddResponse,
+        RoleDelete, RoleDeleteFuture, RoleDeleteResponse, RoleError, RoleGet, RoleGetFuture, RoleGetResponse,
+        RoleGrantPermission, RoleGrantPermissionFuture, RoleGrantPermissionResponse, RoleList, RoleListFuture,
+        RoleListResponse, RoleRevokePermission, RoleRevokePermissionFuture, RoleRevokePermissionResponse, Transaction,
+        TransactionError, TransactionFuture, TransactionOpKind, TransactionResponse, UserAdd, UserAddFuture,
+        UserAddResponse, UserChangePassword, UserChangePasswordFuture, UserChangePasswordResponse, UserDelete,
+        UserDeleteFuture, UserDeleteResponse, UserError, UserGet, UserGetFuture, UserGetResponse, UserGrantRole,
+        UserGrantRoleFuture, UserGrantRoleResponse, UserList, UserListFuture, UserListResponse, UserRevokeRole,
+        UserRevokeRoleFuture, UserRevokeRoleResponse, WatchBuilder, Watcher,
     },
     pb::{etcdserverpb, mvccpb},
 };
@@ -330,39 +330,56 @@ impl crate::driver::LeaseDriver for Client {
     }
 
     fn start_lease_keeper(self) -> Self::LeaseKeeper {
-        let channel = self.inner.channel.clone();
+        let client = self.inner;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let shared_rx = Arc::new(std::sync::Mutex::new(rx));
+        let requests = Arc::new(std::sync::Mutex::new(KeepAliveRequests::new(rx)));
         let inner = async_stream::stream! {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            let mut response_stream = loop {
-                let request_stream = KeepAliveReceiverStream { inner: shared_rx.clone() };
-                let mut lease_client = etcdserverpb::lease_client::LeaseClient::new(channel.clone());
-                match lease_client.lease_keep_alive(request_stream).await {
-                    Ok(resp) => break resp.into_inner(),
+            let mut deadline = std::time::Instant::now() + Duration::from_secs(5);
+            // Whether this stream replaced one whose token etcd stopped accepting. Cleared by
+            // etcd's next answer, so a replacement refused before it is answered ends the keeper.
+            let mut refreshed = false;
+            loop {
+                let mut request = tonic::Request::new(KeepAliveReceiverStream::new(&requests));
+                let generation = client.attach_stream_token(&mut request, deadline).await;
+                let mut lease_client = etcdserverpb::lease_client::LeaseClient::new(client.channel.clone());
+                // etcd sends no response headers before its first answer, so refusing a first
+                // keep-alive fails the call itself, possibly long after `deadline`.
+                let status = match lease_client.lease_keep_alive(request).await {
+                    Ok(resp) => {
+                        let mut response_stream = resp.into_inner();
+                        loop {
+                            match response_stream.message().await {
+                                Ok(Some(resp)) => {
+                                    requests.lock().unwrap().answered();
+                                    refreshed = false;
+                                    let header = ResponseHeader::from_pb(resp.header.expect("LeaseKeepAliveResponse should have a valid header"));
+                                    let lease_id = LeaseId::new(resp.id).expect("LeaseKeepAliveResponse should have a valid lease ID");
+                                    let ttl = if resp.ttl > 0 { Some(Duration::from_secs(resp.ttl as _)) } else { None };
+                                    yield Ok(KeepAliveResponse::new(header, LeaseInfo { lease_id, ttl }));
+                                }
+                                Ok(None) => return,
+                                Err(status) => break status,
+                            }
+                        }
+                    }
                     Err(status) if status.code() == tonic::Code::Unavailable && std::time::Instant::now() <= deadline => {
                         continue;
                     }
-                    Err(status) => {
-                        yield Err(KeepAliveError::from_status(status));
-                        return;
-                    }
+                    Err(status) => status,
+                };
+                if !refreshed
+                    && ClientInner::is_stale_token_error(&status)
+                    && client.refresh_auth_token_unserialized(generation, Some(std::time::Instant::now() + Duration::from_secs(5))).await.is_ok()
+                {
+                    refreshed = true;
+                    deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    continue;
                 }
-            };
-            loop {
-                match response_stream.message().await {
-                    Ok(Some(resp)) => {
-                        let header = ResponseHeader::from_pb(resp.header.expect("LeaseKeepAliveResponse should have a valid header"));
-                        let lease_id = LeaseId::new(resp.id).expect("LeaseKeepAliveResponse should have a valid lease ID");
-                        let ttl = if resp.ttl > 0 { Some(Duration::from_secs(resp.ttl as _)) } else { None };
-                        yield Ok(KeepAliveResponse::new(header, LeaseInfo { lease_id, ttl }));
-                    }
-                    Ok(None) => break,
-                    Err(status) => {
-                        yield Err(KeepAliveError::from_status(status));
-                        break;
-                    }
-                }
+                // A consumer may stop polling at this error, so drop `requests` now rather than at
+                // the return.
+                drop(requests);
+                yield Err(KeepAliveError::from_status(status));
+                return;
             }
         };
         LeaseKeeper::new(KeepAliveSender::new(tx), KeepAliveStream::new(inner))
