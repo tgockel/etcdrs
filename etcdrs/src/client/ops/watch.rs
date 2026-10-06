@@ -110,6 +110,10 @@ impl WatchId {
 pub enum WatchEvent {
     /// A key was created or updated.
     Put {
+        /// The header of the response that carried the event. While a watch catches up on past
+        /// revisions, etcd gives its responses the store's current revision, which can be later
+        /// than the event's own, the record's [`modified_revision`][Metadata::modified_revision].
+        /// Resume a watch after the event's revision, not the header's.
         header: ResponseHeader,
         watch_id: WatchId,
         record: Record,
@@ -121,6 +125,9 @@ pub enum WatchEvent {
     },
     /// A key was deleted.
     Delete {
+        /// The header of the response that carried the event. As for a
+        /// [`Put`][WatchEvent::Put], its revision can be later than the event's own, which is
+        /// `key`'s [`modified_revision`][Metadata::modified_revision].
         header: ResponseHeader,
         watch_id: WatchId,
         key: KeyWithMetadata,
@@ -444,6 +451,9 @@ impl WatchBuilder<Client> {
                     }
                 };
 
+                // The fragments of a response received so far, combined. All but the last fragment
+                // have `fragment` set, and etcd sends nothing else between them.
+                let mut fragments: Option<etcdserverpb::WatchResponse> = None;
                 loop {
                     match response_stream.message().await {
                         Ok(Some(mut resp)) => {
@@ -469,6 +479,18 @@ impl WatchBuilder<Client> {
                                 if !resp.canceled {
                                     continue;
                                 }
+                            }
+                            if let Some(mut held) = fragments.take() {
+                                if held.watch_id == resp.watch_id && !resp.canceled {
+                                    held.events.append(&mut resp.events);
+                                    resp.events = held.events;
+                                } else {
+                                    yield Err(WatchError::invalid_response("incomplete fragmented watch response"));
+                                }
+                            }
+                            if resp.fragment {
+                                fragments = Some(resp);
+                                continue;
                             }
                             for item in convert_response(resp) {
                                 yield item;
@@ -535,6 +557,10 @@ impl<C: crate::driver::WatchDriver> Watch<WatchBuilder<C>> {
 /// Control messages sent before the stream is first polled are sent once it is established. A watch
 /// starts when etcd receives its request, so set [`start_revision`][Watch::start_revision] on a
 /// watch that must not miss earlier events.
+///
+/// etcd splits a response too large for one message into fragments. A `Watcher` yields the events
+/// of such a response back to back once its last fragment arrives, so a stream that fails does so
+/// between revisions, and a watch restarted just after the last event's revision misses nothing.
 ///
 /// ## Cleanup
 ///
@@ -1027,4 +1053,138 @@ fn convert_response(resp: etcdserverpb::WatchResponse) -> Vec<Result<WatchEvent,
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod test {
+    use std::time::Duration;
+
+    use futures::{FutureExt as _, StreamExt as _};
+
+    use super::*;
+    use crate::pb::etcdserverpb::watch_server::{Watch as WatchService, WatchServer};
+
+    /// A watch service that sends, on the one stream a client opens, the responses a test gives it,
+    /// and ends the stream when the test drops their sender.
+    struct Scripted(std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<etcdserverpb::WatchResponse>>>);
+
+    #[tonic::async_trait]
+    impl WatchService for Scripted {
+        async fn watch(
+            self: Arc<Self>,
+            _request: tonic::Request<tonic::Streaming<etcdserverpb::WatchRequest>>,
+        ) -> Result<tonic::Response<tonic::codegen::BoxStream<etcdserverpb::WatchResponse>>, tonic::Status> {
+            let mut responses = self.0.lock().unwrap().take().expect("one stream");
+            Ok(tonic::Response::new(Box::pin(futures::stream::poll_fn(move |cx| {
+                responses.poll_recv(cx).map(|response| response.map(Ok))
+            }))))
+        }
+    }
+
+    /// Start a watcher against a [`Scripted`] service, returning it and the sender of the
+    /// service's responses.
+    async fn scripted_watcher() -> (Watcher, tokio::sync::mpsc::UnboundedSender<etcdserverpb::WatchResponse>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (responses, receiver) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(tonic::transport::Server::builder().serve_with_incoming(
+            WatchServer::new(Scripted(std::sync::Mutex::new(Some(receiver)))),
+            tonic::transport::server::TcpIncoming::from(listener),
+        ));
+        let client = Client::new(&format!("http://{address}")).unwrap();
+        (client.watch().prefix("k/").start(), responses)
+    }
+
+    /// A response on watch 1 that puts each of `keys` at revision 2, marked as a fragment that
+    /// more follow if `fragment`.
+    fn puts(keys: &[&str], fragment: bool) -> etcdserverpb::WatchResponse {
+        etcdserverpb::WatchResponse {
+            header: Some(etcdserverpb::ResponseHeader {
+                cluster_id: 1,
+                member_id: 1,
+                revision: 2,
+                raft_term: 1,
+            }),
+            watch_id: 1,
+            fragment,
+            events: keys
+                .iter()
+                .map(|key| mvccpb::Event {
+                    r#type: PbEventType::Put as i32,
+                    kv: Some(mvccpb::KeyValue {
+                        key: Bytes::copy_from_slice(key.as_bytes()),
+                        create_revision: 2,
+                        mod_revision: 2,
+                        version: 1,
+                        ..Default::default()
+                    }),
+                    prev_kv: None,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The key of the put a watcher yielded.
+    fn put_key(item: Option<Result<WatchEvent, WatchError>>) -> String {
+        match item {
+            Some(Ok(WatchEvent::Put { record, .. })) => String::from_utf8(record.key().to_vec()).unwrap(),
+            other => panic!("expected a put, got {other:?}"),
+        }
+    }
+
+    /// The events of a response etcd splits into fragments used to be yielded as each fragment
+    /// arrived, so a consumer could take part of a revision for all of it.
+    #[tokio::test]
+    async fn fragmented_response_is_yielded_once_whole() {
+        let (mut watcher, responses) = scripted_watcher().await;
+        responses.send(puts(&["k/0"], false)).unwrap();
+        assert_eq!(put_key(watcher.next().await), "k/0");
+
+        responses.send(puts(&["k/1", "k/2"], true)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), watcher.next())
+                .await
+                .is_err()
+        );
+
+        responses.send(puts(&["k/3"], false)).unwrap();
+        let mut keys = vec![put_key(watcher.next().await)];
+        while let Some(item) = watcher.next().now_or_never() {
+            keys.push(put_key(item));
+        }
+        assert_eq!(keys, ["k/1", "k/2", "k/3"]);
+    }
+
+    /// A stream that ends between the fragments of a response yields none of its events. It used
+    /// to yield those of the fragments that arrived, and a consumer that resumed after them lost
+    /// the rest of their revision.
+    #[tokio::test]
+    async fn stream_ending_between_fragments_yields_none_of_them() {
+        let (mut watcher, responses) = scripted_watcher().await;
+        responses.send(puts(&["k/0"], false)).unwrap();
+        assert_eq!(put_key(watcher.next().await), "k/0");
+
+        responses.send(puts(&["k/1", "k/2"], true)).unwrap();
+        drop(responses);
+        assert!(watcher.next().await.is_none());
+    }
+
+    /// etcd never sends another response between the fragments of one, so one that does leaves
+    /// the fragments before it without their last.
+    #[tokio::test]
+    async fn interrupted_fragments_are_an_invalid_response() {
+        let (mut watcher, responses) = scripted_watcher().await;
+        responses.send(puts(&["k/1"], true)).unwrap();
+        responses
+            .send(etcdserverpb::WatchResponse {
+                watch_id: 2,
+                ..puts(&["k/2"], false)
+            })
+            .unwrap();
+
+        let error = watcher.next().await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), WatchErrorKind::InvalidResponse);
+        assert_eq!(put_key(watcher.next().await), "k/2");
+    }
 }

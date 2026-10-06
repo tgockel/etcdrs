@@ -23,7 +23,7 @@ tonic-prost.workspace = true
 
 [dev-dependencies]
 futures = { workspace = true, features = ["std"] }
-tokio = { workspace = true, default-features = false, features = ["macros", "rt"] }
+tokio = { workspace = true, default-features = false, features = ["macros", "net", "rt", "time"] }
 
 [build-dependencies]
 protoc-bin-vendored = { workspace = true, optional = true }

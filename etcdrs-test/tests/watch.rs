@@ -3,7 +3,7 @@ use std::time::Duration;
 use etcdrs::client::{Watch, WatchEvent};
 use etcdrs::{Revision, WatchError, WatchErrorKind, WatchId};
 use etcdrs_test::{EtcdServer, etcd_server};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use rstest::rstest;
 
 /// Helper: the next item from a watcher, with a timeout.
@@ -271,6 +271,54 @@ async fn watch_request_progress(etcd_server: EtcdServer) {
         panic!("expected Progress, got {event:?}");
     };
     assert!(revision >= rev);
+}
+
+/// etcd splits a response of 2 MiB or more into fragments, which can split a revision. The events
+/// of one were yielded as each fragment arrived, so those of the last fragment were not ready with
+/// the others.
+#[rstest]
+#[tokio::test]
+async fn watch_fragmented_response(etcd_server: EtcdServer) {
+    // A window this small keeps etcd from sending the last fragment before the first is read.
+    let client = etcdrs::Client::builder()
+        .add_connection(etcd_server.connect_string())
+        .unwrap()
+        .configure_endpoint(|endpoint| Ok(endpoint.initial_stream_window_size(65_535)))
+        .build()
+        .unwrap();
+
+    // A delete event carries its key and no value, so the keys are what make it large.
+    for i in 0..25 {
+        client
+            .put(format!("wfr/{i:02}/{}", "x".repeat(100 * 1024)))
+            .value("")
+            .await
+            .unwrap();
+    }
+    let sentinel = *client.put("wfr/sentinel").value("").await.unwrap().header();
+
+    // etcd sends a watch's responses whole until it has announced the watch, which it has once the
+    // watch delivers an event.
+    let mut watcher = client
+        .watch()
+        .prefix("wfr/")
+        .start_revision(sentinel.revision())
+        .start();
+    let events = next_events(&mut watcher, 1).await;
+    assert!(matches!(&events[0], WatchEvent::Put { .. }));
+
+    let deleted = *client.delete_prefix("wfr/").await.unwrap().header();
+    let mut events = vec![next_item(&mut watcher).await.unwrap()];
+    while let Some(Some(item)) = watcher.next().now_or_never() {
+        events.push(item.unwrap());
+    }
+    assert_eq!(events.len(), 26);
+    for event in &events {
+        let WatchEvent::Delete { key, .. } = event else {
+            panic!("expected Delete, got {event:?}");
+        };
+        assert_eq!(key.metadata().modified_revision, deleted.revision());
+    }
 }
 
 /// etcd refuses a watch with one response that is both `created` and `canceled`, for watch ID -1.
