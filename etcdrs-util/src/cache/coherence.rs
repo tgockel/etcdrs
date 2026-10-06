@@ -139,9 +139,9 @@ async fn watch_generation(shared: &Shared, mut stream: WatchStream, mut routing:
         };
         let Some(first) = next else { return };
 
-        // Drain everything already available so all events of one watch response -- typically one
-        // revision, e.g. a multi-key transaction -- are applied under a single lock. A reader can
-        // then never observe a prefix of a revision's events under that revision's header.
+        // Drain everything already available so all events of one watch response, which etcdrs
+        // yields back to back and which covers whole revisions, are applied under a single lock. A
+        // reader then never observes part of a revision.
         let mut batch = vec![first];
         while let Some(Some(item)) = stream.next().now_or_never() {
             batch.push(item);
@@ -231,6 +231,7 @@ fn apply_batch(
                 record,
                 ..
             }) => {
+                let header = with_revision(header, record.metadata().modified_revision);
                 if let Some(&index) = routing.get(&watch_id) {
                     let range = &mut state[index];
                     range.store.insert(record.key().clone(), record);
@@ -241,6 +242,7 @@ fn apply_batch(
             Ok(WatchEvent::Delete {
                 header, watch_id, key, ..
             }) => {
+                let header = with_revision(header, key.metadata().modified_revision);
                 if let Some(&index) = routing.get(&watch_id) {
                     let range = &mut state[index];
                     range.store.remove(key.key());
@@ -325,6 +327,12 @@ fn is_stale_token_refusal(reason: &str) -> bool {
     )
 }
 
+/// `header` with `revision` in its place. etcd labels a watch response that catches up on past
+/// revisions with the store's current revision, which can be later than that of the events in it.
+fn with_revision(header: ResponseHeader, revision: Revision) -> ResponseHeader {
+    ResponseHeader::new(header.cluster_id(), header.member_id(), revision, header.raft_term())
+}
+
 /// Advance a range's header, never regressing its revision.
 fn advance_header(range: &mut RangeState, header: ResponseHeader) {
     if range
@@ -350,14 +358,15 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicI64;
 
+    use bytes::Bytes;
     use etcdrs::client::{WatchEvent, WatchId};
-    use etcdrs::{Client, Prefix};
+    use etcdrs::{Client, KeyWithMetadata, Metadata, Prefix, Record, Revision, Version};
     use etcdrs_test::{EtcdServer, etcd_server};
     use rstest::rstest;
 
     use super::super::range_spec::RangeSpec;
     use super::super::{ProgressControl, RangeState, Shared};
-    use super::{apply_batch, is_stale_token_refusal};
+    use super::{apply_batch, is_stale_token_refusal, with_revision};
 
     /// A stream-wide progress reply can arrive after a watch is added but have been computed before
     /// etcd created it, so it must not advance that watch's range. It used to, which labeled the
@@ -397,6 +406,57 @@ mod tests {
         let state = shared.state.lock().unwrap();
         assert_eq!(state[0].header, Some(later));
         assert_eq!(state[1].header, Some(seeded));
+    }
+
+    /// etcd labels each batch of a watch's catch-up with the store's current revision, which can be
+    /// later than the events in it. The cache used to take that label as its range's revision, so a
+    /// range was current from the first batch on, and a stream lost before the last batch resumed
+    /// after it.
+    #[rstest]
+    #[tokio::test]
+    async fn events_label_their_range_with_their_own_revision(etcd_server: EtcdServer) {
+        let client = Client::new(&etcd_server.connect_string()).unwrap();
+        let header = *client.put("k").value("v").await.unwrap().header();
+        let at = |revision| with_revision(header, Revision::new(revision).unwrap());
+        let metadata = |revision| Metadata {
+            create_revision: Revision::new(20).unwrap(),
+            modified_revision: Revision::new(revision).unwrap(),
+            version: Version::new(1),
+            lease: None,
+        };
+        let shared = Shared {
+            client,
+            ranges: vec![RangeSpec::from_range(Prefix("a/"))],
+            state: Mutex::new(vec![RangeState {
+                store: Default::default(),
+                header: Some(at(10)),
+            }]),
+            last_known: AtomicI64::new(10),
+            progress: Mutex::new(ProgressControl::default()),
+        };
+        let watch_id = WatchId::new(1).unwrap();
+        let mut routing = HashMap::from([(watch_id, 0)]);
+
+        let put = WatchEvent::Put {
+            header: at(30),
+            watch_id,
+            record: Record::new(Bytes::from_static(b"a/1"), Bytes::from_static(b"v"), metadata(20)),
+            prev_record: None,
+            created: true,
+        };
+        apply_batch(&shared, &mut routing, 1, vec![Ok(put)]);
+        assert_eq!(shared.state.lock().unwrap()[0].header, Some(at(20)));
+        assert_eq!(shared.last_known_revision(), Revision::new(20));
+
+        let delete = WatchEvent::Delete {
+            header: at(30),
+            watch_id,
+            key: KeyWithMetadata::new(Bytes::from_static(b"a/1"), metadata(25)),
+            prev_record: None,
+        };
+        apply_batch(&shared, &mut routing, 1, vec![Ok(delete)]);
+        assert_eq!(shared.state.lock().unwrap()[0].header, Some(at(25)));
+        assert_eq!(shared.last_known_revision(), Revision::new(25));
     }
 
     #[test]

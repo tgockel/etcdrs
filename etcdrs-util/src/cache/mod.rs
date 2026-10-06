@@ -85,8 +85,9 @@ struct ProgressControl {
 struct RangeState {
     /// The latest known records within the range.
     store: BTreeMap<Bytes, Record>,
-    /// The header of the most recent snapshot or event applied to `store`: the store is exact as
-    /// of `header.revision()`. `None` while the range is unseeded: until a listing of it first
+    /// The header of the most recent snapshot, progress notification or event applied to `store`,
+    /// with an event's revision in place of its response's: the store is exact as of
+    /// `header.revision()`. `None` while the range is unseeded: until a listing of it first
     /// succeeds, and from a refusal of its watch, or a failed listing after compaction, until a
     /// retry lists it again.
     header: Option<ResponseHeader>,
@@ -118,7 +119,8 @@ impl CacheClient {
     /// observed yet.
     ///
     /// Every response header seen by this cache — from operations executed through it, from seed
-    /// snapshots, and from watch events — advances this value. It never decreases.
+    /// snapshots, and from the watch's progress notifications — advances this value, as does the
+    /// revision of every watch event. It never decreases.
     pub fn last_known_revision(&self) -> Option<Revision> {
         self.0.shared.last_known_revision()
     }

@@ -43,11 +43,14 @@ The cache tracks two kinds of revision, with different strengths:
 
 - **Coherent revision** (per range): the store revision the range's cached contents are exact as
   of. Only the watch advances it. A watch event or progress notification at revision `R`
-  guarantees everything in that watch's range has its latest value as of `R`.
+  guarantees everything in that watch's range has its latest value as of `R`. An event's revision
+  is that of its change, not that of the response carrying it: while a watch catches up, etcd
+  labels its responses with the current revision.
 - **Last-known revision** (global): the highest store revision ever observed through this
   `CacheClient`; from the response header of any operation executed through it, from seed
-  snapshots, and from watch events. Seeing revision `R` from an operation only proves the store
-  has reached `R`; the corresponding changes arrive in the cache later, through the watch.
+  snapshots, and from watch events and progress notifications. Seeing revision `R` from an
+  operation only proves the store has reached `R`; the corresponding changes arrive in the cache
+  later, through the watch.
 
 Both are exposed for introspection via [`CacheClient::coherent_revision`] and
 [`CacheClient::last_known_revision`], and they meet in a single serving rule (the *gate*):
@@ -72,9 +75,9 @@ Consequences:
   arrive through the watch within its normal propagation delay. The gate defends the revisions
   *this* client has observed, not global freshness.
 
-Cache-served responses reuse the [`ResponseHeader`][etcdrs::ResponseHeader] observed from the
-watch or seed, so `header().revision()` always reports the coherent revision the data is exact as
-of.
+Cache-served responses reuse the [`ResponseHeader`][etcdrs::ResponseHeader] of the seed or watch
+response that last advanced the range, with an event's revision in place of its response's, so
+`header().revision()` always reports the coherent revision the data is exact as of.
 
 ## Serving Rules
 
@@ -99,7 +102,9 @@ revision. Recovery is automatic:
   after 100ms, doubling the delay each time the listing fails, up to 30s, and adds its watch once
   it succeeds. Other ranges do not wait for it.
 - **Stream loss** (network failure, server restart): the task re-establishes the watch and resumes
-  every range from its coherent revision; nothing is lost or reapplied. While disconnected,
+  every range from its coherent revision; nothing is lost or reapplied. etcd replays what a range
+  missed in batches of up to 1000 revisions, and the range advances with each batch it applies, so
+  a stream lost partway through a replay resumes after the last batch applied. While disconnected,
   ranges keep serving their last coherent snapshot (labeled with its revision) until an operation
   observes a newer revision, at which point reads pass through like an uncached client.
 - **Compaction** past a watch's resume point: that range is re-listed at the current revision and
@@ -125,10 +130,10 @@ Dropping the last `CacheClient` handle aborts the background task, which cancels
 - **Write-heavy workloads**: every revision observed through this client gates all ranges until a
   progress notification lands (about one round trip). Under constant write churn through the same
   `CacheClient`, reads degrade toward passthrough. Read-mostly workloads are the target.
-- **Multi-key transactions**: events of one revision are applied atomically per watch response,
-  but a fragmented response (etcd fragments at roughly 1.5MB) may split one revision across
-  network reads, briefly exposing a prefix of that revision's changes. Pinned-revision reads
-  (which always pass through) are the escape hatch for strict multi-key snapshots.
+- **Multi-key transactions**: a range applies all of a revision's events at once, so a read of
+  one range never observes part of a transaction. Ranges advance independently, so a transaction
+  that spans two ranges can show in one before the other. Pinned-revision reads (which always
+  pass through) are the escape hatch for strict multi-key snapshots.
 - **Stream-wide progress** correctness relies on etcd ≥ 3.4.26 / 3.5.9; older servers could send
   a progress notification before delivering all prior events, which would let the cache serve
   stale data as fresh.

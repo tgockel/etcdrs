@@ -1,8 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use etcdrs::client::{ClientBuilder, GetResponse, Put, RequestCounter};
-use etcdrs::{Client, Permission, Prefix};
+use etcdrs::{Client, Permission, Prefix, Record, Revision};
 use etcdrs_test::{EtcdServer, etcd_server};
 use etcdrs_util::cache::CacheClient;
 use futures::StreamExt;
@@ -109,6 +109,92 @@ async fn assert_stays_cached(cache: &CacheClient, metrics: &RequestCounter, key:
         assert_eq!(response.record().map(|record| record.value().as_ref()), expected);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// A TCP proxy to an etcd server whose connections a test can cut, so that a client loses its
+/// streams while another keeps writing.
+struct Proxy {
+    listener: Arc<tokio::net::TcpListener>,
+    target: String,
+    /// The task accepting connections, `None` while the proxy is cut.
+    accept: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The tasks forwarding the connections accepted since the proxy was last cut.
+    connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl Proxy {
+    async fn start(server: &EtcdServer) -> Self {
+        let proxy = Proxy {
+            listener: Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap()),
+            target: server.connect_string().trim_start_matches("http://").to_owned(),
+            accept: Mutex::new(None),
+            connections: Arc::default(),
+        };
+        proxy.restore();
+        proxy
+    }
+
+    fn connect_string(&self) -> String {
+        format!("http://{}", self.listener.local_addr().unwrap())
+    }
+
+    /// Close every connection. New ones wait unanswered until [`restore`][Self::restore].
+    async fn cut(&self) {
+        let accept = self.accept.lock().unwrap().take();
+        let connections = std::mem::take(&mut *self.connections.lock().unwrap());
+        for task in accept.into_iter().chain(connections) {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    /// Forward connections again, starting with those that waited while the proxy was cut.
+    fn restore(&self) {
+        let listener = Arc::clone(&self.listener);
+        let target = self.target.clone();
+        let connections = Arc::clone(&self.connections);
+        *self.accept.lock().unwrap() = Some(tokio::spawn(async move {
+            loop {
+                let (mut inbound, _) = listener.accept().await.unwrap();
+                let target = target.clone();
+                connections.lock().unwrap().push(tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                }));
+            }
+        }));
+    }
+}
+
+/// [`counting_client`], connected through `proxy`.
+fn counting_client_via(proxy: &Proxy) -> (Client, Arc<RequestCounter>) {
+    count_requests(Client::builder().add_connection(proxy.connect_string()).unwrap())
+}
+
+/// Put `count` new keys under `foo/new/` through `client`, concurrently, so that each takes a
+/// revision of its own. Returns the latest.
+async fn put_new_keys(client: &Client, count: usize) -> Revision {
+    futures::stream::iter(0..count)
+        .map(|i| {
+            let client = client.clone();
+            async move {
+                let response = client.put(format!("foo/new/{i:04}")).value("v").await.unwrap();
+                response.header().revision()
+            }
+        })
+        .buffer_unordered(256)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .max()
+        .unwrap()
+}
+
+/// Every record under `foo/`, listed by etcd through `client`.
+async fn foo_records(client: &Client) -> Vec<Record> {
+    let view = client.list_prefix("foo/").await.unwrap();
+    view.into_stream().map(Result::unwrap).collect().await
 }
 
 #[rstest]
@@ -516,6 +602,92 @@ async fn compaction_recovery_converges(mut etcd_server: EtcdServer) {
     cache.compact(head).physical().await.unwrap();
 
     eventually_cached(&cache, &metrics, "foo/k", Some(b"v20")).await;
+}
+
+/// etcd replays what a watch missed in batches of up to 1000 revisions, each labeled with its
+/// current revision. The cache used to take that label for its range's from the first batch on, so
+/// it served a partly replayed range as current.
+#[rstest]
+#[tokio::test]
+async fn replay_serves_what_it_applied(etcd_server: EtcdServer) {
+    let external = Client::new(&etcd_server.connect_string()).unwrap();
+    external.put("foo/a").value("v1").await.unwrap();
+
+    let proxy = Proxy::start(&etcd_server).await;
+    let (client, metrics) = counting_client_via(&proxy);
+    let cache = CacheClient::builder(client).cache(Prefix("foo/")).build();
+    eventually_cached(&cache, &metrics, "foo/a", Some(b"v1")).await;
+
+    proxy.cut().await;
+    let last = put_new_keys(&external, 4500).await;
+    proxy.restore();
+
+    // Every key is written once, so at any revision etcd held the keys written by then.
+    let records = foo_records(&external).await;
+    eventually(async || {
+        let before = metrics.get().requested();
+        let view = cache.list_prefix("foo/").await.unwrap();
+        let revision = view.revision();
+        let listed: Vec<Record> = view.into_stream().map(Result::unwrap).collect().await;
+        if metrics.get().requested() != before {
+            return None;
+        }
+        let held: Vec<Record> = records
+            .iter()
+            .filter(|record| record.metadata().modified_revision <= revision)
+            .cloned()
+            .collect();
+        assert!(
+            listed == held,
+            "served {} records at {revision:?}, where etcd held {}",
+            listed.len(),
+            held.len()
+        );
+        (revision >= last).then_some(())
+    })
+    .await;
+}
+
+/// The cache used to resume a watch after the label of the last batch of a replay it applied,
+/// which etcd sets to its current revision, so a stream lost partway through a replay lost the
+/// rest of it for good.
+#[rstest]
+#[tokio::test]
+async fn stream_lost_during_replay_loses_nothing(etcd_server: EtcdServer) {
+    let external = Client::new(&etcd_server.connect_string()).unwrap();
+    external.put("foo/a").value("v1").await.unwrap();
+
+    let proxy = Proxy::start(&etcd_server).await;
+    let (client, metrics) = counting_client_via(&proxy);
+    let cache = CacheClient::builder(client).cache(Prefix("foo/")).build();
+    eventually_cached(&cache, &metrics, "foo/a", Some(b"v1")).await;
+    let seeded = cache.coherent_revision(Prefix("foo/"));
+
+    proxy.cut().await;
+    put_new_keys(&external, 4500).await;
+    // Written last, so it is replayed in the last batch.
+    external.delete("foo/a").await.unwrap();
+    proxy.restore();
+
+    // Cut again once the first batch is applied, with four more to come.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while cache.coherent_revision(Prefix("foo/")) == seeded {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("no batch applied within 30 seconds");
+    proxy.cut().await;
+    proxy.restore();
+
+    let records = foo_records(&external).await;
+    eventually(async || {
+        let before = metrics.get().requested();
+        let view = cache.list_prefix("foo/").await.unwrap();
+        let listed: Vec<Record> = view.into_stream().map(Result::unwrap).collect().await;
+        (metrics.get().requested() == before && listed == records).then_some(())
+    })
+    .await;
 }
 
 /// etcd lists an inverted range as empty but refuses to watch it. The cache unseeds that range and
