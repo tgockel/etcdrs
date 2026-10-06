@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use etcdrs::client::{ClientBuilder, GetResponse, Put, RequestCounter};
-use etcdrs::{Client, Prefix};
+use etcdrs::{Client, Permission, Prefix};
 use etcdrs_test::{EtcdServer, etcd_server};
 use etcdrs_util::cache::CacheClient;
 use futures::StreamExt;
@@ -44,6 +44,21 @@ async fn enable_auth(server: &EtcdServer) -> Client {
         .credentials("root", "rootpw")
         .build()
         .unwrap()
+}
+
+/// [`enable_auth`], then add `eve`, who may read `pub/` and nothing else, and write `pub/x` and
+/// `secret/x`.
+async fn enable_auth_with_reader(server: &EtcdServer) -> Client {
+    let root = enable_auth(server).await;
+    root.user_add("eve").password("evepw").await.unwrap();
+    root.role_add("reader").await.unwrap();
+    root.role_grant_permission("reader", Permission::read(Prefix("pub/")))
+        .await
+        .unwrap();
+    root.user_grant_role("eve", "reader").await.unwrap();
+    root.put("pub/x").value("visible").await.unwrap();
+    root.put("secret/x").value("hidden").await.unwrap();
+    root
 }
 
 /// Poll `condition` until it returns `Some`, panicking after 30 seconds.
@@ -623,6 +638,97 @@ async fn caches_under_auth(etcd_server: EtcdServer) {
     root.put("foo/a").value("v2").await.unwrap();
     eventually_cached(&cache, &metrics, "foo/a", Some(b"v2")).await;
     assert_stays_cached(&cache, &metrics, "foo/a", Some(b"v2")).await;
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
+/// A range the client may not read used to be listed every 100 ms before the first watcher could
+/// start, so no range was watched. Configured first, it also gives the range after it a watch ID
+/// other than its index + 1.
+#[rstest]
+#[tokio::test]
+async fn unreadable_range_does_not_hold_up_the_others(etcd_server: EtcdServer) {
+    let root = enable_auth_with_reader(&etcd_server).await;
+    let (client, metrics) = counting_client_as(&etcd_server, "eve", "evepw");
+    let cache = CacheClient::builder(client)
+        .cache(Prefix("secret/"))
+        .cache(Prefix("pub/"))
+        .build();
+
+    eventually_cached(&cache, &metrics, "pub/x", Some(b"visible")).await;
+    root.put("pub/x").value("v2").await.unwrap();
+    eventually_cached(&cache, &metrics, "pub/x", Some(b"v2")).await;
+    assert_stays_cached(&cache, &metrics, "pub/x", Some(b"v2")).await;
+
+    // Nothing reads through the cache from here on, so each request it makes is a listing of
+    // secret/.
+    assert!(cache.coherent_revision(Prefix("secret/")).is_none());
+    let before = metrics.get().requested();
+    eventually(async || (metrics.get().requested() > before).then_some(())).await;
+    assert!(cache.coherent_revision(Prefix("secret/")).is_none());
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
+/// etcd checks a watch stream's token only when it creates a watch, so a watch added to a stream
+/// that has outlived its token is refused, though the client has since refreshed its own. The cache
+/// used to retry such a watch on the same stream, to be refused again for as long as the stream
+/// lived.
+#[rstest]
+#[tokio::test]
+async fn range_watched_after_its_stream_token_was_revoked(etcd_server: EtcdServer) {
+    let root = enable_auth_with_reader(&etcd_server).await;
+    let (client, metrics) = counting_client_as(&etcd_server, "eve", "evepw");
+    let cache = CacheClient::builder(client)
+        .cache(Prefix("pub/"))
+        .cache(Prefix("secret/"))
+        .build();
+
+    // A watch is live on the stream, so etcdrs keeps the stream when etcd refuses its token.
+    eventually_cached(&cache, &metrics, "pub/x", Some(b"visible")).await;
+    root.put("pub/x").value("v2").await.unwrap();
+    eventually_cached(&cache, &metrics, "pub/x", Some(b"v2")).await;
+
+    // Revoked first, so the stream's token is stale by the time secret/ can be listed.
+    root.user_change_password("eve", "evepw").await.unwrap();
+    root.role_grant_permission("reader", Permission::read(Prefix("secret/")))
+        .await
+        .unwrap();
+
+    eventually_cached(&cache, &metrics, "secret/x", Some(b"hidden")).await;
+    assert_stays_cached(&cache, &metrics, "secret/x", Some(b"hidden")).await;
+    root.put("secret/x").value("v2").await.unwrap();
+    eventually_cached(&cache, &metrics, "secret/x", Some(b"v2")).await;
+
+    // Cleanup: disable auth
+    root.auth_disable().await.unwrap();
+}
+
+/// A watch added to a running stream gets no stream-wide progress. A watcher that started with no
+/// watch, because no range could be listed, used to add every range that way, so once a revision
+/// this client observed left a range behind, it stayed behind until its own next event.
+#[rstest]
+#[tokio::test]
+async fn range_listed_after_the_watcher_started_empty(etcd_server: EtcdServer) {
+    let root = enable_auth_with_reader(&etcd_server).await;
+    let (client, metrics) = counting_client_as(&etcd_server, "eve", "evepw");
+    let cache = CacheClient::builder(client).cache(Prefix("secret/")).build();
+
+    // The first listing takes two requests, one without a token and its replay, so a third is a
+    // listing retried after the watcher started.
+    eventually(async || (metrics.get().requested() >= 3).then_some(())).await;
+    root.role_grant_permission("reader", Permission::read(Prefix("secret/")))
+        .await
+        .unwrap();
+    eventually_cached(&cache, &metrics, "secret/x", Some(b"hidden")).await;
+
+    // A read outside the cache observes a revision secret/ can only be proven to have reached by
+    // stream-wide progress.
+    root.put("pub/y").value("1").await.unwrap();
+    cache.get("pub/y").await.unwrap();
+    eventually_cached(&cache, &metrics, "secret/x", Some(b"hidden")).await;
 
     // Cleanup: disable auth
     root.auth_disable().await.unwrap();

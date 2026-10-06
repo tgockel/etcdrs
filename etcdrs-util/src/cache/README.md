@@ -65,9 +65,9 @@ Consequences:
 - **Re-warming.** When a gated read passes through, the cache asks the watch for a progress
   notification (debounced). One notification re-proves freshness for every range on the stream, so
   quiet ranges return to local serving about one round trip after the disturbance. A range whose
-  watch was re-added after compaction or a refused watch is the exception: until the stream is next
-  re-established, it re-warms only through its own watch events and per-watch progress
-  notifications.
+  watch was added to a running stream, after compaction, a refused watch, or a listing that failed
+  when the stream started, is the exception: until the stream is next re-established, it re-warms
+  only through its own watch events and per-watch progress notifications.
 - **External writers do not gate.** Writes made by other clients bump nothing here; they simply
   arrive through the watch within its normal propagation delay. The gate defends the revisions
   *this* client has observed, not global freshness.
@@ -90,22 +90,30 @@ size, and the client-side stream paginates to completion anyway, so the returned
 
 ## Failure and Recovery
 
-The background task seeds each configured range with a revision-pinned list, then watches all
-ranges on one stream, each watch resuming from just past that range's coherent revision. Recovery
-is automatic:
+The background task seeds each configured range with a revision-pinned list, then watches every
+range it could list on one stream, each watch resuming from just past that range's coherent
+revision. Recovery is automatic:
 
-- **Seeding failures** retry every 100ms; reads of an unseeded range pass through, so startup
-  costs at most one ordinary round trip per read.
+- **Listing failures**: a range the task cannot list, because etcd is unreachable or the client
+  may not read it, is left out of the watch, and its reads pass through. The task lists it again
+  after 100ms, doubling the delay each time the listing fails, up to 30s, and adds its watch once
+  it succeeds. Other ranges do not wait for it.
 - **Stream loss** (network failure, server restart): the task re-establishes the watch and resumes
   every range from its coherent revision; nothing is lost or reapplied. While disconnected,
   ranges keep serving their last coherent snapshot (labeled with its revision) until an operation
   observes a newer revision, at which point reads pass through like an uncached client.
 - **Compaction** past a watch's resume point: that range is re-listed at the current revision and
-  its watch re-added; other ranges are unaffected.
+  its watch re-added; other ranges are unaffected. If it cannot be re-listed, it drops its snapshot
+  and is retried like a listing failure.
 - **Refused watches**: etcd refuses to watch an empty or inverted range, or one the client may not
   read. That range drops its snapshot, so its reads pass through, and the task re-lists it and
   re-adds its watch after 100ms, doubling the delay each time it is refused again or cannot be
   re-listed, up to 30s. Other ranges keep their watches.
+- **Stale auth tokens**: etcd checks a watch stream's auth token only when it creates a watch on
+  it, so the stream can outlive its token, which etcd stops accepting after five minutes unused or
+  a password change, for example. When etcd refuses a re-added watch for that reason, the task
+  starts a new stream with the client's current token, as after a stream loss. The range keeps the
+  snapshot it was just re-listed with.
 
 Dropping the last `CacheClient` handle aborts the background task, which cancels its watches.
 

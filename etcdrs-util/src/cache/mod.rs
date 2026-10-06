@@ -86,8 +86,9 @@ struct RangeState {
     /// The latest known records within the range.
     store: BTreeMap<Bytes, Record>,
     /// The header of the most recent snapshot or event applied to `store`: the store is exact as
-    /// of `header.revision()`. `None` while the range is unseeded: until its initial seed completes,
-    /// and from a refusal of its watch until a retry reseeds it.
+    /// of `header.revision()`. `None` while the range is unseeded: until a listing of it first
+    /// succeeds, and from a refusal of its watch, or a failed listing after compaction, until a
+    /// retry lists it again.
     header: Option<ResponseHeader>,
 }
 
@@ -126,8 +127,8 @@ impl CacheClient {
     ///
     /// Returns `None` if `range` is not one of the configured cache ranges (compared by exact
     /// boundaries, so e.g. `Prefix("a/")` only matches a range cached as that same prefix) or if
-    /// it is not seeded: its initial seed has not completed yet, or etcd refused to watch it and it
-    /// has not been reseeded since.
+    /// it is not seeded: it has not been listed yet, it could not be listed, or etcd refused to
+    /// watch it, and no retry has listed it since.
     pub fn coherent_revision(&self, range: impl AsRange) -> Option<Revision> {
         let spec = RangeSpec::from_range(range);
         let index = self.0.shared.ranges.iter().position(|configured| *configured == spec)?;
