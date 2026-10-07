@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use etcdrs::client::RequestCounter;
 use etcdrs::{Client, OperationError, RetryPolicy};
+use rstest::rstest;
 
 /// Long enough that a retry is never in doubt. Nothing waits this out: the retrying calls are
 /// cancelled the moment they have proven the point, and the tests that do run to completion use
@@ -141,4 +142,20 @@ async fn retry_never_makes_a_single_attempt() {
     assert_never_sent(&err);
 
     assert_eq!(metrics.get().requested(), 1);
+}
+
+/// A deadline too far off for gRPC to send retries with none, as [`RetryPolicy::Forever`] does. It
+/// used to panic: `Duration::MAX` when added to the time the call started, and any deadline still
+/// 100,000,000 hours or more away when tonic encoded the time left.
+#[rstest]
+#[case::duration_max(Duration::MAX)]
+#[case::past_the_grpc_maximum(Duration::from_secs(100_000_001 * 60 * 60))]
+#[tokio::test]
+async fn a_deadline_grpc_cannot_send_retries_like_forever(#[case] deadline: Duration) {
+    let (client, metrics) = unreachable_client(deadline);
+    let call = tokio::spawn(async move { client.get("retry-far-deadline").await });
+
+    wait_for_second_attempt(&metrics).await;
+
+    call.abort();
 }

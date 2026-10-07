@@ -167,14 +167,14 @@ impl<C> GrantLease<C> {
 
     /// Request a time-to-live on the lease.
     ///
-    /// This is only the requested time-to-live; the service will give you a different time-to-live if it is out of
-    /// bounds for the configuration. Check the returned [`ttl`][LeaseInfo::ttl] to see how long you were given in the
-    /// lease.
+    /// This is only the requested time-to-live; the service raises one below its minimum to that minimum. Check the
+    /// returned [`ttl`][LeaseInfo::ttl] to see how long you were given in the lease. One above 9,000,000,000 seconds
+    /// fails with [`TtlTooLarge`][GrantLeaseErrorKind::TtlTooLarge].
     ///
     /// While a [`Duration`] can be nanosecond resolution, the service itself only respects whole seconds. Leaving this
     /// unspecified will use the lowest-possible TTL the server supports (usually 2 seconds).
     pub fn ttl(mut self, duration: Duration) -> Self {
-        self.request.ttl = duration.as_secs() as _;
+        self.request.ttl = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX);
         self
     }
 
@@ -183,7 +183,8 @@ impl<C> GrantLease<C> {
         LeaseId::new(self.request.id)
     }
 
-    /// The requested lease TTL, or `None` when the server default is used.
+    /// The requested lease TTL in whole seconds, at most `i64::MAX` of them, or `None` when the server default is
+    /// used.
     pub fn requested_ttl(&self) -> Option<Duration> {
         (self.request.ttl > 0).then(|| Duration::from_secs(self.request.ttl as _))
     }
@@ -1278,6 +1279,19 @@ mod test {
         let mut second = KeepAliveReceiverStream::new(&requests);
         assert_eq!(take(&mut second), Poll::Ready(Some(1)));
         assert_eq!(take(&mut second), Poll::Ready(None));
+    }
+
+    /// etcd raises a negative TTL to its minimum, so a TTL past `i64::MAX` seconds must not wrap.
+    #[test]
+    fn a_ttl_past_i64_max_seconds_saturates() {
+        for ttl in [Duration::from_secs(1 << 63), Duration::MAX] {
+            let grant = GrantLease::new().ttl(ttl);
+            assert_eq!(
+                grant.requested_ttl(),
+                Some(Duration::from_secs(i64::MAX as u64)),
+                "{ttl:?}"
+            );
+        }
     }
 
     #[test]

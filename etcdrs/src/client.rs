@@ -81,6 +81,9 @@ pub enum RetryPolicy {
     /// The time left in that budget is also the gRPC deadline sent with each request, recomputed
     /// for every attempt. Once the budget is spent that deadline is zero, so a request dispatched
     /// after it lapsed fails immediately rather than running unbounded.
+    ///
+    /// A duration of 100,000,000 hours or more, too long for gRPC to send as a deadline, retries with
+    /// no deadline, as [`Forever`][Self::Forever] does.
     WithDeadline(std::time::Duration),
     /// Never retry; return the first error immediately.
     Never,
@@ -218,14 +221,16 @@ impl ClientInner {
     where
         Request: Clone,
     {
+        // tonic's `set_timeout` panics on this or more: `grpc-timeout` holds at most eight digits of hours.
+        const GRPC_TIMEOUT_LIMIT: std::time::Duration = std::time::Duration::from_secs(100_000_000 * 60 * 60);
         let deadline: Option<std::time::Instant> = match &self.retry_policy {
-            RetryPolicy::WithDeadline(d) => Some(std::time::Instant::now() + *d),
-            RetryPolicy::Never | RetryPolicy::Forever => None,
+            RetryPolicy::WithDeadline(d) if *d < GRPC_TIMEOUT_LIMIT => std::time::Instant::now().checked_add(*d),
+            RetryPolicy::WithDeadline(_) | RetryPolicy::Never | RetryPolicy::Forever => None,
         };
         let timing_allows_retry = || match &self.retry_policy {
             RetryPolicy::Never => false,
             RetryPolicy::Forever => true,
-            RetryPolicy::WithDeadline(_) => deadline.is_some_and(|d| std::time::Instant::now() <= d),
+            RetryPolicy::WithDeadline(_) => deadline.is_none_or(|d| std::time::Instant::now() <= d),
         };
         // Zero rather than absent once the deadline has passed: an attempt sent with no
         // `grpc-timeout` at all can outlive the budget indefinitely.

@@ -39,6 +39,28 @@ async fn leases(etcd_cluster: EtcdCluster) {
     assert_eq!(revoke_err.kind(), RevokeLeaseErrorKind::NotFound, "{revoke_err:?}");
 }
 
+/// etcd refuses a TTL over its `MaxLeaseTTL` of 9,000,000,000 seconds. A TTL of 2^63 seconds or more
+/// used to wrap negative, which etcd raised to its minimum TTL.
+#[rstest]
+#[case::one_past_max_lease_ttl(Duration::from_secs(9_000_000_001))]
+#[case::duration_max(Duration::MAX)]
+#[tokio::test]
+async fn a_ttl_over_the_maximum_is_too_large(etcd_server: EtcdServer, #[case] ttl: Duration) {
+    let client = Client::new(&etcd_server.connect_string()).unwrap();
+
+    let err = client
+        .grant_lease()
+        .ttl(ttl)
+        .await
+        .expect_err("etcd should refuse the TTL");
+    assert_eq!(err.kind(), GrantLeaseErrorKind::TtlTooLarge, "{err:?}");
+    assert_eq!(
+        err.grpc_status().map(|s| s.message()),
+        Some("etcdserver: too large lease TTL"),
+        "{err:?}"
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn time_to_live(etcd_cluster: EtcdCluster) {
