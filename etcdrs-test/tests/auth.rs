@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use etcdrs::client::{KeepAliveResponse, LeaseKeeper, RequestCounter, Watch, WatchEvent, Watcher};
+use etcdrs::client::{Get, KeepAliveResponse, LeaseKeeper, RequestCounter, Watch, WatchEvent, Watcher};
 use etcdrs::{
     KeepAliveError, KeepAliveErrorKind, Permission, Prefix, Record, TargetRange, WatchError, WatchErrorKind, WatchId,
 };
@@ -150,6 +150,18 @@ async fn auth_lifecycle(etcd_server: EtcdServer) {
     let unauthed = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
     let err = unauthed.get("foo").await.unwrap_err();
     assert_eq!(err.kind(), etcdrs::GetErrorKind::Authentication);
+    let err = unauthed
+        .transaction()
+        .and_then_do(Get::new("foo"))
+        .commit()
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), etcdrs::TransactionErrorKind::Authentication, "{err:?}");
+    assert_eq!(
+        err.grpc_status().map(|s| s.message()),
+        Some("etcdserver: user name is empty"),
+        "{err:?}"
+    );
 
     // Cleanup: disable auth
     authed.auth_disable().await.unwrap();
@@ -456,6 +468,31 @@ async fn role_already_exists(etcd_server: EtcdServer) {
     client.role_add("myrole").await.unwrap();
     let err = client.role_add("myrole").await.unwrap_err();
     assert_eq!(err.kind(), etcdrs::RoleErrorKind::RoleAlreadyExists);
+}
+
+/// etcd refuses a role with no name with an `INVALID_ARGUMENT` about the request, which used to be
+/// reported as `Authentication`. A user with no name gets the same status as a request without a
+/// token, so it still is.
+#[rstest]
+#[tokio::test]
+async fn empty_names_are_refused(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+
+    let err = client.role_add("").await.unwrap_err();
+    assert_eq!(err.kind(), etcdrs::RoleErrorKind::Unknown, "{err:?}");
+    assert_eq!(
+        err.grpc_status().map(|s| s.message()),
+        Some("etcdserver: role name is empty"),
+        "{err:?}"
+    );
+
+    let err = client.user_add("").password("pw").await.unwrap_err();
+    assert_eq!(err.kind(), etcdrs::UserErrorKind::Authentication, "{err:?}");
+    assert_eq!(
+        err.grpc_status().map(|s| s.message()),
+        Some("etcdserver: user name is empty"),
+        "{err:?}"
+    );
 }
 
 /// Watch and keep-alive streams used to open with no token, so etcd refused every watch and ended

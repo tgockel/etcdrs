@@ -2,7 +2,7 @@ use bytes::Bytes;
 
 use crate::{
     Client, LeaseId, Record, ResponseHeader, Revision,
-    client::{Delete, Get, GetPreviousValue, List, Put, record_from_pb},
+    client::{ClientInner, Delete, Get, GetPreviousValue, List, Put, record_from_pb},
     pb::etcdserverpb,
     record::{AsKey, AsValue},
 };
@@ -564,7 +564,8 @@ pub enum TransactionErrorKind {
     /// The request structure is invalid.
     ///
     /// This comes from the gRPC API as `INVALID_ARGUMENT`. Common causes include too many operations, duplicate keys
-    /// in the same branch, or invalid sub-operation arguments.
+    /// in the same branch, or invalid sub-operation arguments. The two `INVALID_ARGUMENT` responses about the token are
+    /// reported as [`Authentication`][Self::Authentication] instead.
     InvalidArgument,
     /// A sub-operation requested a revision older than the server has.
     ///
@@ -580,7 +581,8 @@ pub enum TransactionErrorKind {
     LeaseNotFound,
     /// There is an authentication or authorization error.
     ///
-    /// This comes from the gRPC API as `UNAUTHENTICATED` or `PERMISSION_DENIED`.
+    /// This comes from the gRPC API as `UNAUTHENTICATED` or `PERMISSION_DENIED`, or as `INVALID_ARGUMENT` with
+    /// "etcdserver: user name is empty" or "etcdserver: revision of auth store is old".
     Authentication,
     /// The server or transport is resource-exhausted.
     ///
@@ -614,6 +616,9 @@ define_op_error! {
 impl TransactionError {
     pub(crate) fn from_status(status: tonic::Status) -> Self {
         let kind = match status.code() {
+            tonic::Code::InvalidArgument if ClientInner::is_stale_token_error(&status) => {
+                TransactionErrorKind::Authentication
+            }
             tonic::Code::InvalidArgument => TransactionErrorKind::InvalidArgument,
             tonic::Code::NotFound => TransactionErrorKind::LeaseNotFound,
             tonic::Code::Unauthenticated => TransactionErrorKind::Authentication,
@@ -635,5 +640,27 @@ impl TransactionError {
             _ => TransactionErrorKind::Unknown,
         };
         Self::new(kind, "", Some(status))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// A transaction sent without a token gets "user name is empty".
+    #[test]
+    fn invalid_argument_is_authentication_only_for_token_messages() {
+        use TransactionErrorKind::*;
+
+        for (message, expected) in [
+            ("etcdserver: user name is empty", Authentication),
+            ("etcdserver: revision of auth store is old", Authentication),
+            ("etcdserver: too many operations in txn request", InvalidArgument),
+            ("etcdserver: duplicate key given in txn request", InvalidArgument),
+            ("etcdserver: key is not provided", InvalidArgument),
+        ] {
+            let kind = TransactionError::from_status(tonic::Status::invalid_argument(message)).kind();
+            assert_eq!(kind, expected, "{message:?}");
+        }
     }
 }

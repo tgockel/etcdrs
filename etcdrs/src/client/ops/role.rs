@@ -8,6 +8,7 @@ use bytes::Bytes;
 
 use crate::{
     Client, ResponseHeader,
+    client::ClientInner,
     pb::{authpb, etcdserverpb},
     range::{AsRange, TargetRange},
 };
@@ -737,8 +738,11 @@ pub enum RoleErrorKind {
     AuthNotEnabled,
     /// There is an authentication or authorization error.
     ///
-    /// This comes from the gRPC API as `UNAUTHENTICATED`, `PERMISSION_DENIED` and
-    /// `INVALID_ARGUMENT` when the argument describes an authentication error.
+    /// This comes from the gRPC API as `UNAUTHENTICATED` or `PERMISSION_DENIED`, or as
+    /// `INVALID_ARGUMENT` with "etcdserver: user name is empty" or "etcdserver: revision of auth
+    /// store is old". Other `INVALID_ARGUMENT` responses describe the request rather than the
+    /// caller, and are reported as [`InvalidAuthManagement`][Self::InvalidAuthManagement] or
+    /// [`Unknown`][Self::Unknown].
     Authentication,
     /// The server or transport is resource-exhausted.
     ///
@@ -755,8 +759,11 @@ pub enum RoleErrorKind {
     Timeout,
     /// An error that is not covered by any other error kind.
     ///
-    /// All uncovered gRPC errors are mapped to this kind of error. They should not happen unless
-    /// the etcd server has changed its error codes.
+    /// All uncovered gRPC errors are mapped to this kind of error. Among them are
+    /// `INVALID_ARGUMENT` responses that describe the request, such as "etcdserver: role name is
+    /// empty" for [`role_add`][Client::role_add] with an empty name. Their message is available
+    /// from [`grpc_status`][RoleError::grpc_status]. Other uncovered errors should not happen
+    /// unless the etcd server has changed its error codes.
     Unknown,
 }
 
@@ -791,8 +798,10 @@ impl RoleError {
             tonic::Code::InvalidArgument => {
                 if status.message().contains("invalid auth management") {
                     RoleErrorKind::InvalidAuthManagement
-                } else {
+                } else if ClientInner::is_stale_token_error(&status) {
                     RoleErrorKind::Authentication
+                } else {
+                    RoleErrorKind::Unknown
                 }
             }
             tonic::Code::ResourceExhausted => RoleErrorKind::Exhausted,
@@ -815,3 +824,25 @@ const _: () = {
         _assert_send::<RoleRevokePermissionFuture>();
     }
 };
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// `role_add("")` gets "role name is empty", which is about the request.
+    #[test]
+    fn invalid_argument_is_authentication_only_for_token_messages() {
+        use RoleErrorKind::*;
+
+        for (message, expected) in [
+            ("etcdserver: user name is empty", Authentication),
+            ("etcdserver: revision of auth store is old", Authentication),
+            ("etcdserver: invalid auth management", InvalidAuthManagement),
+            ("etcdserver: role name is empty", Unknown),
+            ("etcdserver: request is too large", Unknown),
+        ] {
+            let kind = RoleError::from_status(tonic::Status::invalid_argument(message)).kind();
+            assert_eq!(kind, expected, "{message:?}");
+        }
+    }
+}

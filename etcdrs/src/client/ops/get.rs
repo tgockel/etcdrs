@@ -8,6 +8,7 @@ use bytes::Bytes;
 
 use crate::{
     Client, ResponseHeader, Revision,
+    client::ClientInner,
     pb::etcdserverpb,
     record::{AsKey, Record},
 };
@@ -177,8 +178,9 @@ pub enum GetErrorKind {
     FutureRevision,
     /// There is an authentication or authorization error.
     ///
-    /// This comes from the gRPC API as `UNAUTHENTICATED`, `PERMISSION_DENIED` and `INVALID_ARGUMENT` when the argument
-    /// describes an authentication error.
+    /// This comes from the gRPC API as `UNAUTHENTICATED` or `PERMISSION_DENIED`, or as `INVALID_ARGUMENT` with
+    /// "etcdserver: user name is empty" or "etcdserver: revision of auth store is old". Other `INVALID_ARGUMENT`
+    /// responses describe the request rather than the caller, and are reported as [`Unknown`][Self::Unknown].
     Authentication,
     /// The server or transport is resource-exhausted.
     ///
@@ -199,7 +201,9 @@ pub enum GetErrorKind {
     DataLoss,
     /// An error that is not covered by any other error kind.
     ///
-    /// All uncovered gRPC errors are mapped to this kind of error. They should not happen unless the etcd server has
+    /// All uncovered gRPC errors are mapped to this kind of error. Among them are `INVALID_ARGUMENT` responses that
+    /// describe the request, such as "etcdserver: key is not provided" for the empty key. Their message is available
+    /// from [`grpc_status`][GetError::grpc_status]. Other uncovered errors should not happen unless the etcd server has
     /// changed its error codes. These can also be emitted from the client if the server does something unexpected
     /// (for example, returning more than one record for a single-key get).
     Unknown,
@@ -215,8 +219,7 @@ impl GetError {
         let kind = match status.code() {
             tonic::Code::Unauthenticated => GetErrorKind::Authentication,
             tonic::Code::PermissionDenied => GetErrorKind::Authentication,
-            // NOTE: Other "invalid arguments" won't be returned because we won't send bad arguments
-            tonic::Code::InvalidArgument => GetErrorKind::Authentication,
+            tonic::Code::InvalidArgument if ClientInner::is_stale_token_error(&status) => GetErrorKind::Authentication,
             tonic::Code::ResourceExhausted => GetErrorKind::Exhausted,
             tonic::Code::OutOfRange => {
                 if status.message().contains("compacted") {
@@ -242,3 +245,24 @@ const _: () = {
         _assert_send::<GetFuture>();
     }
 };
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// `get("")` gets "key is not provided", which is about the request.
+    #[test]
+    fn invalid_argument_is_authentication_only_for_token_messages() {
+        use GetErrorKind::*;
+
+        for (message, expected) in [
+            ("etcdserver: user name is empty", Authentication),
+            ("etcdserver: revision of auth store is old", Authentication),
+            ("etcdserver: key is not provided", Unknown),
+            ("etcdserver: invalid sort option", Unknown),
+        ] {
+            let kind = GetError::from_status(tonic::Status::invalid_argument(message)).kind();
+            assert_eq!(kind, expected, "{message:?}");
+        }
+    }
+}

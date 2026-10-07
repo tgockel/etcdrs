@@ -1,6 +1,9 @@
 use std::{fmt::Debug, sync::Arc, time::Duration};
 
-use etcdrs::{AsRange, CompactErrorKind, OperationError, Prefix, Revision, Version, WatchErrorKind, client::List};
+use etcdrs::{
+    AsRange, CompactErrorKind, DeleteErrorKind, GetErrorKind, OperationError, Prefix, PutErrorKind, Revision, Version,
+    WatchErrorKind, client::List,
+};
 use etcdrs_test::{EtcdCluster, EtcdServer, etcd_cluster, etcd_server};
 use futures::StreamExt;
 use rstest::rstest;
@@ -212,9 +215,9 @@ async fn assert_lists(client: &etcdrs::Client, range: impl AsRange + Clone + Deb
     assert_eq!(counted, expected.len(), "{range:?} counted the wrong keys");
 }
 
-/// Helper: assert that etcd refused `result` for naming the empty key.
+/// Helper: assert that etcd refused `result` for naming the empty key, and return the refusal.
 #[track_caller]
-fn assert_key_not_provided<T>(result: Result<T, impl OperationError>) {
+fn assert_key_not_provided<T, E: OperationError>(result: Result<T, E>) -> E {
     let Err(err) = result else {
         panic!("a request for the empty key succeeded");
     };
@@ -223,6 +226,7 @@ fn assert_key_not_provided<T>(result: Result<T, impl OperationError>) {
         Some("etcdserver: key is not provided"),
         "{err:?}"
     );
+    err
 }
 
 /// etcd has no empty key, so a range from `""` starts at the first key, `"\0"`, and the empty
@@ -279,20 +283,47 @@ async fn default_list_addresses_every_key(etcd_server: EtcdServer) {
 }
 
 /// etcd has no empty key and refuses every request for one. Listing it used to list every key
-/// instead, because the list driver turned the empty key into the whole keyspace.
+/// instead, because the list driver turned the empty key into the whole keyspace. The refusal is
+/// about the request, so it is `Unknown`; it used to be reported as `Authentication`.
 #[rstest]
 #[tokio::test]
 async fn the_empty_key_is_refused(etcd_server: EtcdServer) {
     let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
     client.put("a").value("a").await.unwrap();
 
-    assert_key_not_provided(client.get("").await);
-    assert_key_not_provided(client.list("").await);
-    assert_key_not_provided(client.list("").keys_only().await);
-    assert_key_not_provided(client.list("").count_only().await);
-    assert_key_not_provided(client.delete("").await);
-    assert_key_not_provided(client.delete_range("").await);
+    let err = assert_key_not_provided(client.get("").await);
+    assert_eq!(err.kind(), GetErrorKind::Unknown, "{err:?}");
+    let err = assert_key_not_provided(client.list("").await);
+    assert_eq!(err.kind(), GetErrorKind::Unknown, "{err:?}");
+    let err = assert_key_not_provided(client.list("").keys_only().await);
+    assert_eq!(err.kind(), GetErrorKind::Unknown, "{err:?}");
+    let err = assert_key_not_provided(client.list("").count_only().await);
+    assert_eq!(err.kind(), GetErrorKind::Unknown, "{err:?}");
+    let err = assert_key_not_provided(client.put("").value("a").await);
+    assert_eq!(err.kind(), PutErrorKind::Unknown, "{err:?}");
+    let err = assert_key_not_provided(client.delete("").await);
+    assert_eq!(err.kind(), DeleteErrorKind::Unknown, "{err:?}");
+    let err = assert_key_not_provided(client.delete_range("").await);
+    assert_eq!(err.kind(), DeleteErrorKind::Unknown, "{err:?}");
     assert_eq!(client.list(..).count_only().await.unwrap().count(), 1);
+}
+
+/// etcd refuses a request over its `--max-request-bytes`, 1.5 MiB by default, with an
+/// `INVALID_ARGUMENT` about the request, which used to be reported as `Authentication`. The value
+/// stays under the 2 MiB gRPC receive limit, past which the server refuses the message with
+/// `RESOURCE_EXHAUSTED` instead.
+#[rstest]
+#[tokio::test]
+async fn an_oversized_put_is_unclassified(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+
+    let err = client.put("big").value(vec![0u8; 1_600_000]).await.unwrap_err();
+    assert_eq!(err.kind(), PutErrorKind::Unknown, "{err:?}");
+    assert_eq!(
+        err.grpc_status().map(|s| s.message()),
+        Some("etcdserver: request is too large"),
+        "{err:?}"
+    );
 }
 
 #[rstest]

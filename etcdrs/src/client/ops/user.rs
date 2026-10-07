@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::{Client, ResponseHeader, pb::etcdserverpb};
+use crate::{Client, ResponseHeader, client::ClientInner, pb::etcdserverpb};
 
 /// # User Management
 impl Client {
@@ -757,8 +757,14 @@ pub enum UserErrorKind {
     AuthNotEnabled,
     /// There is an authentication or authorization error.
     ///
-    /// This comes from the gRPC API as `UNAUTHENTICATED`, `PERMISSION_DENIED` and
-    /// `INVALID_ARGUMENT` when the argument describes an authentication error.
+    /// This comes from the gRPC API as `UNAUTHENTICATED` or `PERMISSION_DENIED`, or as
+    /// `INVALID_ARGUMENT` with "etcdserver: user name is empty" or "etcdserver: revision of auth
+    /// store is old". Other `INVALID_ARGUMENT` responses describe the request rather than the
+    /// caller, and are reported as [`InvalidAuthManagement`][Self::InvalidAuthManagement] or
+    /// [`Unknown`][Self::Unknown].
+    ///
+    /// [`user_add`][Client::user_add] with an empty name is refused with the same "etcdserver: user
+    /// name is empty" as a request without a token, so it is reported as this kind too.
     Authentication,
     /// The server or transport is resource-exhausted.
     ///
@@ -775,8 +781,11 @@ pub enum UserErrorKind {
     Timeout,
     /// An error that is not covered by any other error kind.
     ///
-    /// All uncovered gRPC errors are mapped to this kind of error. They should not happen unless
-    /// the etcd server has changed its error codes.
+    /// All uncovered gRPC errors are mapped to this kind of error. Among them are
+    /// `INVALID_ARGUMENT` responses that describe the request, such as "etcdserver: request is too
+    /// large" for a request over the server's `--max-request-bytes`. Their message is available
+    /// from [`grpc_status`][UserError::grpc_status]. Other uncovered errors should not happen
+    /// unless the etcd server has changed its error codes.
     Unknown,
 }
 
@@ -814,8 +823,10 @@ impl UserError {
             tonic::Code::InvalidArgument => {
                 if status.message().contains("invalid auth management") {
                     UserErrorKind::InvalidAuthManagement
-                } else {
+                } else if ClientInner::is_stale_token_error(&status) {
                     UserErrorKind::Authentication
+                } else {
+                    UserErrorKind::Unknown
                 }
             }
             tonic::Code::ResourceExhausted => UserErrorKind::Exhausted,
@@ -838,3 +849,25 @@ const _: () = {
         _assert_send::<UserRevokeRoleFuture>();
     }
 };
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// `user_add("")` also gets "user name is empty", so it cannot be told apart from a request
+    /// without a token.
+    #[test]
+    fn invalid_argument_is_authentication_only_for_token_messages() {
+        use UserErrorKind::*;
+
+        for (message, expected) in [
+            ("etcdserver: user name is empty", Authentication),
+            ("etcdserver: revision of auth store is old", Authentication),
+            ("etcdserver: invalid auth management", InvalidAuthManagement),
+            ("etcdserver: request is too large", Unknown),
+        ] {
+            let kind = UserError::from_status(tonic::Status::invalid_argument(message)).kind();
+            assert_eq!(kind, expected, "{message:?}");
+        }
+    }
+}

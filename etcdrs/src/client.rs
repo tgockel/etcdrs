@@ -332,6 +332,9 @@ impl ClientInner {
     /// `UNAUTHENTICATED` is the only code `ErrInvalidAuthToken` uses, so it is matched on its own.
     /// The other two share `INVALID_ARGUMENT` with unrelated errors (`ErrInvalidAuthMgmt`,
     /// `ErrEmptyKey`, ...), so they are matched on the exact message, as etcd's own client does.
+    ///
+    /// The error classifiers report an `INVALID_ARGUMENT` as `Authentication` only when this
+    /// matches it, so changing it changes the public error kinds.
     fn is_stale_token_error(status: &tonic::Status) -> bool {
         match status.code() {
             tonic::Code::Unauthenticated => true,

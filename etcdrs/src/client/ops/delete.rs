@@ -9,7 +9,7 @@ use bytes::Bytes;
 
 use crate::{
     AsRange, Client, Prefix, ResponseHeader, TargetRange,
-    client::GetPreviousValue,
+    client::{ClientInner, GetPreviousValue},
     pb::etcdserverpb,
     record::{AsKey, Record},
 };
@@ -293,8 +293,9 @@ where
 pub enum DeleteErrorKind {
     /// There is an authentication or authorization error.
     ///
-    /// This comes from the gRPC API as `UNAUTHENTICATED`, `PERMISSION_DENIED` and `INVALID_ARGUMENT` when the argument
-    /// describes an authentication error.
+    /// This comes from the gRPC API as `UNAUTHENTICATED` or `PERMISSION_DENIED`, or as `INVALID_ARGUMENT` with
+    /// "etcdserver: user name is empty" or "etcdserver: revision of auth store is old". Other `INVALID_ARGUMENT`
+    /// responses describe the request rather than the caller, and are reported as [`Unknown`][Self::Unknown].
     Authentication,
     /// The server or transport is resource-exhausted.
     ///
@@ -311,8 +312,10 @@ pub enum DeleteErrorKind {
     Timeout,
     /// An error that is not covered by any other error kind.
     ///
-    /// All uncovered gRPC errors are mapped to this kind of error. They should not happen unless the etcd server has
-    /// changed its error codes.
+    /// All uncovered gRPC errors are mapped to this kind of error. Among them are `INVALID_ARGUMENT` responses that
+    /// describe the request, such as "etcdserver: key is not provided" for the empty key. Their message is available
+    /// from [`grpc_status`][DeleteError::grpc_status]. Other uncovered errors should not happen unless the etcd server
+    /// has changed its error codes.
     Unknown,
 }
 
@@ -326,8 +329,9 @@ impl DeleteError {
         let kind = match status.code() {
             tonic::Code::Unauthenticated => DeleteErrorKind::Authentication,
             tonic::Code::PermissionDenied => DeleteErrorKind::Authentication,
-            // NOTE: Other "invalid arguments" won't be returned because we won't send bad arguments
-            tonic::Code::InvalidArgument => DeleteErrorKind::Authentication,
+            tonic::Code::InvalidArgument if ClientInner::is_stale_token_error(&status) => {
+                DeleteErrorKind::Authentication
+            }
             tonic::Code::ResourceExhausted => DeleteErrorKind::Exhausted,
             tonic::Code::Unavailable => DeleteErrorKind::Unavailable,
             // Don't care who timed us out
@@ -347,3 +351,24 @@ const _: () = {
         _assert_send::<DeleteFuture<Result<DeleteResponse<usize, GetPreviousValue>, DeleteError>>>();
     }
 };
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// `delete("")` gets "key is not provided", which is about the request.
+    #[test]
+    fn invalid_argument_is_authentication_only_for_token_messages() {
+        use DeleteErrorKind::*;
+
+        for (message, expected) in [
+            ("etcdserver: user name is empty", Authentication),
+            ("etcdserver: revision of auth store is old", Authentication),
+            ("etcdserver: key is not provided", Unknown),
+            ("etcdserver: request is too large", Unknown),
+        ] {
+            let kind = DeleteError::from_status(tonic::Status::invalid_argument(message)).kind();
+            assert_eq!(kind, expected, "{message:?}");
+        }
+    }
+}

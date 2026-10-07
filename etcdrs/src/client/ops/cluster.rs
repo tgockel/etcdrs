@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::{Client, ClusterResponseHeader, MemberId, pb::etcdserverpb};
+use crate::{Client, ClusterResponseHeader, MemberId, client::ClientInner, pb::etcdserverpb};
 
 /// # Cluster Membership
 impl Client {
@@ -698,9 +698,9 @@ pub enum ClusterErrorKind {
     /// There is an authentication or authorization error.
     ///
     /// This comes from the gRPC API as `UNAUTHENTICATED` or `PERMISSION_DENIED`, or as
-    /// `INVALID_ARGUMENT` with "etcdserver: user name is empty", "etcdserver: revision of auth
-    /// store is old" or "etcdserver: invalid auth management". Other `INVALID_ARGUMENT` responses
-    /// describe the request rather than the caller, and are reported as [`Unknown`][Self::Unknown].
+    /// `INVALID_ARGUMENT` with "etcdserver: user name is empty" or "etcdserver: revision of auth
+    /// store is old". Other `INVALID_ARGUMENT` responses describe the request rather than the
+    /// caller, and are reported as [`Unknown`][Self::Unknown].
     Authentication,
     /// The server or transport is resource-exhausted.
     ///
@@ -721,7 +721,11 @@ pub enum ClusterErrorKind {
     Timeout,
     /// An error that is not covered by any other error kind.
     ///
-    /// All uncovered gRPC errors are mapped to this kind of error. They should not happen unless
+    /// All uncovered gRPC errors are mapped to this kind of error. Among them are
+    /// `INVALID_ARGUMENT` responses that describe the request, such as "etcdserver: given member
+    /// URLs are invalid" for a malformed peer URL, and refusals that have no kind of their own yet,
+    /// such as "etcdserver: too many learner members in cluster". Their message is available from
+    /// [`grpc_status`][ClusterError::grpc_status]. Other uncovered errors should not happen unless
     /// the etcd server has changed its error codes.
     Unknown,
 }
@@ -764,18 +768,14 @@ impl ClusterError {
             },
             (tonic::Code::Unauthenticated, _) => ClusterErrorKind::Authentication,
             (tonic::Code::PermissionDenied, _) => ClusterErrorKind::Authentication,
-            // The only INVALID_ARGUMENT statuses a cluster RPC reaches that describe the caller --
-            // the same three `ClientInner::is_stale_token_error` keys on. The rest describe the
-            // request, above all "etcdserver: given member URLs are invalid" for the peer URLs
-            // `member_add` hands to `types.NewURLs`. Those fall through to `Unknown`, because the
-            // kind that one wants cannot be added to an exhaustive enum in a released 0.1.x
-            // without breaking downstream matches.
-            (
-                tonic::Code::InvalidArgument,
-                "etcdserver: user name is empty"
-                | "etcdserver: revision of auth store is old"
-                | "etcdserver: invalid auth management",
-            ) => ClusterErrorKind::Authentication,
+            // An INVALID_ARGUMENT that is not about the token describes the request, above all
+            // "etcdserver: given member URLs are invalid" for the peer URLs `member_add` hands to
+            // `types.NewURLs`. Those fall through to `Unknown`, because the kind that one wants
+            // cannot be added to an exhaustive enum in a released 0.1.x without breaking
+            // downstream matches.
+            (tonic::Code::InvalidArgument, _) if ClientInner::is_stale_token_error(&status) => {
+                ClusterErrorKind::Authentication
+            }
             (tonic::Code::ResourceExhausted, _) => ClusterErrorKind::Exhausted,
             (tonic::Code::DataLoss, _) => ClusterErrorKind::DataLoss,
             // `ErrGRPCUnhealthy` is the one strict-reconfig refusal that keeps a code of its own,
@@ -862,19 +862,20 @@ mod test {
         );
     }
 
-    /// `INVALID_ARGUMENT` is not answered on the code alone: only these three messages describe
-    /// an authentication problem. "given member URLs are invalid" is the reason it cannot be --
-    /// `member_add` forwards caller-supplied peer URLs, so it is the one a caller can actually
-    /// provoke. It wants a kind of its own, which an exhaustive public enum shipped in 0.1.0
-    /// cannot have, so it stays `Unknown` until an incompatible release.
+    /// `INVALID_ARGUMENT` is not answered on the code alone: only the two messages about the token
+    /// describe an authentication problem. "given member URLs are invalid" is the reason it cannot
+    /// be -- `member_add` forwards caller-supplied peer URLs, so it is the one a caller can
+    /// actually provoke. It wants a kind of its own, which an exhaustive public enum shipped in
+    /// 0.1.0 cannot have, so it stays `Unknown` until an incompatible release. "invalid auth
+    /// management" comes only from user and role RPCs.
     #[test]
-    fn invalid_argument_is_authentication_only_for_auth_messages() {
+    fn invalid_argument_is_authentication_only_for_token_messages() {
         use ClusterErrorKind::*;
 
         for (message, expected) in [
             ("etcdserver: user name is empty", Authentication),
             ("etcdserver: revision of auth store is old", Authentication),
-            ("etcdserver: invalid auth management", Authentication),
+            ("etcdserver: invalid auth management", Unknown),
             ("etcdserver: given member URLs are invalid", Unknown),
             ("etcdserver: request is too large", Unknown),
             ("etcdserver: invalid client api version", Unknown),

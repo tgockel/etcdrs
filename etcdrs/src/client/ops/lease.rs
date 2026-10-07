@@ -12,7 +12,7 @@ use std::{
 use bytes::Bytes;
 use futures_core::Stream;
 
-use crate::{Client, LeaseId, ResponseHeader, pb::etcdserverpb};
+use crate::{Client, LeaseId, ResponseHeader, client::ClientInner, pb::etcdserverpb};
 
 /// # Leases
 impl Client {
@@ -361,8 +361,9 @@ pub enum GrantLeaseErrorKind {
     TtlTooLarge,
     /// There is an authentication or authorization error.
     ///
-    /// This comes from the gRPC API as `UNAUTHENTICATED`, `PERMISSION_DENIED` and `INVALID_ARGUMENT` when the argument
-    /// describes an authentication error.
+    /// This comes from the gRPC API as `UNAUTHENTICATED` or `PERMISSION_DENIED`, or as `INVALID_ARGUMENT` with
+    /// "etcdserver: user name is empty" or "etcdserver: revision of auth store is old". Other `INVALID_ARGUMENT`
+    /// responses describe the request rather than the caller, and are reported as [`Unknown`][Self::Unknown].
     Authentication,
     /// The server or transport is resource-exhausted.
     ///
@@ -398,8 +399,9 @@ impl GrantLeaseError {
         let kind = match status.code() {
             tonic::Code::Unauthenticated => GrantLeaseErrorKind::Authentication,
             tonic::Code::PermissionDenied => GrantLeaseErrorKind::Authentication,
-            // NOTE: Other "invalid arguments" won't be returned because we won't send bad arguments
-            tonic::Code::InvalidArgument => GrantLeaseErrorKind::Authentication,
+            tonic::Code::InvalidArgument if ClientInner::is_stale_token_error(&status) => {
+                GrantLeaseErrorKind::Authentication
+            }
             tonic::Code::ResourceExhausted => GrantLeaseErrorKind::Exhausted,
             tonic::Code::OutOfRange => GrantLeaseErrorKind::TtlTooLarge,
             tonic::Code::FailedPrecondition => {
@@ -429,8 +431,9 @@ pub enum RevokeLeaseErrorKind {
     NotFound,
     /// There is an authentication or authorization error.
     ///
-    /// This comes from the gRPC API as `UNAUTHENTICATED`, `PERMISSION_DENIED` and `INVALID_ARGUMENT` when the argument
-    /// describes an authentication error.
+    /// This comes from the gRPC API as `UNAUTHENTICATED` or `PERMISSION_DENIED`, or as `INVALID_ARGUMENT` with
+    /// "etcdserver: user name is empty" or "etcdserver: revision of auth store is old". Other `INVALID_ARGUMENT`
+    /// responses describe the request rather than the caller, and are reported as [`Unknown`][Self::Unknown].
     Authentication,
     /// The server or transport is resource-exhausted.
     ///
@@ -467,8 +470,9 @@ impl RevokeLeaseError {
             tonic::Code::NotFound => RevokeLeaseErrorKind::NotFound,
             tonic::Code::Unauthenticated => RevokeLeaseErrorKind::Authentication,
             tonic::Code::PermissionDenied => RevokeLeaseErrorKind::Authentication,
-            // NOTE: Other "invalid arguments" won't be returned because we won't send bad arguments
-            tonic::Code::InvalidArgument => RevokeLeaseErrorKind::Authentication,
+            tonic::Code::InvalidArgument if ClientInner::is_stale_token_error(&status) => {
+                RevokeLeaseErrorKind::Authentication
+            }
             tonic::Code::ResourceExhausted => RevokeLeaseErrorKind::Exhausted,
             tonic::Code::DataLoss => RevokeLeaseErrorKind::DataLoss,
             tonic::Code::Unavailable => RevokeLeaseErrorKind::Unavailable,
@@ -658,8 +662,9 @@ pub enum LeaseTimeToLiveErrorKind {
     NotFound,
     /// There is an authentication or authorization error.
     ///
-    /// This comes from the gRPC API as `UNAUTHENTICATED`, `PERMISSION_DENIED` and `INVALID_ARGUMENT` when the argument
-    /// describes an authentication error.
+    /// This comes from the gRPC API as `UNAUTHENTICATED` or `PERMISSION_DENIED`, or as `INVALID_ARGUMENT` with
+    /// "etcdserver: user name is empty" or "etcdserver: revision of auth store is old". Other `INVALID_ARGUMENT`
+    /// responses describe the request rather than the caller, and are reported as [`Unknown`][Self::Unknown].
     Authentication,
     /// The server or transport is resource-exhausted.
     ///
@@ -696,8 +701,9 @@ impl LeaseTimeToLiveError {
             tonic::Code::NotFound => LeaseTimeToLiveErrorKind::NotFound,
             tonic::Code::Unauthenticated => LeaseTimeToLiveErrorKind::Authentication,
             tonic::Code::PermissionDenied => LeaseTimeToLiveErrorKind::Authentication,
-            // NOTE: Other "invalid arguments" won't be returned because we won't send bad arguments
-            tonic::Code::InvalidArgument => LeaseTimeToLiveErrorKind::Authentication,
+            tonic::Code::InvalidArgument if ClientInner::is_stale_token_error(&status) => {
+                LeaseTimeToLiveErrorKind::Authentication
+            }
             tonic::Code::ResourceExhausted => LeaseTimeToLiveErrorKind::Exhausted,
             tonic::Code::DataLoss => LeaseTimeToLiveErrorKind::DataLoss,
             tonic::Code::Unavailable => LeaseTimeToLiveErrorKind::Unavailable,
@@ -802,8 +808,9 @@ impl<C: crate::driver::LeaseDriver> IntoFuture for Leases<C> {
 pub enum LeasesErrorKind {
     /// There is an authentication or authorization error.
     ///
-    /// This comes from the gRPC API as `UNAUTHENTICATED`, `PERMISSION_DENIED` and `INVALID_ARGUMENT` when the argument
-    /// describes an authentication error.
+    /// This comes from the gRPC API as `UNAUTHENTICATED` or `PERMISSION_DENIED`, or as `INVALID_ARGUMENT` with
+    /// "etcdserver: user name is empty" or "etcdserver: revision of auth store is old". Other `INVALID_ARGUMENT`
+    /// responses describe the request rather than the caller, and are reported as [`Unknown`][Self::Unknown].
     Authentication,
     /// The server or transport is resource-exhausted.
     ///
@@ -839,8 +846,9 @@ impl LeasesError {
         let kind = match status.code() {
             tonic::Code::Unauthenticated => LeasesErrorKind::Authentication,
             tonic::Code::PermissionDenied => LeasesErrorKind::Authentication,
-            // NOTE: Other "invalid arguments" won't be returned because we won't send bad arguments
-            tonic::Code::InvalidArgument => LeasesErrorKind::Authentication,
+            tonic::Code::InvalidArgument if ClientInner::is_stale_token_error(&status) => {
+                LeasesErrorKind::Authentication
+            }
             tonic::Code::ResourceExhausted => LeasesErrorKind::Exhausted,
             tonic::Code::DataLoss => LeasesErrorKind::DataLoss,
             tonic::Code::Unavailable => LeasesErrorKind::Unavailable,
@@ -1125,8 +1133,9 @@ pub enum KeepAliveErrorKind {
     NotFound,
     /// There is an authentication or authorization error.
     ///
-    /// This comes from the gRPC API as `UNAUTHENTICATED`, `PERMISSION_DENIED` and `INVALID_ARGUMENT` when the argument
-    /// describes an authentication error.
+    /// This comes from the gRPC API as `UNAUTHENTICATED` or `PERMISSION_DENIED`, or as `INVALID_ARGUMENT` with
+    /// "etcdserver: user name is empty" or "etcdserver: revision of auth store is old". Other `INVALID_ARGUMENT`
+    /// responses describe the request rather than the caller, and are reported as [`Unknown`][Self::Unknown].
     Authentication,
     /// The server or transport is resource-exhausted.
     ///
@@ -1163,8 +1172,9 @@ impl KeepAliveError {
             tonic::Code::NotFound => KeepAliveErrorKind::NotFound,
             tonic::Code::Unauthenticated => KeepAliveErrorKind::Authentication,
             tonic::Code::PermissionDenied => KeepAliveErrorKind::Authentication,
-            // NOTE: Other "invalid arguments" won't be returned because we won't send bad arguments
-            tonic::Code::InvalidArgument => KeepAliveErrorKind::Authentication,
+            tonic::Code::InvalidArgument if ClientInner::is_stale_token_error(&status) => {
+                KeepAliveErrorKind::Authentication
+            }
             tonic::Code::ResourceExhausted => KeepAliveErrorKind::Exhausted,
             tonic::Code::DataLoss => KeepAliveErrorKind::DataLoss,
             tonic::Code::Unavailable => KeepAliveErrorKind::Unavailable,
@@ -1268,5 +1278,25 @@ mod test {
         let mut second = KeepAliveReceiverStream::new(&requests);
         assert_eq!(take(&mut second), Poll::Ready(Some(1)));
         assert_eq!(take(&mut second), Poll::Ready(None));
+    }
+
+    #[test]
+    fn invalid_argument_is_authentication_only_for_token_messages() {
+        for (message, expected) in [
+            ("etcdserver: user name is empty", "Authentication"),
+            ("etcdserver: revision of auth store is old", "Authentication"),
+            ("etcdserver: request is too large", "Unknown"),
+            ("etcdserver: invalid client api version", "Unknown"),
+        ] {
+            let status = || tonic::Status::invalid_argument(message);
+            let kinds = [
+                format!("{:?}", GrantLeaseError::from_status(status()).kind()),
+                format!("{:?}", RevokeLeaseError::from_status(status()).kind()),
+                format!("{:?}", LeaseTimeToLiveError::from_status(status()).kind()),
+                format!("{:?}", LeasesError::from_status(status()).kind()),
+                format!("{:?}", KeepAliveError::from_status(status()).kind()),
+            ];
+            assert_eq!(kinds, [expected; 5], "{message:?}");
+        }
     }
 }

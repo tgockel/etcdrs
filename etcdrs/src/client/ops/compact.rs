@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::{Client, ResponseHeader, Revision, pb::etcdserverpb};
+use crate::{Client, ResponseHeader, Revision, client::ClientInner, pb::etcdserverpb};
 
 /// # Compaction
 impl Client {
@@ -152,8 +152,9 @@ pub enum CompactErrorKind {
     FutureRevision,
     /// There is an authentication or authorization error.
     ///
-    /// This comes from the gRPC API as `UNAUTHENTICATED`, `PERMISSION_DENIED` and `INVALID_ARGUMENT` when the argument
-    /// describes an authentication error.
+    /// This comes from the gRPC API as `UNAUTHENTICATED` or `PERMISSION_DENIED`, or as `INVALID_ARGUMENT` with
+    /// "etcdserver: user name is empty" or "etcdserver: revision of auth store is old". Other `INVALID_ARGUMENT`
+    /// responses describe the request rather than the caller, and are reported as [`Unknown`][Self::Unknown].
     Authentication,
     /// The server or transport is resource-exhausted.
     ///
@@ -189,8 +190,9 @@ impl CompactError {
         let kind = match status.code() {
             tonic::Code::Unauthenticated => CompactErrorKind::Authentication,
             tonic::Code::PermissionDenied => CompactErrorKind::Authentication,
-            // NOTE: Other "invalid arguments" won't be returned because we won't send bad arguments
-            tonic::Code::InvalidArgument => CompactErrorKind::Authentication,
+            tonic::Code::InvalidArgument if ClientInner::is_stale_token_error(&status) => {
+                CompactErrorKind::Authentication
+            }
             tonic::Code::ResourceExhausted => CompactErrorKind::Exhausted,
             tonic::Code::OutOfRange => {
                 if status.message().contains("compacted") {
@@ -217,3 +219,23 @@ const _: () = {
         _assert_send::<CompactFuture>();
     }
 };
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn invalid_argument_is_authentication_only_for_token_messages() {
+        use CompactErrorKind::*;
+
+        for (message, expected) in [
+            ("etcdserver: user name is empty", Authentication),
+            ("etcdserver: revision of auth store is old", Authentication),
+            ("etcdserver: request is too large", Unknown),
+            ("etcdserver: invalid client api version", Unknown),
+        ] {
+            let kind = CompactError::from_status(tonic::Status::invalid_argument(message)).kind();
+            assert_eq!(kind, expected, "{message:?}");
+        }
+    }
+}

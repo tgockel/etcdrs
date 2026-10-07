@@ -9,6 +9,7 @@ use bytes::Bytes;
 
 use crate::{
     Client, LeaseId, ResponseHeader,
+    client::ClientInner,
     pb::etcdserverpb,
     record::{AsKey, AsValue, Record},
 };
@@ -230,8 +231,10 @@ pub enum PutErrorKind {
     KeyNotFound,
     /// There is an authentication or authorization error.
     ///
-    /// This comes from the gRPC API as `UNAUTHENTICATED`, `PERMISSION_DENIED` and `INVALID_ARGUMENT` when the argument
-    /// describes an authentication error.
+    /// This comes from the gRPC API as `UNAUTHENTICATED` or `PERMISSION_DENIED`, or as `INVALID_ARGUMENT` with
+    /// "etcdserver: user name is empty" or "etcdserver: revision of auth store is old". Other `INVALID_ARGUMENT`
+    /// responses describe the request rather than the caller, and are reported as [`KeyNotFound`][Self::KeyNotFound]
+    /// or [`Unknown`][Self::Unknown].
     Authentication,
     /// The server or transport is resource-exhausted.
     ///
@@ -252,7 +255,10 @@ pub enum PutErrorKind {
     Timeout,
     /// An error that is not covered by any other error kind.
     ///
-    /// All uncovered gRPC errors are mapped to this kind of error. They should not happen unless the etcd server has
+    /// All uncovered gRPC errors are mapped to this kind of error. Among them are `INVALID_ARGUMENT` responses that
+    /// describe the request, such as "etcdserver: key is not provided" for the empty key, or "etcdserver: request is
+    /// too large" for a request over the server's `--max-request-bytes`. Their message is available from
+    /// [`grpc_status`][PutError::grpc_status]. Other uncovered errors should not happen unless the etcd server has
     /// changed its error codes.
     Unknown,
 }
@@ -271,9 +277,10 @@ impl PutError {
             tonic::Code::InvalidArgument => {
                 if status.message().contains("key not found") {
                     PutErrorKind::KeyNotFound
-                } else {
-                    // NOTE: Other "invalid arguments" won't be returned because we won't send bad arguments
+                } else if ClientInner::is_stale_token_error(&status) {
                     PutErrorKind::Authentication
+                } else {
+                    PutErrorKind::Unknown
                 }
             }
             tonic::Code::ResourceExhausted => PutErrorKind::Exhausted,
@@ -294,3 +301,26 @@ const _: () = {
         _assert_send::<PutFuture<Result<PutResponse<GetPreviousValue>, PutError>>>();
     }
 };
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// `put("")` gets "key is not provided", and a put over `--max-request-bytes` gets "request is too large". Both
+    /// are about the request.
+    #[test]
+    fn invalid_argument_is_authentication_only_for_token_messages() {
+        use PutErrorKind::*;
+
+        for (message, expected) in [
+            ("etcdserver: user name is empty", Authentication),
+            ("etcdserver: revision of auth store is old", Authentication),
+            ("etcdserver: key not found", KeyNotFound),
+            ("etcdserver: key is not provided", Unknown),
+            ("etcdserver: request is too large", Unknown),
+        ] {
+            let kind = PutError::from_status(tonic::Status::invalid_argument(message)).kind();
+            assert_eq!(kind, expected, "{message:?}");
+        }
+    }
+}
