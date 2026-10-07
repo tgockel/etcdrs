@@ -218,4 +218,15 @@ mod tests {
         assert!(dir.exists(), "the last attempt's data dir {dir:?} should be kept");
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    #[tokio::test]
+    async fn single_server_advertises_its_peer_url() {
+        let server = etcd_server();
+        let client = etcdrs::Client::new(&server.connect_string()).unwrap();
+        let listed = client.member_list().await.unwrap();
+        let [member] = listed.members() else {
+            panic!("expected one member, got {:?}", listed.members());
+        };
+        assert_eq!(member.peer_urls(), [server.config.peer_url()]);
+    }
 }

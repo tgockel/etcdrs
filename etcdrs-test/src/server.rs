@@ -41,7 +41,7 @@ impl EtcdServer {
         }
 
         let client_port = self.config.client_port;
-        let peer_port = self.config.peer_port;
+        let peer_url = self.config.peer_url();
         let mut command = process::Command::new(get_etcd_program());
         command
             .arg("--name")
@@ -53,16 +53,16 @@ impl EtcdServer {
             .arg("--advertise-client-urls")
             .arg(format!("http://127.0.0.1:{client_port}"))
             .arg("--listen-peer-urls")
-            .arg(format!("http://127.0.0.1:{peer_port}"));
+            .arg(&peer_url)
+            .arg("--initial-advertise-peer-urls")
+            .arg(&peer_url)
+            .arg("--initial-cluster")
+            .arg(match &self.config.initial_cluster {
+                Some(initial_cluster) => initial_cluster.clone(),
+                None => format!("{}={peer_url}", self.config.name.0),
+            });
         if let Some(cluster_token) = self.config.cluster_token.as_ref() {
             command.arg("--initial-cluster-token").arg(cluster_token);
-        }
-        if let Some(initial_cluster) = self.config.initial_cluster.as_ref() {
-            command.arg("--initial-cluster").arg(initial_cluster);
-            // if we're part of a cluster, advertise our peer URL
-            command
-                .arg("--initial-advertise-peer-urls")
-                .arg(format!("http://127.0.0.1:{peer_port}"));
         }
         if let Some(state) = self.config.cluster_state {
             command.arg("--initial-cluster-state").arg(match state {
@@ -227,7 +227,7 @@ impl EtcdCluster {
         let mut entries: Vec<String> = self
             .servers
             .values()
-            .map(|s| format!("{}=http://127.0.0.1:{}", s.config.name.0, s.config.peer_port))
+            .map(|s| format!("{}={}", s.config.name.0, s.config.peer_url()))
             .collect();
         entries.push(format!("{}={}", config.name.0, config.peer_url()));
         config.initial_cluster = Some(entries.join(","));
@@ -257,7 +257,7 @@ impl EtcdClusterConfig {
         }
         let initial_cluster_string = configs
             .values()
-            .map(|config| format!("{}=http://127.0.0.1:{}", config.name.0, config.peer_port))
+            .map(|config| format!("{}={}", config.name.0, config.peer_url()))
             .collect::<Vec<_>>()
             .join(",");
 
