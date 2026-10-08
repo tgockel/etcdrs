@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use etcdrs::{Client, GrantLeaseError, LeaseId, RevokeLeaseError};
 use futures::StreamExt;
+use tokio::sync::OnceCell;
 
 /// A pool that manages etcd leases, automatically keeping them alive and grouping leases with the
 /// same TTL.
@@ -33,8 +34,9 @@ struct Shared {
 
 #[derive(Default)]
 struct PoolState {
-    /// TTL in whole seconds to the pooled [`LeaseId`] for that TTL.
-    pooled: HashMap<u64, LeaseId>,
+    /// TTL in whole seconds to the grant of the pooled lease for that TTL, which concurrent
+    /// [`LeasePool::get_lease`] calls share. A failed grant is removed.
+    pooled: HashMap<u64, Arc<OnceCell<Result<LeaseId, GrantLeaseError>>>>,
     /// All leases being kept alive, keyed by their [`LeaseId`].
     tracked: HashMap<LeaseId, TrackedLease>,
 }
@@ -73,42 +75,51 @@ impl LeasePool {
     ///
     /// The TTL is truncated to whole seconds (matching etcd's granularity). If a lease with that
     /// TTL already exists in the pool, its [`LeaseId`] is returned. Otherwise, a new lease is
-    /// granted from the server and added to the pool.
+    /// granted from the server and added to the pool. Concurrent calls with the same TTL share one
+    /// grant: if it fails, each of them returns the error, and the next call grants again.
     pub async fn get_lease(&self, ttl: Duration) -> Result<LeaseId, GrantLeaseError> {
         let ttl_secs = ttl.as_secs();
-
-        // Fast path: reuse an existing pooled lease.
-        {
-            let state = self.0.shared.state.lock().unwrap();
-            if let Some(&lease_id) = state.pooled.get(&ttl_secs) {
-                return Ok(lease_id);
-            }
-        }
-
-        // Slow path: grant a new lease from the server.
-        let response = self.0.shared.client.grant_lease().ttl(ttl).await?;
-        let lease_id = response.lease_id;
-        let server_ttl_secs = response.ttl.map_or(ttl_secs, |d| d.as_secs());
-
-        {
+        let grant = {
             let mut state = self.0.shared.state.lock().unwrap();
-            // Another task may have raced us; use theirs and let ours expire naturally.
-            if let Some(&existing) = state.pooled.get(&ttl_secs) {
-                return Ok(existing);
+            let pooled = &mut state.pooled;
+            if !pooled.contains_key(&ttl_secs) {
+                // Drop the grants whose callers were all cancelled before they finished. Checking
+                // `initialized` first, or `strong_count` for `get_mut`, can drop one a caller just finished.
+                pooled.retain(|_, grant| Arc::get_mut(grant).is_none_or(|grant| grant.initialized()));
             }
-            state.pooled.insert(ttl_secs, lease_id);
-            state.tracked.insert(
-                lease_id,
-                TrackedLease {
-                    requested_ttl_secs: ttl_secs,
-                    pooled: true,
-                    next_keepalive: tokio::time::Instant::now() + keepalive_interval(server_ttl_secs),
-                },
-            );
-        }
-
-        self.0.shared.notify.notify_one();
-        Ok(lease_id)
+            Arc::clone(pooled.entry(ttl_secs).or_default())
+        };
+        let granted = grant
+            .get_or_init(|| async {
+                let response = self.0.shared.client.grant_lease().ttl(ttl).await;
+                let mut state = self.0.shared.state.lock().unwrap();
+                let response = match response {
+                    Ok(response) => response,
+                    Err(e) => {
+                        state.pooled.remove(&ttl_secs);
+                        return Err(e);
+                    }
+                };
+                let server_ttl_secs = response.ttl.map_or(ttl_secs, |d| d.as_secs());
+                state.tracked.insert(
+                    response.lease_id,
+                    TrackedLease {
+                        requested_ttl_secs: ttl_secs,
+                        pooled: true,
+                        next_keepalive: tokio::time::Instant::now() + keepalive_interval(server_ttl_secs),
+                    },
+                );
+                drop(state);
+                self.0.shared.notify.notify_one();
+                Ok(response.lease_id)
+            })
+            .await;
+        // `GrantLeaseError` is not `Clone`. A grant without a lease ID fails only with a gRPC status
+        // and no message of its own, so this copy reads the same.
+        granted
+            .as_ref()
+            .copied()
+            .map_err(|e| GrantLeaseError::new(e.kind(), "", e.grpc_status().cloned()))
     }
 
     /// Grant a new lease from the server, even if a pooled lease with the same TTL already exists.
@@ -236,5 +247,34 @@ async fn keepalive_loop(shared: Arc<Shared>) {
 
         // Brief delay before reconnecting to avoid a tight retry loop.
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use etcdrs::Client;
+    use etcdrs_test::{EtcdServer, etcd_server};
+    use futures::FutureExt;
+    use rstest::rstest;
+
+    use super::LeasePool;
+
+    #[rstest]
+    #[tokio::test]
+    async fn adding_a_ttl_forgets_abandoned_grants(etcd_server: EtcdServer) {
+        let pool = LeasePool::new(Client::new(&etcd_server.connect_string()).unwrap());
+        let ttls = || {
+            let state = pool.0.shared.state.lock().unwrap();
+            state.pooled.keys().copied().collect::<Vec<_>>()
+        };
+
+        // Polled once, so its grant starts, then dropped before etcd answers.
+        assert!(pool.get_lease(Duration::from_secs(10)).now_or_never().is_none());
+        assert_eq!(ttls(), [10]);
+
+        pool.get_lease(Duration::from_secs(20)).await.unwrap();
+        assert_eq!(ttls(), [20]);
     }
 }

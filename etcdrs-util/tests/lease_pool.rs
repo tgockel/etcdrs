@@ -1,9 +1,12 @@
+use std::sync::Arc;
 use std::time::Duration;
 
-use etcdrs::Client;
+use etcdrs::client::RequestCounter;
+use etcdrs::{Client, GrantLeaseErrorKind};
 use etcdrs_test::{EtcdServer, etcd_server};
 use etcdrs_util::lease_pool::LeasePool;
 use rstest::rstest;
+use tokio::task::JoinSet;
 
 #[rstest]
 #[tokio::test]
@@ -14,6 +17,57 @@ async fn get_lease_pools_by_ttl(etcd_server: EtcdServer) {
     let a = pool.get_lease(Duration::from_secs(10)).await.unwrap();
     let b = pool.get_lease(Duration::from_secs(10)).await.unwrap();
     assert_eq!(a, b, "same TTL should return the same pooled lease");
+}
+
+/// Single-node deliberately: `leases()` lists only the leases of the member that answers it.
+#[rstest]
+#[tokio::test]
+async fn concurrent_get_lease_grants_one_lease(etcd_server: EtcdServer) {
+    let client = Client::new(&etcd_server.connect_string()).unwrap();
+    let pool = LeasePool::new(client.clone());
+
+    let mut tasks = JoinSet::new();
+    for _ in 0..10 {
+        let pool = pool.clone();
+        tasks.spawn(async move { pool.get_lease(Duration::from_secs(10)).await.unwrap() });
+    }
+    let lease_ids = tasks.join_all().await;
+
+    assert!(lease_ids.iter().all(|&id| id == lease_ids[0]), "{lease_ids:?}");
+    assert_eq!(client.leases().await.unwrap().into_leases(), [lease_ids[0]]);
+}
+
+#[rstest]
+#[tokio::test]
+async fn concurrent_get_lease_shares_a_refused_grant(etcd_server: EtcdServer) {
+    let metrics = Arc::new(RequestCounter::default());
+    let client = Client::builder()
+        .add_connection(etcd_server.connect_string())
+        .unwrap()
+        .metrics(metrics.clone())
+        .build()
+        .unwrap();
+    let pool = LeasePool::new(client);
+    // One second over etcd's maximum lease TTL.
+    let ttl = Duration::from_secs(9_000_000_001);
+
+    let mut tasks = JoinSet::new();
+    for _ in 0..10 {
+        let pool = pool.clone();
+        tasks.spawn(async move { pool.get_lease(ttl).await.unwrap_err() });
+    }
+    for err in tasks.join_all().await {
+        assert_eq!(err.kind(), GrantLeaseErrorKind::TtlTooLarge, "{err:?}");
+        assert_eq!(
+            err.grpc_status().map(|s| s.message()),
+            Some("etcdserver: too large lease TTL")
+        );
+    }
+    assert_eq!(metrics.get().requested(), 1, "concurrent calls should share one grant");
+
+    let err = pool.get_lease(ttl).await.unwrap_err();
+    assert_eq!(err.kind(), GrantLeaseErrorKind::TtlTooLarge, "{err:?}");
+    assert_eq!(metrics.get().requested(), 2, "the next call should grant again");
 }
 
 #[rstest]
