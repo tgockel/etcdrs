@@ -33,4 +33,3 @@ tonic-prost-build   = { version = "^0.14.3", default-features = false }
 # Local dependencies
 etcdrs      = { version = "^0.1.0", path = "etcdrs" }
 etcdrs-test = { version = "^0.1.0", path = "etcdrs-test" }
-etcdrs-util = { version = "^0.1.0", path = "etcdrs-util" }

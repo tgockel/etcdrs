@@ -20,7 +20,6 @@ rstest = ["dep:rstest"]
 [dependencies]
 etcdrs.workspace = true
 etcd-bin-vendored.workspace = true
-futures = { workspace = true, default-features = true }
 rand = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
 rstest = { workspace = true, optional = true, features = ["async-timeout", "crate-name"] }
 socket2.workspace = true
@@ -28,6 +27,7 @@ tokio = { workspace = true, default-features = false, features = ["rt", "time"] 
 
 [dev-dependencies]
 etcdrs-test = { path = ".", features = ["rstest"] }
+futures = { workspace = true, features = ["std"] }
 tokio = { workspace = true, default-features = false, features = ["macros", "rt", "time"] }
 # Used by tests/retry.rs to assert a failure really was a pre-send connect failure rather than
 # anything a server could have answered. Already in the tree via etcdrs.
