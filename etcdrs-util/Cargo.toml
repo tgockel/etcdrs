@@ -31,4 +31,4 @@ default = [
     "lease-pool",
 ]
 cache = ["tokio/time"]
-lease-pool = ["tokio/time"]
+lease-pool = ["tokio/macros", "tokio/time"]
