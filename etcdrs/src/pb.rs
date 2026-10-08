@@ -1,4 +1,4 @@
-#![allow(clippy::enum_variant_names, reason = "generated code")]
+#![allow(clippy::double_must_use, clippy::enum_variant_names, reason = "generated code")]
 
 #[cfg(feature = "generate")]
 include!(concat!(env!("OUT_DIR"), "/gen-src/all.rs"));
