@@ -505,6 +505,11 @@ impl WatchBuilder<Client> {
                                     continue;
                                 }
                             }
+                            // etcd holds back a watch's events until it has answered the watch's
+                            // create, but sends a stream-wide progress notification at once.
+                            if resp.watch_id == -1 && !resp.canceled && !unanswered_creates.lock().unwrap().is_empty() {
+                                continue;
+                            }
                             for item in convert_response(resp) {
                                 yield item;
                             }
@@ -646,6 +651,12 @@ impl Watcher {
     /// The server will respond with a [`WatchEvent::Progress`] containing the current store
     /// revision. This is useful for heartbeat/liveness checks and for learning the current
     /// revision when no events have occurred recently.
+    ///
+    /// No response arrives in three cases, so request progress again if one is overdue. etcd
+    /// ignores the request while a watch is catching up on past revisions or starts at a revision
+    /// the store has not reached, and answers none on a watcher without watches. The stream drops a
+    /// response that arrives while etcd has yet to confirm a watch's creation: etcd sends the
+    /// response at once, but holds back that watch's events until it confirms it.
     pub fn request_progress(&self) {
         self.sender.request_progress();
     }
@@ -1083,46 +1094,89 @@ mod test {
     use crate::pb::etcdserverpb::watch_server::{Watch as WatchService, WatchServer};
 
     /// A watch service that sends, on the one stream a client opens, the responses a test gives it,
-    /// and ends the stream when the test drops their sender.
-    struct Scripted(std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<etcdserverpb::WatchResponse>>>);
+    /// and ends the stream when the test drops their sender. It passes the requests it receives to
+    /// the test.
+    struct Scripted {
+        responses: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<etcdserverpb::WatchResponse>>>,
+        requests: tokio::sync::mpsc::UnboundedSender<etcdserverpb::WatchRequest>,
+    }
 
     #[tonic::async_trait]
     impl WatchService for Scripted {
         async fn watch(
             self: Arc<Self>,
-            _request: tonic::Request<tonic::Streaming<etcdserverpb::WatchRequest>>,
+            request: tonic::Request<tonic::Streaming<etcdserverpb::WatchRequest>>,
         ) -> Result<tonic::Response<tonic::codegen::BoxStream<etcdserverpb::WatchResponse>>, tonic::Status> {
-            let mut responses = self.0.lock().unwrap().take().expect("one stream");
+            let mut responses = self.responses.lock().unwrap().take().expect("one stream");
+            let mut incoming = request.into_inner();
+            let requests = self.requests.clone();
+            tokio::spawn(async move {
+                while let Ok(Some(request)) = incoming.message().await {
+                    let _ = requests.send(request);
+                }
+            });
             Ok(tonic::Response::new(Box::pin(futures::stream::poll_fn(move |cx| {
                 responses.poll_recv(cx).map(|response| response.map(Ok))
             }))))
         }
     }
 
-    /// Start a watcher against a [`Scripted`] service, returning it and the sender of the
-    /// service's responses.
-    async fn scripted_watcher() -> (Watcher, tokio::sync::mpsc::UnboundedSender<etcdserverpb::WatchResponse>) {
+    /// Start a watcher against a [`Scripted`] service, returning it, the sender of the service's
+    /// responses, and the receiver of the requests the service receives.
+    async fn scripted_watcher() -> (
+        Watcher,
+        tokio::sync::mpsc::UnboundedSender<etcdserverpb::WatchResponse>,
+        tokio::sync::mpsc::UnboundedReceiver<etcdserverpb::WatchRequest>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (responses, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, requests) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(tonic::transport::Server::builder().serve_with_incoming(
-            WatchServer::new(Scripted(std::sync::Mutex::new(Some(receiver)))),
+            WatchServer::new(Scripted {
+                responses: std::sync::Mutex::new(Some(receiver)),
+                requests: sender,
+            }),
             tonic::transport::server::TcpIncoming::from(listener),
         ));
         let client = Client::new(&format!("http://{address}")).unwrap();
-        (client.watch().prefix("k/").start(), responses)
+        (client.watch().prefix("k/").start(), responses, requests)
+    }
+
+    /// The header etcd gives a response at `revision`.
+    fn header(revision: i64) -> etcdserverpb::ResponseHeader {
+        etcdserverpb::ResponseHeader {
+            cluster_id: 1,
+            member_id: 1,
+            revision,
+            raft_term: 1,
+        }
+    }
+
+    /// etcd's reply that it created watch 1.
+    fn created() -> etcdserverpb::WatchResponse {
+        etcdserverpb::WatchResponse {
+            header: Some(header(1)),
+            watch_id: 1,
+            created: true,
+            ..Default::default()
+        }
+    }
+
+    /// A stream-wide progress notification at `revision`, which etcd sends with watch ID -1.
+    fn progress(revision: i64) -> etcdserverpb::WatchResponse {
+        etcdserverpb::WatchResponse {
+            header: Some(header(revision)),
+            watch_id: -1,
+            ..Default::default()
+        }
     }
 
     /// A response on watch 1 that puts each of `keys` at revision 2, marked as a fragment that
     /// more follow if `fragment`.
     fn puts(keys: &[&str], fragment: bool) -> etcdserverpb::WatchResponse {
         etcdserverpb::WatchResponse {
-            header: Some(etcdserverpb::ResponseHeader {
-                cluster_id: 1,
-                member_id: 1,
-                revision: 2,
-                raft_term: 1,
-            }),
+            header: Some(header(2)),
             watch_id: 1,
             fragment,
             events: keys
@@ -1155,7 +1209,7 @@ mod test {
     /// arrived, so a consumer could take part of a revision for all of it.
     #[tokio::test]
     async fn fragmented_response_is_yielded_once_whole() {
-        let (mut watcher, responses) = scripted_watcher().await;
+        let (mut watcher, responses, _) = scripted_watcher().await;
         responses.send(puts(&["k/0"], false)).unwrap();
         assert_eq!(put_key(watcher.next().await), "k/0");
 
@@ -1179,7 +1233,7 @@ mod test {
     /// the rest of their revision.
     #[tokio::test]
     async fn stream_ending_between_fragments_yields_none_of_them() {
-        let (mut watcher, responses) = scripted_watcher().await;
+        let (mut watcher, responses, _) = scripted_watcher().await;
         responses.send(puts(&["k/0"], false)).unwrap();
         assert_eq!(put_key(watcher.next().await), "k/0");
 
@@ -1192,7 +1246,7 @@ mod test {
     /// the fragments before it without their last.
     #[tokio::test]
     async fn interrupted_fragments_are_an_invalid_response() {
-        let (mut watcher, responses) = scripted_watcher().await;
+        let (mut watcher, responses, _) = scripted_watcher().await;
         responses.send(puts(&["k/1"], true)).unwrap();
         responses
             .send(etcdserverpb::WatchResponse {
@@ -1204,5 +1258,32 @@ mod test {
         let error = watcher.next().await.unwrap().unwrap_err();
         assert_eq!(error.kind(), WatchErrorKind::InvalidResponse);
         assert_eq!(put_key(watcher.next().await), "k/2");
+    }
+
+    /// etcd holds back a watch's events until it has sent the watch's `created` reply, but sends a
+    /// stream-wide progress notification at once. The stream used to yield such a notification
+    /// ahead of the events up to its revision.
+    #[tokio::test]
+    async fn stream_wide_progress_before_a_created_reply_is_dropped() {
+        let (mut watcher, responses, mut requests) = scripted_watcher().await;
+        // Once the service has the create, the stream counts it as unanswered.
+        tokio::select! {
+            item = watcher.next() => panic!("expected nothing, got {item:?}"),
+            request = requests.recv() => assert!(
+                matches!(request.unwrap().request_union, Some(PbRequestUnion::CreateRequest(_)))
+            ),
+        }
+
+        responses.send(progress(2)).unwrap();
+        responses.send(created()).unwrap();
+        responses.send(puts(&["k/0"], false)).unwrap();
+        responses.send(progress(3)).unwrap();
+
+        assert_eq!(put_key(watcher.next().await), "k/0");
+        let item = watcher.next().await;
+        assert!(
+            matches!(&item, Some(Ok(WatchEvent::Progress { revision, .. })) if revision.get() == 3),
+            "expected progress at 3, got {item:?}"
+        );
     }
 }

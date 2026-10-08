@@ -487,10 +487,20 @@ async fn watch_request_progress_before_first_poll(etcd_server: EtcdServer) {
 
     // etcd ignores a progress request while any watch on the stream is still catching up, and
     // answers none on a stream without watches. A watch with no start revision starts caught up.
-    let mut watcher = client.watch().key("early/progress").start();
-    watcher.request_progress();
-
-    let event = next_item(&mut watcher).await.expect("watch stream yielded an error");
+    // etcd can still answer before it confirms the watch, and the stream drops such an answer, so
+    // a new watcher asks again: asking on the same one would come after its first poll.
+    let mut watchers = 0;
+    let event = loop {
+        let mut watcher = client.watch().key("early/progress").start();
+        watcher.request_progress();
+        if let Ok(item) = tokio::time::timeout(Duration::from_secs(1), watcher.next()).await {
+            break item
+                .expect("watch stream ended unexpectedly")
+                .expect("watch stream yielded an error");
+        }
+        watchers += 1;
+        assert!(watchers < 5, "no progress notification on 5 watchers");
+    };
     let WatchEvent::Progress { revision, .. } = event else {
         panic!("expected Progress, got {event:?}");
     };
