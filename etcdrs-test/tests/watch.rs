@@ -273,6 +273,44 @@ async fn watch_request_progress(etcd_server: EtcdServer) {
     assert!(revision >= rev);
 }
 
+/// etcd keeps a compacted watch until the client cancels it, and answers no progress request on its
+/// stream while it does. The stream never canceled one, so after a compaction, `request_progress`
+/// went unanswered for as long as the stream lived.
+#[rstest]
+#[tokio::test]
+async fn watch_request_progress_after_compaction(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+
+    let old = client.put("wpc/old").value("1").await.unwrap().header().revision();
+    let head = client.put("wpc/live").value("1").await.unwrap().header().revision();
+    client.compact(head).await.unwrap();
+
+    let mut watcher = client.watch().key("wpc/live").start_revision(head).start();
+    let events = next_events(&mut watcher, 1).await;
+    let WatchEvent::Put { watch_id: live_id, .. } = events[0] else {
+        panic!("expected Put, got {:?}", events[0]);
+    };
+
+    let compacted_id = watcher.add(Watch::new("wpc/old").start_revision(old));
+    let error = next_item(&mut watcher).await.expect_err("expected the compaction");
+    assert_eq!(error.kind(), WatchErrorKind::Compacted);
+    assert_eq!(error.watch_id(), Some(compacted_id));
+
+    watcher.request_progress();
+    let event = next_item(&mut watcher).await.expect("watch stream yielded an error");
+    let WatchEvent::Progress { revision, .. } = event else {
+        panic!("expected Progress, got {event:?}");
+    };
+    assert!(revision >= head);
+
+    // etcd confirms cancellations in the order it receives them, so a confirmation of the compacted
+    // watch's cancellation would come first.
+    watcher.cancel(live_id);
+    let error = next_item(&mut watcher).await.expect_err("expected the cancellation");
+    assert_eq!(error.kind(), WatchErrorKind::Canceled);
+    assert_eq!(error.watch_id(), Some(live_id));
+}
+
 /// etcd splits a response of 2 MiB or more into fragments, which can split a revision. The events
 /// of one were yielded as each fragment arrived, so those of the last fragment were not ready with
 /// the others.

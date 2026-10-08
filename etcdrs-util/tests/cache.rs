@@ -604,6 +604,43 @@ async fn compaction_recovery_converges(mut etcd_server: EtcdServer) {
     eventually_cached(&cache, &metrics, "foo/k", Some(b"v20")).await;
 }
 
+/// etcd keeps a compacted watch until the client cancels it, and answers no progress request on its
+/// stream while it does. The stream never canceled one, so after a compaction, ranges gated by a
+/// write through the cache stayed gated until their own next event or per-watch progress
+/// notification.
+#[rstest]
+#[tokio::test]
+async fn ranges_rewarm_after_a_watch_is_compacted(etcd_server: EtcdServer) {
+    let external = Client::new(&etcd_server.connect_string()).unwrap();
+    external.put("a/k").value("v1").await.unwrap();
+    external.put("b/k").value("v1").await.unwrap();
+
+    let proxy = Proxy::start(&etcd_server).await;
+    let (client, metrics) = counting_client_via(&proxy);
+    let cache = CacheClient::builder(client)
+        .cache(Prefix("a/"))
+        .cache(Prefix("b/"))
+        .build();
+    eventually_cached(&cache, &metrics, "a/k", Some(b"v1")).await;
+    eventually_cached(&cache, &metrics, "b/k", Some(b"v1")).await;
+
+    // Reading a/ before the compaction would request progress, which would keep its watch from being
+    // compacted.
+    external.put("b/k").value("v2").await.unwrap();
+    let head = external.put("b/k").value("v3").await.unwrap().header().revision();
+    eventually_cached(&cache, &metrics, "b/k", Some(b"v3")).await;
+
+    // The next watcher resumes a/ from before the compacted revision, and b/ from after it.
+    proxy.cut().await;
+    external.compact(head).await.unwrap();
+    proxy.restore();
+    eventually_cached(&cache, &metrics, "a/k", Some(b"v1")).await;
+
+    // a/'s new watch was added to a running stream, so only b/ re-warms through stream-wide progress.
+    cache.put("c/k").value("v1").await.unwrap();
+    eventually_cached(&cache, &metrics, "b/k", Some(b"v3")).await;
+}
+
 /// etcd replays what a watch missed in batches of up to 1000 revisions, each labeled with its
 /// current revision. The cache used to take that label for its range's from the first batch on, so
 /// it served a partly replayed range as current.

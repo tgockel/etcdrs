@@ -1,7 +1,7 @@
 use std::{
     backtrace::Backtrace,
     borrow::Cow,
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     fmt,
     num::NonZeroI64,
     ops::{Deref, DerefMut},
@@ -454,6 +454,8 @@ impl WatchBuilder<Client> {
                 // The fragments of a response received so far, combined. All but the last fragment
                 // have `fragment` set, and etcd sends nothing else between them.
                 let mut fragments: Option<etcdserverpb::WatchResponse> = None;
+                // The compacted watches the stream canceled, until etcd confirms each cancellation.
+                let mut canceled_compacted = HashSet::new();
                 loop {
                     match response_stream.message().await {
                         Ok(Some(mut resp)) => {
@@ -491,6 +493,17 @@ impl WatchBuilder<Client> {
                             if resp.fragment {
                                 fragments = Some(resp);
                                 continue;
+                            }
+                            if resp.canceled {
+                                if resp.compact_revision != 0 {
+                                    // etcd keeps a compacted watch until it is canceled, and
+                                    // answers no stream-wide progress request while it does, so
+                                    // cancel it before a consumer can react to the error.
+                                    requests.lock().unwrap().send(cancel_request(resp.watch_id));
+                                    canceled_compacted.insert(resp.watch_id);
+                                } else if canceled_compacted.remove(&resp.watch_id) {
+                                    continue;
+                                }
                             }
                             for item in convert_response(resp) {
                                 yield item;
@@ -621,8 +634,9 @@ impl Watcher {
     /// will eventually yield an error with [`WatchErrorKind::Canceled`] for this watch, confirming the
     /// cancellation. Other watches on this watcher are unaffected.
     ///
-    /// The server ignores a cancellation of a watch it refused to create (see [`add`][Self::add]),
-    /// so for such a watch the refusal is the only [`WatchErrorKind::Canceled`] error.
+    /// Canceling a watch that already ended with an error yields nothing more: the server ignores a
+    /// cancellation of a watch it refused to create (see [`add`][Self::add]), and the stream
+    /// cancels a [`WatchErrorKind::Compacted`] watch itself.
     pub fn cancel(&self, watch_id: WatchId) {
         self.sender.cancel(watch_id);
     }
@@ -703,11 +717,7 @@ impl WatchSender {
     ///
     /// See [`Watcher::cancel`] for details.
     pub fn cancel(&self, watch_id: WatchId) {
-        self.send(etcdserverpb::WatchRequest {
-            request_union: Some(PbRequestUnion::CancelRequest(etcdserverpb::WatchCancelRequest {
-                watch_id: watch_id.get(),
-            })),
-        });
+        self.send(cancel_request(watch_id.get()));
     }
 
     /// Request a progress notification.
@@ -717,6 +727,14 @@ impl WatchSender {
         self.send(etcdserverpb::WatchRequest {
             request_union: Some(PbRequestUnion::ProgressRequest(etcdserverpb::WatchProgressRequest {})),
         });
+    }
+}
+
+fn cancel_request(watch_id: i64) -> etcdserverpb::WatchRequest {
+    etcdserverpb::WatchRequest {
+        request_union: Some(PbRequestUnion::CancelRequest(etcdserverpb::WatchCancelRequest {
+            watch_id,
+        })),
     }
 }
 
@@ -816,7 +834,7 @@ impl Stream for ReceiverStream {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WatchErrorKind {
     /// The watch was compacted — the requested revision is older than the server's compacted
-    /// revision.
+    /// revision. The stream cancels the watch on the server and yields nothing more for it.
     Compacted,
     /// The watch was canceled by [`Watcher::cancel`], or the server refused to create it.
     /// [`WatchError::cancel_reason`] carries the server's reason for a refusal.
