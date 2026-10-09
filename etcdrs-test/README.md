@@ -44,6 +44,21 @@ Each server has a private directory named `etcd-srvr-<random letters>` in [`std:
 etcd keeps its data in the `data` subdirectory, and its stdout and stderr go to `etcd.log`, not to
 the test's output. A restarted server reuses its data and appends to its log.
 
+# Stopping etcd
+
+Stopping or dropping a server kills its etcd process. etcd is also killed when the test process
+exits without dropping the server, whether it exits through `std::process::exit`, an abort or a
+SIGKILL from a CI timeout, or the server is never dropped, like one in a `static` or an rstest
+`#[once]` fixture. The server's directory is left behind in that case.
+
+- **Linux** -- etcd is spawned with `PR_SET_PDEATHSIG` set to `SIGKILL`, from a thread that never
+  exits.
+- **macOS and other Unix** -- etcd joins the process group of a `/bin/sh` watchdog, which kills
+  that group once the test process exits.
+- **Windows** -- etcd is put in a job object that kills it once the test process exits. etcd is
+  spawned before it is put in the job, so a test process that exits in between leaves it running.
+- **Other platforms** -- etcd keeps running.
+
 # etcd Binary Resolution
 
 The etcd binary is resolved in the following order:

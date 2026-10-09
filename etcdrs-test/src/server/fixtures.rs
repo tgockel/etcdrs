@@ -224,6 +224,79 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn server_started_on_a_thread_that_exits_keeps_running() {
+        start_ready(
+            || {
+                std::thread::spawn(|| EtcdServerConfig::new_single_temporary().start().unwrap())
+                    .join()
+                    .unwrap()
+            },
+            |server| vec![server],
+        );
+    }
+
+    /// Runs this test again as a helper process that starts a server and is then killed with SIGKILL.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn etcd_dies_with_its_test_process() {
+        use std::io::BufRead;
+
+        const HELPER: &str = "ETCDRS_TEST_HELPER";
+        if env::var_os(HELPER).is_some() {
+            let server = etcd_server();
+            let pid = server.runner.as_ref().unwrap().proc.id();
+            // Not stdout, where libtest's "test ... " can start the same line.
+            eprintln!("etcd-pid={pid} {}", server.config.working_dir.display());
+            // Returns, so the server is dropped, if the parent exits without killing this process.
+            io::stdin().lines().next();
+            return;
+        }
+
+        let mut helper = process::Command::new(env::current_exe().unwrap())
+            .args([
+                "server::fixtures::tests::etcd_dies_with_its_test_process",
+                "--exact",
+                "--no-capture",
+            ])
+            .env(HELPER, "1")
+            .stdin(process::Stdio::piped())
+            .stdout(process::Stdio::null())
+            .stderr(process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = io::BufReader::new(helper.stderr.take().unwrap())
+            .lines()
+            .map(Result::unwrap)
+            .find_map(|line| line.strip_prefix("etcd-pid=").map(str::to_owned))
+            .expect("the helper exited before it started etcd");
+        let (pid, dir) = started.split_once(' ').unwrap();
+        // Whatever reaps orphans may leave etcd a zombie, which has exited all the same.
+        let running = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(") ")
+                    .is_some_and(|(_, rest)| !rest.starts_with(['Z', 'X']))
+            })
+        };
+        assert!(running(), "etcd {pid} is not running");
+
+        helper.kill().unwrap();
+        helper.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let survived = running();
+        if survived {
+            process::Command::new("kill")
+                .args(["-s", "KILL", pid])
+                .status()
+                .unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(!survived, "etcd {pid} outlived its test process");
+    }
+
     #[tokio::test]
     async fn restarted_server_appends_to_its_log() {
         let mut server = etcd_server();

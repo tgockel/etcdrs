@@ -29,6 +29,10 @@ impl EtcdServer {
     ///
     /// This returns once etcd is spawned, without waiting for it to bind its ports, so etcd can still exit right
     /// after, for example when one of them is taken.
+    ///
+    /// etcd is killed when this server is stopped or dropped. On Unix and Windows, it is also killed when this process
+    /// exits, even without unwinding, except on Windows when this process exits after this call spawns etcd but before
+    /// it puts etcd in a job object.
     pub fn start(&mut self) -> io::Result<()> {
         if self.runner.is_some() {
             return Err(io::Error::other(
@@ -80,15 +84,15 @@ impl EtcdServer {
             .open(&log_path)
             .map_err(|error| io::Error::new(error.kind(), format!("failed to open etcd log {log_path:?}: {error}")))?;
         command.stdout(log.try_clone()?).stderr(log);
-        let mut etcd_process = command.spawn()?;
-        if let Some(rc) = etcd_process.try_wait()? {
+        let mut runner = EtcdRunner::spawn(command)?;
+        if let Some(rc) = runner.proc.try_wait()? {
             return Err(io::Error::other(format!(
                 "etcd immediately exited with {rc}; {}",
                 self.config.log_tail()
             )));
         }
 
-        self.runner = Some(EtcdRunner { proc: etcd_process });
+        self.runner = Some(runner);
 
         Ok(())
     }
@@ -394,6 +398,164 @@ struct EtcdRunner {
     proc: process::Child,
 }
 
+impl EtcdRunner {
+    /// Spawn etcd so that it is killed when this process exits.
+    ///
+    /// `PR_SET_PDEATHSIG` fires when the thread that forked etcd exits, not this process, so every etcd is forked by
+    /// one thread that never exits.
+    #[cfg(target_os = "linux")]
+    fn spawn(mut command: process::Command) -> io::Result<Self> {
+        use std::{
+            os::unix::process::CommandExt,
+            sync::{Mutex, mpsc},
+        };
+
+        type Spawn = (process::Command, mpsc::Sender<io::Result<process::Child>>);
+        // Not a LazyLock, which would turn one failure to start the thread into a panic in every later call.
+        static SPAWNER: Mutex<Option<mpsc::Sender<Spawn>>> = Mutex::new(None);
+
+        let parent = process::id() as libc::pid_t;
+        // The hook runs in a fork of this multithreaded process, where allocating can deadlock.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // This process exited before the prctl, so the signal will never come.
+                if libc::getppid() != parent {
+                    return Err(io::ErrorKind::Other.into());
+                }
+                Ok(())
+            });
+        }
+        let mut spawner = SPAWNER.lock().unwrap();
+        if spawner.is_none() {
+            let (sender, spawns) = mpsc::channel::<Spawn>();
+            std::thread::Builder::new().spawn(move || {
+                for (mut command, spawned) in spawns {
+                    let _ = spawned.send(command.spawn());
+                }
+            })?;
+            *spawner = Some(sender);
+        }
+        let (spawned, child) = mpsc::channel();
+        spawner.as_ref().unwrap().send((command, spawned)).unwrap();
+        child.recv().unwrap().map(|proc| Self { proc })
+    }
+
+    /// Spawn etcd so that it is killed when this process exits.
+    ///
+    /// etcd joins the process group of a watchdog that kills the group, not etcd's PID: the PID of an etcd that was
+    /// reaped can be recycled while the watchdog runs, but not the ID of a group the watchdog is in.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn spawn(mut command: process::Command) -> io::Result<Self> {
+        use std::{os::unix::process::CommandExt, sync::Mutex};
+
+        static WATCHDOG: Mutex<Option<process::Child>> = Mutex::new(None);
+        let mut watchdog = WATCHDOG.lock().unwrap();
+        if watchdog.is_none() {
+            *watchdog = Some(spawn_watchdog()?);
+        }
+        command
+            .process_group(watchdog.as_ref().unwrap().id() as i32)
+            .spawn()
+            .map(|proc| Self { proc })
+    }
+
+    /// Spawn etcd so that it is killed when this process exits.
+    #[cfg(windows)]
+    fn spawn(mut command: process::Command) -> io::Result<Self> {
+        use std::{
+            os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+            sync::Mutex,
+        };
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        };
+
+        // Windows kills the processes in the job once its last handle closes, which this one does when this process
+        // exits.
+        static JOB: Mutex<Option<OwnedHandle>> = Mutex::new(None);
+        let mut job = JOB.lock().unwrap();
+        if job.is_none() {
+            unsafe {
+                let created = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if created.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                let created = OwnedHandle::from_raw_handle(created);
+                let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let size = size_of_val(&limits) as u32;
+                if SetInformationJobObject(
+                    created.as_raw_handle(),
+                    JobObjectExtendedLimitInformation,
+                    (&raw const limits).cast(),
+                    size,
+                ) == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                *job = Some(created);
+            }
+        }
+
+        let job = job.as_ref().unwrap();
+        // Dropping the runner kills etcd.
+        let runner = Self { proc: command.spawn()? };
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), runner.proc.as_raw_handle()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(runner)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn spawn(mut command: process::Command) -> io::Result<Self> {
+        command.spawn().map(|proc| Self { proc })
+    }
+}
+
+/// Spawn a `/bin/sh` that SIGKILLs its process group, itself included, once it reads end-of-file on stdin, a FIFO that
+/// only this process can write to, which happens when this process exits.
+///
+/// Not a pipe from `Stdio::piped`: on macOS, std sets close-on-exec on a pipe's ends only after creating them, so a
+/// process that another thread spawns in between can inherit the writer and keep the watchdog from reading end-of-file.
+#[cfg(all(unix, any(test, not(target_os = "linux"))))]
+fn spawn_watchdog() -> io::Result<process::Child> {
+    use std::os::{
+        fd::{AsRawFd, OwnedFd},
+        unix::{ffi::OsStrExt, fs::OpenOptionsExt, process::CommandExt},
+    };
+
+    let fifo = env::temp_dir().join(format!("etcdrs-watchdog-{}", get_random_name(12)));
+    let c_fifo = ffi::CString::new(fifo.as_os_str().as_bytes())?;
+    if unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Opening either end blocks until the other end is open, but a non-blocking reader opens at once.
+    let ends = std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .and_then(|reader| Ok((reader, std::fs::File::options().write(true).open(&fifo)?)));
+    std::fs::remove_file(&fifo)?;
+    let (reader, writer) = ends?;
+    // A non-blocking stdin would end the watchdog's `read` at once.
+    if unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, 0) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut watchdog = process::Command::new("/bin/sh")
+        .args(["-c", "read _; kill -9 0"])
+        .stdin(reader)
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    watchdog.stdin = Some(OwnedFd::from(writer).into());
+    Ok(watchdog)
+}
+
 impl Drop for EtcdRunner {
     fn drop(&mut self) {
         if let Err(error) = self.proc.kill() {
@@ -508,6 +670,26 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::AddrInUse, "port {port}: {error}");
             net::TcpListener::bind(address).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_kills_its_process_group_once_its_pipe_closes() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+        let mut watchdog = spawn_watchdog().unwrap();
+        let mut member = process::Command::new("sleep")
+            .arg("60")
+            .process_group(watchdog.id() as i32)
+            .spawn()
+            .unwrap();
+        // Long enough for a watchdog whose `read` does not block to kill its group.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(member.try_wait().unwrap(), None, "killed before the pipe closed");
+        // This process exiting closes the pipe the same way.
+        drop(watchdog.stdin.take());
+        assert_eq!(member.wait().unwrap().signal(), Some(9));
+        assert_eq!(watchdog.wait().unwrap().signal(), Some(9));
     }
 
     #[test]

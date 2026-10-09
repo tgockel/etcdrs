@@ -25,6 +25,17 @@ rstest = { workspace = true, optional = true, features = ["async-timeout", "crat
 socket2.workspace = true
 tokio = { workspace = true, default-features = false, features = ["rt", "time"] }
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 etcdrs-test = { path = ".", features = ["rstest"] }
 futures = { workspace = true, features = ["std"] }
