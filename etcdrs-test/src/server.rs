@@ -23,8 +23,9 @@ impl EtcdServer {
 
     /// Start the etcd process.
     ///
-    /// The first call creates the data directory, and fails with [`io::ErrorKind::AlreadyExists`] if it already
-    /// exists. Later calls reuse it, so data persists across [`stop`][`EtcdServer::stop`].
+    /// The first call creates the server's directory, which holds etcd's data and its log, and fails with
+    /// [`io::ErrorKind::AlreadyExists`] if it already exists. Later calls reuse it, so data persists across
+    /// [`stop`][`EtcdServer::stop`].
     ///
     /// This returns once etcd is spawned, without waiting for it to bind its ports, so etcd can still exit right
     /// after, for example when one of them is taken.
@@ -46,8 +47,9 @@ impl EtcdServer {
         command
             .arg("--name")
             .arg(&self.config.name.0)
+            // etcd warns on every start about any file in its data dir that is not its own, so the log stays outside.
             .arg("--data-dir")
-            .arg(&self.config.working_dir)
+            .arg(self.config.working_dir.join("data"))
             .arg("--listen-client-urls")
             .arg(format!("http://127.0.0.1:{client_port}"))
             .arg("--advertise-client-urls")
@@ -71,10 +73,18 @@ impl EtcdServer {
             });
         }
 
+        let log_path = self.config.log_path();
+        let log = std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map_err(|error| io::Error::new(error.kind(), format!("failed to open etcd log {log_path:?}: {error}")))?;
+        command.stdout(log.try_clone()?).stderr(log);
         let mut etcd_process = command.spawn()?;
         if let Some(rc) = etcd_process.try_wait()? {
             return Err(io::Error::other(format!(
-                "etcd immediately exited with {rc} -- check the logs for issues in startup"
+                "etcd immediately exited with {rc}; {}",
+                self.config.log_tail()
             )));
         }
 
@@ -155,6 +165,25 @@ impl EtcdServerConfig {
     /// The peer URL this server will advertise.
     pub fn peer_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.peer_port)
+    }
+
+    fn log_path(&self) -> path::PathBuf {
+        self.working_dir.join("etcd.log")
+    }
+
+    /// Name etcd's log and quote its last JSON record, or its last line if it has none, as the log is usually removed
+    /// before anyone reads an error naming it.
+    fn log_tail(&self) -> String {
+        let log = self.log_path();
+        let text = std::fs::read(&log).unwrap_or_default();
+        let text = String::from_utf8_lossy(&text);
+        // Go prints a panic and its stack trace after etcd's record of the panic.
+        let line = text
+            .lines()
+            .rfind(|line| line.starts_with('{'))
+            .or_else(|| text.lines().last())
+            .unwrap_or_default();
+        format!("last record in {log:?}: {line}")
     }
 
     /// Build a server, but do not start it.
@@ -344,7 +373,7 @@ fn keep_test_dir() -> bool {
 }
 
 fn create_working_dir(path: &path::Path) -> io::Result<()> {
-    // etcd creates its data dir 0700, and warns on every start about one that is not.
+    // 0700 keeps etcd's log private in the shared temp dir.
     #[cfg(unix)]
     let created = {
         use std::os::unix::fs::DirBuilderExt;
@@ -356,7 +385,7 @@ fn create_working_dir(path: &path::Path) -> io::Result<()> {
     created.map_err(|error| {
         io::Error::new(
             error.kind(),
-            format!("failed to create etcd data dir {path:?}: {error}"),
+            format!("failed to create etcd server dir {path:?}: {error}"),
         )
     })
 }
@@ -387,7 +416,10 @@ impl Drop for EtcdServer {
             && let Err(error) = std::fs::remove_dir_all(&self.config.working_dir)
             && error.kind() != io::ErrorKind::NotFound
         {
-            eprintln!("Failed to remove etcd data dir {:?}: {error}", self.config.working_dir);
+            eprintln!(
+                "Failed to remove etcd server dir {:?}: {error}",
+                self.config.working_dir
+            );
         }
     }
 }
@@ -415,6 +447,31 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn log_tail_quotes_the_last_json_record_or_else_the_last_line() {
+        let config = EtcdServerConfig::new_single_temporary();
+        std::fs::create_dir(&config.working_dir).unwrap();
+        let log = config.log_path();
+
+        let record = r#"{"level":"panic","msg":"failed to create WAL","error":"no space left on device"}"#;
+        let panicked = [
+            r#"{"level":"info","msg":"bootstrapping storage"}"#,
+            record,
+            "panic: failed to create WAL",
+            "",
+            "goroutine 1 [running]:",
+            "go.uber.org/zap/zapcore.CheckWriteAction.OnWrite(0x1?, 0x2a7?, {0x0?, 0x0?, 0x36cd976a7060?})",
+            "\tgo.uber.org/zap@v1.27.1/zapcore/entry.go:196 +0x54",
+        ];
+        std::fs::write(&log, panicked.join("\n")).unwrap();
+        assert_eq!(config.log_tail(), format!("last record in {log:?}: {record}"));
+
+        std::fs::write(&log, b"stray byte \xff\nlast line\n").unwrap();
+        assert_eq!(config.log_tail(), format!("last record in {log:?}: last line"));
+
+        std::fs::remove_dir_all(&config.working_dir).unwrap();
     }
 
     #[test]

@@ -38,6 +38,12 @@ For more control, build an [`EtcdServerConfig`] or [`EtcdClusterConfig`] directl
 
 Call [`.start()`][EtcdServerConfig::start] to launch the server or cluster process.
 
+# Data and Logs
+
+Each server has a private directory named `etcd-srvr-<random letters>` in [`std::env::temp_dir`].
+etcd keeps its data in the `data` subdirectory, and its stdout and stderr go to `etcd.log`, not to
+the test's output. A restarted server reuses its data and appends to its log.
+
 # etcd Binary Resolution
 
 The etcd binary is resolved in the following order:
@@ -52,10 +58,10 @@ In most cases, the vendored binary handles resolution automatically and no confi
 # Environment Variables
 
 - **`ETCD`** -- path to the etcd binary (see [etcd Binary Resolution](#etcd-binary-resolution)).
-- **`ETCDRS_KEEP_TEST_DIR`** -- set to `1` or `true` to prevent automatic cleanup of etcd data
-  directories after a test passes. By default, data directories under `/tmp` are removed when a
-  test completes successfully; they are always kept when a test fails so you can inspect the state.
-  Any other value emits a warning and is treated as `false`.
+- **`ETCDRS_KEEP_TEST_DIR`** -- set to `1` or `true` to prevent automatic cleanup of server
+  directories (see [Data and Logs](#data-and-logs)) after a test passes. By default, they are
+  removed when a test completes successfully; they are always kept when a test fails so you can
+  inspect etcd's data and log. Any other value emits a warning and is treated as `false`.
 
 # Feature Flags
 

@@ -90,8 +90,11 @@ async fn wait_until_ready(mut servers: Vec<&mut EtcdServer>) -> Result<(), Strin
             if let Some(exit) = server.runner.as_mut().unwrap().proc.try_wait().unwrap() {
                 let config = &server.config;
                 return Err(format!(
-                    "{} exited with {exit} (client port {}, peer port {}); etcd's log on stderr says why",
-                    config.name.0, config.client_port, config.peer_port
+                    "{} exited with {exit} (client port {}, peer port {}); {}",
+                    config.name.0,
+                    config.client_port,
+                    config.peer_port,
+                    config.log_tail()
                 ));
             }
         }
@@ -213,10 +216,23 @@ mod tests {
             message.contains(&format!("client port {}, peer port {taken}", last.client_port)),
             "{message}"
         );
+        assert!(message.contains(&format!("{:?}", last.log_path())), "{message}");
+        assert!(message.contains(&format!("127.0.0.1:{taken}: bind:")), "{message}");
 
         let dir = &last.working_dir;
         assert!(dir.exists(), "the last attempt's data dir {dir:?} should be kept");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restarted_server_appends_to_its_log() {
+        let mut server = etcd_server();
+        server.stop().unwrap();
+        server.start().unwrap();
+        wait_until_ready(vec![&mut server]).await.unwrap();
+
+        let log = std::fs::read_to_string(server.config.log_path()).unwrap();
+        assert_eq!(log.matches(r#""msg":"Running: ""#).count(), 2, "{log}");
     }
 
     #[tokio::test]
