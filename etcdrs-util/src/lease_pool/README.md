@@ -37,9 +37,10 @@ pool.revoke_lease(lease_id).await.expect("revoke_lease failed");
 task that manages the keep-alive stream.
 
 [`LeasePool::get_lease`] returns a lease with the requested TTL, reusing an existing one if the
-pool already has a lease at that TTL (rounded to the nearest whole second, since etcd only supports
-second-granularity TTLs). [`LeasePool::grant_lease`] always creates a new lease, even if one with
-the same TTL already exists, and adds it to the pool for automatic keep-alive.
+pool already has a lease at that TTL (truncated to whole seconds, since etcd only supports
+second-granularity TTLs). It does not check that the lease still exists on the server; see
+[Stale Leases](#stale-leases). [`LeasePool::grant_lease`] always creates a new lease, even if one
+with the same TTL already exists, and adds it to the pool for automatic keep-alive.
 
 [`LeasePool::revoke_lease`] removes a lease from the pool and sends a revoke request to the server.
 If the lease was a pooled lease (obtained via [`get_lease`][LeasePool::get_lease]), future calls
@@ -49,8 +50,8 @@ with that TTL will create a new lease.
 
 Since etcd TTLs have second granularity, the pool groups leases by their whole-second TTL value.
 A call to `get_lease(Duration::from_secs(30))` and `get_lease(Duration::from_millis(30_200))`
-will return the same `LeaseId`, since both round to 30 seconds. This reduces the number of active
-leases on the server and the number of keep-alive messages needed.
+will return the same `LeaseId`, since both truncate to 30 seconds. This reduces the number of
+active leases on the server and the number of keep-alive messages needed.
 
 ## Keep-Alive Mechanism
 
@@ -73,4 +74,48 @@ If the keep-alive stream terminates with an error, the background task:
 3. Resumes normal scheduling based on the new server-reported TTLs.
 
 Leases that have expired during the outage (server reports `ttl: None`) are removed from the
-pool. Future `get_lease` calls for that TTL will create a new lease.
+pool. Future `get_lease` calls for that TTL will create a new lease. Until the pool receives that
+report, `get_lease` can still return the expired lease; see [Stale Leases](#stale-leases).
+
+## Stale Leases
+
+`get_lease` does not ask the server whether the pooled lease still exists, so it can return a
+lease that is already gone: another client revoked it, or it expired while the pool's keep-alives
+were not reaching the server. A put that uses such a lease fails with
+[`PutErrorKind::LeaseNotFound`][etcdrs::PutErrorKind::LeaseNotFound].
+
+The pool removes a lease only when a keep-alive response reports it gone. Until then, `get_lease`
+keeps returning it:
+
+- If keep-alives are reaching the server, that takes up to about a third of the TTL (at least one
+  second) after the lease is revoked, plus one round trip.
+- While the keep-alive stream is failing, such as while etcd is unreachable, there is no limit.
+
+To recover, pass the lease to [`LeasePool::revoke_lease`]. That removes it from the pool, so the
+next `get_lease` grants a new lease. The revoke request itself fails with
+[`RevokeLeaseErrorKind::NotFound`][etcdrs::RevokeLeaseErrorKind::NotFound], because the server no
+longer has the lease:
+
+```rust,no_run
+use std::time::Duration;
+use etcdrs::PutErrorKind;
+use etcdrs_util::lease_pool::LeasePool;
+
+# async {
+# let client: etcdrs::Client = todo!();
+# let pool = LeasePool::new(client.clone());
+let ttl = Duration::from_secs(30);
+let lease_id = pool.get_lease(ttl).await.expect("get_lease failed");
+match client.put("my-key").value("my-value").lease(lease_id).await {
+    Err(e) if e.kind() == PutErrorKind::LeaseNotFound => {
+        // Fails with `NotFound`, but only after the pool has dropped the lease.
+        let _ = pool.revoke_lease(lease_id).await;
+        let lease_id = pool.get_lease(ttl).await.expect("get_lease failed");
+        client.put("my-key").value("my-value").lease(lease_id).await.expect("put failed");
+    }
+    result => {
+        result.expect("put failed");
+    }
+}
+# };
+```

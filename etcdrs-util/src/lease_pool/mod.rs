@@ -77,6 +77,19 @@ impl LeasePool {
     /// TTL already exists in the pool, its [`LeaseId`] is returned. Otherwise, a new lease is
     /// granted from the server and added to the pool. Concurrent calls with the same TTL share one
     /// grant: if it fails, each of them returns the error, and the next call grants again.
+    ///
+    /// The pool does not check a pooled lease against the server, so the returned lease can
+    /// already be gone: another client revoked it, or it expired while the pool's keep-alives
+    /// were not reaching the server. A put that uses it fails with
+    /// [`PutErrorKind::LeaseNotFound`][etcdrs::PutErrorKind::LeaseNotFound]. The pool drops the
+    /// lease when a keep-alive response reports it gone. That takes up to about a third of the
+    /// TTL (at least one second) plus a round trip, or has no limit while the keep-alive stream
+    /// is failing, such as while etcd is unreachable.
+    ///
+    /// To recover, pass the lease to [`revoke_lease`][Self::revoke_lease]. That removes it from
+    /// the pool, so the next `get_lease` grants a new lease. The revoke request itself fails
+    /// with [`RevokeLeaseErrorKind::NotFound`][etcdrs::RevokeLeaseErrorKind::NotFound], because
+    /// the server no longer has the lease.
     pub async fn get_lease(&self, ttl: Duration) -> Result<LeaseId, GrantLeaseError> {
         let ttl_secs = ttl.as_secs();
         let grant = {
@@ -151,6 +164,10 @@ impl LeasePool {
     ///
     /// If the lease was a pooled lease (obtained via [`get_lease`][Self::get_lease]), it is removed
     /// from the pool and future calls to `get_lease` with that TTL will create a new one.
+    ///
+    /// The pool removes the lease before it sends the request, so the lease is gone from the
+    /// pool even if the request fails, such as with
+    /// [`NotFound`][etcdrs::RevokeLeaseErrorKind::NotFound] for a lease the server no longer has.
     pub async fn revoke_lease(&self, lease_id: LeaseId) -> Result<(), RevokeLeaseError> {
         {
             let mut state = self.0.shared.state.lock().unwrap();
