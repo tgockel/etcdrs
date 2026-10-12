@@ -151,8 +151,6 @@ impl EtcdServerConfig {
         // Both sockets are open at once, so the ports differ.
         let (client, client_port) = reserve_tcp_port().unwrap();
         let (peer, peer_port) = reserve_tcp_port().unwrap();
-        // etcd's listeners set SO_REUSEADDR exactly where std's do, so this binds where etcd could.
-        let etcd_can_bind = |port| net::TcpListener::bind((net::Ipv4Addr::LOCALHOST, port)).is_ok();
         let reserved_ports = (etcd_can_bind(client_port) && etcd_can_bind(peer_port)).then(|| Arc::new([client, peer]));
         Self {
             name,
@@ -341,6 +339,28 @@ fn reserve_tcp_port() -> io::Result<(socket2::Socket, u16)> {
     socket.set_reuse_address(true)?;
     let port = socket.local_addr()?.as_socket().unwrap().port();
     Ok((socket, port))
+}
+
+/// Whether etcd could bind `port` while a reservation holds it. Not a given on Linux: gVisor keeps the SO_REUSEADDR
+/// that a socket had when it bound, so a reservation, which sets the option after binding, refuses etcd's bind.
+#[cfg(target_os = "linux")]
+fn etcd_can_bind(port: u16) -> bool {
+    // Never listens: a process that another thread spawns inherits this socket until it calls exec, and a listening
+    // socket would make every other bind of the port fail until then.
+    let address = net::SocketAddr::from((net::Ipv4Addr::LOCALHOST, port));
+    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+        .and_then(|socket| {
+            socket.set_reuse_address(true)?;
+            socket.bind(&address.into())
+        })
+        .is_ok()
+}
+
+/// Whether etcd could bind `port` while a reservation holds it. etcd's listeners set SO_REUSEADDR exactly where std's
+/// do, so this binds where etcd could.
+#[cfg(not(target_os = "linux"))]
+fn etcd_can_bind(port: u16) -> bool {
+    net::TcpListener::bind((net::Ipv4Addr::LOCALHOST, port)).is_ok()
 }
 
 /// Get the path to `etcd`.
@@ -670,6 +690,31 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::AddrInUse, "port {port}: {error}");
             net::TcpListener::bind(address).unwrap();
         }
+    }
+
+    /// A process that another thread spawns inherits every socket open at that moment until it calls exec.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn temporary_ports_stay_bindable_while_other_threads_spawn_processes() {
+        use std::time::{Duration, Instant};
+
+        // The spawning threads stop at the deadline on their own, so a failed bind cannot leave the scope waiting.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    while Instant::now() < deadline {
+                        process::Command::new("true").status().unwrap();
+                    }
+                });
+            }
+            while Instant::now() < deadline {
+                let config = EtcdServerConfig::new_single_temporary();
+                for port in [config.client_port, config.peer_port] {
+                    net::TcpListener::bind((net::Ipv4Addr::LOCALHOST, port)).unwrap();
+                }
+            }
+        });
     }
 
     #[cfg(unix)]
