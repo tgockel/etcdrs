@@ -4,8 +4,10 @@ use super::{BuildError, Client, ClientBuilder};
 impl Client {
     /// Create a [`ClientBuilder`], for when a connection string alone is not enough.
     ///
-    /// Use this to supply credentials, a [`RetryPolicy`][super::RetryPolicy], or a
-    /// [`MetricsCollector`][super::MetricsCollector]; [`new`][Self::new] covers everything else.
+    /// Use this to supply credentials, a [`RetryPolicy`][super::RetryPolicy], a
+    /// [`MetricsCollector`][super::MetricsCollector], or a
+    /// [limit on response size][ClientBuilder::max_response_size]; [`new`][Self::new] covers
+    /// everything else.
     pub fn builder() -> ClientBuilder {
         ClientBuilder::default()
     }

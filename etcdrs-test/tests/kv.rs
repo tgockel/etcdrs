@@ -127,6 +127,57 @@ async fn list_response_over_4_mib(etcd_server: EtcdServer) {
     assert_eq!(client.list_prefix("big/").count_only().await.unwrap().count(), 50);
 }
 
+/// A response over the client's `max_response_size` fails the call, and one under it does not.
+#[rstest]
+#[tokio::test]
+async fn response_over_max_response_size_is_refused(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::builder()
+        .add_connection(etcd_server.connect_string())
+        .unwrap()
+        .max_response_size(64 * 1024)
+        .build()
+        .unwrap();
+    client.put("big").value(vec![0u8; 100 * 1024]).await.unwrap();
+    client.put("small").value("v").await.unwrap();
+
+    let err = client.get("big").await.unwrap_err();
+    assert_eq!(err.kind(), GetErrorKind::Unknown, "{err:?}");
+    let status = err.grpc_status().unwrap();
+    assert_eq!(status.code(), tonic::Code::OutOfRange, "{err:?}");
+    assert!(status.message().contains("the limit is: 65536 bytes"), "{err:?}");
+
+    let small = client.get("small").await.unwrap().into_record().unwrap();
+    assert_eq!(small.value(), &b"v"[..]);
+}
+
+/// etcd applies a request before it sends the response, so a refused response to a write is an
+/// error for a write that happened.
+#[rstest]
+#[tokio::test]
+async fn refused_response_to_a_write_leaves_it_applied(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::builder()
+        .add_connection(etcd_server.connect_string())
+        .unwrap()
+        .max_response_size(64 * 1024)
+        .build()
+        .unwrap();
+    let unbounded = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+    unbounded.put("k").value(vec![0u8; 100 * 1024]).await.unwrap();
+
+    // The response carries the 100 KiB value that the put replaces.
+    let err = client
+        .put("k")
+        .value("new")
+        .get_previous()
+        .await
+        .err()
+        .expect("the response is refused");
+    assert_eq!(err.grpc_status().unwrap().code(), tonic::Code::OutOfRange, "{err:?}");
+
+    let record = unbounded.get("k").await.unwrap().into_record().unwrap();
+    assert_eq!(record.value(), &b"new"[..]);
+}
+
 #[rstest]
 #[tokio::test]
 async fn create_delete_get(etcd_server: EtcdServer) {

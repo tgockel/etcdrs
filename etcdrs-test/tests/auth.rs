@@ -167,6 +167,49 @@ async fn auth_lifecycle(etcd_server: EtcdServer) {
     authed.auth_disable().await.unwrap();
 }
 
+/// A response limit below the size of the `Authenticate` response keeps a client with credentials
+/// from getting a token. Its calls then fail with etcd's refusal of a request that carried none,
+/// and only `authenticate` reports the size error.
+#[rstest]
+#[tokio::test]
+async fn response_limit_below_the_authenticate_response(etcd_server: EtcdServer) {
+    let root = enable_auth(&etcd_server).await;
+    let token = root.authenticate().await.unwrap().into_token();
+
+    // 40 bytes holds a response of nothing but a header, and not one that also carries a token.
+    let with_token = etcdrs::Client::builder()
+        .add_connection(etcd_server.connect_string())
+        .unwrap()
+        .auth_token(&token)
+        .unwrap()
+        .max_response_size(40)
+        .build()
+        .unwrap();
+    assert!(with_token.get("foo").await.unwrap().into_record().is_none());
+
+    let with_credentials = etcdrs::Client::builder()
+        .add_connection(etcd_server.connect_string())
+        .unwrap()
+        .credentials("root", "rootpw")
+        .max_response_size(40)
+        .build()
+        .unwrap();
+    let err = with_credentials.get("foo").await.unwrap_err();
+    assert_eq!(err.kind(), etcdrs::GetErrorKind::Authentication, "{err:?}");
+    assert_eq!(
+        err.grpc_status().map(|s| s.message()),
+        Some("etcdserver: user name is empty"),
+        "{err:?}"
+    );
+
+    let err = with_credentials.authenticate().await.unwrap_err();
+    assert_eq!(
+        err.grpc_status().map(|s| s.code()),
+        Some(tonic::Code::OutOfRange),
+        "{err:?}"
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn auth_enable_requires_root(etcd_server: EtcdServer) {

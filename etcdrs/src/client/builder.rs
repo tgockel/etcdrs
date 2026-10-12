@@ -29,6 +29,7 @@ pub struct ClientBuilder {
     metrics: Option<Box<dyn MetricsCollector>>,
     auth: Option<AuthConfig>,
     retry_policy: RetryPolicy,
+    max_response_size: Option<usize>,
 }
 
 impl ClientBuilder {
@@ -115,6 +116,34 @@ impl ClientBuilder {
         self.retry_policy(RetryPolicy::Forever)
     }
 
+    /// Set the largest response, in bytes, that the client accepts.
+    ///
+    /// The limit applies to each gRPC message: a list that etcd answers in one response counts that
+    /// whole response, and a watch counts each response it receives. A response over the limit fails
+    /// the operation with the gRPC status `OutOfRange`, which the error's `grpc_status` returns, and
+    /// ends a [`Watcher`][super::Watcher] or [`LeaseKeeper`][super::LeaseKeeper].
+    ///
+    /// The default is `i32::MAX`, the most etcd sends in one message, so the client accepts every
+    /// response etcd can send. A limit of `0` is not special: it refuses every response with content.
+    ///
+    /// A lower limit has consequences beyond the failed call:
+    ///
+    /// - etcd has already acted on a request when it sends the response, and the client does not
+    ///   replay a refused one, so a refused response to a write leaves the write applied.
+    /// - A [list][super::List] answers in one response unless it has a
+    ///   [`limit`][super::List::limit]. etcdrs-util's `CacheClient` lists each range it caches in one
+    ///   request, so a limit below the size of the records in a range keeps the cache from seeding it.
+    /// - A watch that starts from a past revision fails if etcd replays that history in a response
+    ///   over the limit, and a watch restarted from the same revision can fail again.
+    /// - With [`credentials`][Self::credentials], the client authenticates by itself, and a limit
+    ///   below the size of that response keeps it from getting a token. Calls then fail with etcd's
+    ///   refusal of a request that carried no token, not with `OutOfRange`.
+    ///   [`authenticate`][Client::authenticate] reports the size error.
+    pub fn max_response_size(mut self, bytes: usize) -> Self {
+        self.max_response_size = Some(bytes);
+        self
+    }
+
     /// Set credentials for authenticating with the etcd cluster.
     ///
     /// The token is obtained lazily: the first unary request goes out without one, and when the
@@ -166,6 +195,7 @@ impl ClientBuilder {
             metrics,
             auth,
             retry_policy,
+            max_response_size,
         } = self;
 
         if remotes.is_empty() {
@@ -211,7 +241,7 @@ impl ClientBuilder {
                 metrics,
                 auth,
                 retry_policy,
-                max_response_size: DEFAULT_MAX_RESPONSE_SIZE,
+                max_response_size: max_response_size.unwrap_or(DEFAULT_MAX_RESPONSE_SIZE),
             }),
         })
     }
