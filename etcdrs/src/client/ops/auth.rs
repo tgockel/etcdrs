@@ -442,7 +442,7 @@ impl ClientInner {
         password: &str,
         timeout: Option<std::time::Duration>,
     ) -> Result<etcdserverpb::AuthenticateResponse, tonic::Status> {
-        let mut client = etcdserverpb::auth_client::AuthClient::new(self.channel.clone());
+        let mut client = self.service_client(etcdserverpb::auth_client::AuthClient::new);
         let mut request = tonic::Request::new(etcdserverpb::AuthenticateRequest {
             name: name.into(),
             password: password.into(),

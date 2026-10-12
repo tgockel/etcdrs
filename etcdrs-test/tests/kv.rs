@@ -86,6 +86,47 @@ async fn list_pagination_consistent_revision(etcd_server: EtcdServer) {
     assert_eq!(values, vec![b"b", b"c", b"d"]);
 }
 
+/// tonic refuses a message over 4 MiB unless the client raises its limit, and etcd answers a list
+/// without a `limit` in one response however large it is.
+#[rstest]
+#[tokio::test]
+async fn list_response_over_4_mib(etcd_server: EtcdServer) {
+    let metrics = Arc::new(etcdrs::client::RequestCounter::default());
+    let client = etcdrs::Client::builder()
+        .add_connection(etcd_server.connect_string())
+        .unwrap()
+        .metrics(metrics.clone())
+        .build()
+        .unwrap();
+
+    for i in 0..50u8 {
+        client
+            .put(format!("big/{i:02}"))
+            .value(vec![i; 100 * 1024])
+            .await
+            .unwrap();
+    }
+
+    let before = metrics.get().requested();
+    let records = client
+        .list_prefix("big/")
+        .await
+        .unwrap()
+        .into_stream()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>()
+        .await;
+    assert_eq!(metrics.get().requested(), before + 1);
+    assert_eq!(records.len(), 50);
+    for (i, record) in records.iter().enumerate() {
+        assert_eq!(record.key(), format!("big/{i:02}").as_bytes());
+        assert_eq!(record.value().len(), 100 * 1024);
+        assert!(record.value().iter().all(|&byte| byte == i as u8), "{i}");
+    }
+
+    assert_eq!(client.list_prefix("big/").count_only().await.unwrap().count(), 50);
+}
+
 #[rstest]
 #[tokio::test]
 async fn create_delete_get(etcd_server: EtcdServer) {

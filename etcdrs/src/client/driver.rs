@@ -341,7 +341,7 @@ impl crate::driver::LeaseDriver for Client {
             loop {
                 let mut request = tonic::Request::new(KeepAliveReceiverStream::new(&requests));
                 let generation = client.attach_stream_token(&mut request, deadline).await;
-                let mut lease_client = etcdserverpb::lease_client::LeaseClient::new(client.channel.clone());
+                let mut lease_client = client.service_client(etcdserverpb::lease_client::LeaseClient::new);
                 // etcd sends no response headers before its first answer, so refusing a first
                 // keep-alive fails the call itself, possibly long after `deadline`.
                 let status = match lease_client.lease_keep_alive(request).await {

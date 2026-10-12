@@ -415,6 +415,39 @@ async fn cached_list_count_and_keys_only(etcd_server: EtcdServer) {
     assert_eq!(metrics.get().requested(), before);
 }
 
+/// tonic refuses a message over 4 MiB unless the client raises its limit, and one list seeds a
+/// range, so a range holding more never seeded.
+#[rstest]
+#[tokio::test]
+async fn a_range_over_4_mib_is_seeded(etcd_server: EtcdServer) {
+    let external = Client::new(&etcd_server.connect_string()).unwrap();
+    for i in 0..50u8 {
+        external
+            .put(format!("big/{i:02}"))
+            .value(vec![i; 100 * 1024])
+            .await
+            .unwrap();
+    }
+
+    let (client, metrics) = counting_client(&etcd_server);
+    let cache = CacheClient::builder(client).cache(Prefix("big/")).build();
+    let last = vec![49u8; 100 * 1024];
+    eventually_cached(&cache, &metrics, "big/49", Some(last.as_slice())).await;
+    assert!(cache.coherent_revision(Prefix("big/")).is_some());
+
+    let before = metrics.get().requested();
+    let records = cache
+        .list_prefix("big/")
+        .await
+        .unwrap()
+        .into_stream()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>()
+        .await;
+    assert_eq!(records.len(), 50);
+    assert_eq!(metrics.get().requested(), before);
+}
+
 #[rstest]
 #[tokio::test]
 async fn partial_overlap_list_passes_through(etcd_server: EtcdServer) {

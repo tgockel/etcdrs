@@ -120,6 +120,7 @@ struct ClientInner {
     metrics: Option<Box<dyn MetricsCollector>>,
     auth: Option<AuthState>,
     retry_policy: RetryPolicy,
+    max_response_size: usize,
 }
 
 fn metadata_from_pb(r: &crate::pb::mvccpb::KeyValue) -> Metadata {
@@ -202,7 +203,34 @@ pub(crate) enum Idempotency {
     Mutable,
 }
 
+trait ServiceClient: Sized {
+    fn with_max_decoding_message_size(self, limit: usize) -> Self;
+}
+
+macro_rules! impl_service_client {
+    ($($client:ty),+ $(,)?) => {$(
+        impl ServiceClient for $client {
+            fn with_max_decoding_message_size(self, limit: usize) -> Self {
+                self.max_decoding_message_size(limit)
+            }
+        }
+    )+};
+}
+
+impl_service_client!(
+    crate::pb::etcdserverpb::auth_client::AuthClient<tonic::transport::Channel>,
+    crate::pb::etcdserverpb::cluster_client::ClusterClient<tonic::transport::Channel>,
+    crate::pb::etcdserverpb::kv_client::KvClient<tonic::transport::Channel>,
+    crate::pb::etcdserverpb::lease_client::LeaseClient<tonic::transport::Channel>,
+    crate::pb::etcdserverpb::watch_client::WatchClient<tonic::transport::Channel>,
+);
+
 impl ClientInner {
+    /// Build service clients through this rather than `new`, which leaves tonic's 4 MiB response limit.
+    fn service_client<C: ServiceClient>(&self, create: impl FnOnce(tonic::transport::Channel) -> C) -> C {
+        create(self.channel.clone()).with_max_decoding_message_size(self.max_response_size)
+    }
+
     /// Execute a unary gRPC call with retry and timeout logic.
     ///
     /// `idempotency` declares whether the RPC being invoked mutates server state, which decides
@@ -220,6 +248,7 @@ impl ClientInner {
     ) -> Result<R, tonic::Status>
     where
         Request: Clone,
+        GrpcClient: ServiceClient,
     {
         // tonic's `set_timeout` panics on this or more: `grpc-timeout` holds at most eight digits of hours.
         const GRPC_TIMEOUT_LIMIT: std::time::Duration = std::time::Duration::from_secs(100_000_000 * 60 * 60);
@@ -235,7 +264,7 @@ impl ClientInner {
         // Zero rather than absent once the deadline has passed: an attempt sent with no
         // `grpc-timeout` at all can outlive the budget indefinitely.
         let remaining = || deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
-        let mut client = create_client(self.channel.clone());
+        let mut client = self.service_client(create_client);
         let mut token_refreshed = false;
         loop {
             let metric = metrics::MetricsSpan::new(&self.metrics);

@@ -19,6 +19,9 @@ enum AuthConfig {
     Token(tonic::metadata::AsciiMetadataValue),
 }
 
+/// etcd sends messages of up to `math.MaxInt32` bytes.
+const DEFAULT_MAX_RESPONSE_SIZE: usize = i32::MAX as usize;
+
 #[derive(Default)]
 pub struct ClientBuilder {
     remotes: Vec<Remote>,
@@ -208,6 +211,7 @@ impl ClientBuilder {
                 metrics,
                 auth,
                 retry_policy,
+                max_response_size: DEFAULT_MAX_RESPONSE_SIZE,
             }),
         })
     }

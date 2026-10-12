@@ -432,7 +432,7 @@ impl WatchBuilder<Client> {
                         unanswered_creates: unanswered_creates.clone(),
                     });
                     let generation = client.attach_stream_token(&mut request, deadline).await;
-                    let mut watch_client = etcdserverpb::watch_client::WatchClient::new(client.channel.clone());
+                    let mut watch_client = client.service_client(etcdserverpb::watch_client::WatchClient::new);
                     match watch_client.watch(request).await {
                         Ok(resp) => break (resp.into_inner(), unanswered_creates, generation),
                         Err(status)
@@ -1197,12 +1197,17 @@ mod test {
         }
     }
 
-    /// The key of the put a watcher yielded.
-    fn put_key(item: Option<Result<WatchEvent, WatchError>>) -> String {
+    /// The record of the put a watcher yielded.
+    fn put_record(item: Option<Result<WatchEvent, WatchError>>) -> Record {
         match item {
-            Some(Ok(WatchEvent::Put { record, .. })) => String::from_utf8(record.key().to_vec()).unwrap(),
+            Some(Ok(WatchEvent::Put { record, .. })) => record,
             other => panic!("expected a put, got {other:?}"),
         }
+    }
+
+    /// The key of the put a watcher yielded.
+    fn put_key(item: Option<Result<WatchEvent, WatchError>>) -> String {
+        String::from_utf8(put_record(item).key().to_vec()).unwrap()
     }
 
     /// The events of a response etcd splits into fragments used to be yielded as each fragment
@@ -1285,5 +1290,25 @@ mod test {
             matches!(&item, Some(Ok(WatchEvent::Progress { revision, .. })) if revision.get() == 3),
             "expected progress at 3, got {item:?}"
         );
+    }
+
+    /// etcd sends the events it held back for a watch it had not yet announced whole, however
+    /// large, and tonic refuses a message over 4 MiB unless the client raises its limit.
+    #[tokio::test]
+    async fn response_over_4_mib_is_yielded() {
+        let (mut watcher, responses, _) = scripted_watcher().await;
+        let keys = (0..50).map(|i| format!("k/{i:02}")).collect::<Vec<_>>();
+        let mut response = puts(&keys.iter().map(String::as_str).collect::<Vec<_>>(), false);
+        for (i, event) in response.events.iter_mut().enumerate() {
+            event.kv.as_mut().unwrap().value = Bytes::from(vec![i as u8; 100 * 1024]);
+        }
+        responses.send(response).unwrap();
+
+        for (i, key) in keys.iter().enumerate() {
+            let record = put_record(watcher.next().await);
+            assert_eq!(record.key(), key.as_bytes());
+            assert_eq!(record.value().len(), 100 * 1024);
+            assert!(record.value().iter().all(|&byte| byte == i as u8), "{key}");
+        }
     }
 }
