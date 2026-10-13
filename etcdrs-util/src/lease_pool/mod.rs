@@ -55,6 +55,10 @@ impl LeasePool {
     /// Create a new lease pool backed by the given client.
     ///
     /// This spawns a background task that maintains the keep-alive stream.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from outside a Tokio runtime, which is required to spawn the background task.
     pub fn new(client: Client) -> Self {
         let shared = Arc::new(Shared {
             client,

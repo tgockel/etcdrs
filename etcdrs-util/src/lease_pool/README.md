@@ -34,7 +34,7 @@ pool.revoke_lease(lease_id).await.expect("revoke_lease failed");
 ## API Overview
 
 [`LeasePool::new`] creates a pool backed by a [`Client`][etcdrs::Client] and spawns a background
-task that manages the keep-alive stream.
+task that manages the keep-alive stream, so it must be called within a Tokio runtime.
 
 [`LeasePool::get_lease`] returns a lease with the requested TTL, reusing an existing one if the
 pool already has a lease at that TTL (truncated to whole seconds, since etcd only supports

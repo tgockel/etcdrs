@@ -22,6 +22,10 @@ impl Client {
     /// ```
     ///
     /// A single URI is also accepted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from outside a Tokio runtime, like [`ClientBuilder::build`], which this calls.
     pub fn new(connection_string: &str) -> Result<Self, BuildError> {
         Self::builder().connection_string(connection_string)?.build()
     }

@@ -25,6 +25,9 @@ pub use metrics::{MetricsCollector, RequestCount, RequestCounter};
 /// # };
 /// ```
 ///
+/// Creating a client spawns a background task, so [`new`][Client::new] and [`ClientBuilder::build`]
+/// must be called from within a Tokio runtime.
+///
 /// The client wraps an [`Arc`] internally and every method takes `&self`, so cloning is cheap and
 /// one instance can be shared across tasks with no further synchronization.
 ///

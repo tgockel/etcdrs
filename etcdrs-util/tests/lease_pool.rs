@@ -8,6 +8,19 @@ use etcdrs_util::lease_pool::LeasePool;
 use rstest::rstest;
 use tokio::task::JoinSet;
 
+/// `Client::new` needs a runtime too, so the client is made inside one and the pool outside it.
+#[test]
+#[should_panic(expected = "there is no reactor running")]
+fn new_outside_a_runtime_panics() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let client = runtime.block_on(async { Client::new("http://127.0.0.1:2379").unwrap() });
+
+    let _ = LeasePool::new(client);
+}
+
 #[rstest]
 #[tokio::test]
 async fn get_lease_pools_by_ttl(etcd_server: EtcdServer) {

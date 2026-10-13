@@ -188,6 +188,12 @@ impl ClientBuilder {
         Ok(self)
     }
 
+    /// Create the client from the endpoints and settings configured so far.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from outside a Tokio runtime, which is required to spawn the background task
+    /// that drives the connection. A missing runtime is a panic, not a [`BuildError`].
     pub fn build(self) -> Result<Client, BuildError> {
         let Self {
             remotes,
