@@ -220,6 +220,23 @@ async fn auth_enable_requires_root(etcd_server: EtcdServer) {
     assert_eq!(err.kind(), etcdrs::AuthErrorKind::RootUserRequired);
 }
 
+/// etcd refuses a root user that lacks the `root` role with its own message, and the same kind as
+/// for a missing root user.
+#[rstest]
+#[tokio::test]
+async fn auth_enable_requires_root_role(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+    client.user_add("root").password("rootpw").await.unwrap();
+
+    let err = client.auth_enable().await.unwrap_err();
+    assert_eq!(err.kind(), etcdrs::AuthErrorKind::RootUserRequired, "{err:?}");
+    assert_eq!(
+        err.grpc_status().map(|s| s.message()),
+        Some("etcdserver: root user does not have root role"),
+        "{err:?}"
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn auth_status_reports_enabled(etcd_server: EtcdServer) {
@@ -412,6 +429,35 @@ async fn empty_prefix_permission_covers_every_key(etcd_server: EtcdServer) {
 
     // Cleanup: disable auth
     root.auth_disable().await.unwrap();
+}
+
+/// etcd checks the range of a permission whether or not auth is enabled, and refuses an empty key or
+/// an end at or before the key. It reports the root role's permission with an empty key, so that one
+/// cannot be granted to another role either, although it covers every key.
+#[rstest]
+#[tokio::test]
+async fn invalid_permission_range_is_refused_without_auth(etcd_server: EtcdServer) {
+    let client = etcdrs::Client::new(&etcd_server.connect_string()).unwrap();
+    client.role_add("root").await.unwrap();
+    client.role_add("r").await.unwrap();
+
+    let root_permissions = client.role_get("root").await.unwrap().into_permissions();
+    assert_eq!(root_permissions.len(), 1, "{root_permissions:?}");
+    assert_eq!(root_permissions[0].target_range(), TargetRange::ToEnd(b""));
+
+    for permission in [
+        Permission::read(""),
+        Permission::read("b".."a"),
+        Permission::read("a".."a"),
+        root_permissions[0].clone(),
+    ] {
+        let err = client.role_grant_permission("r", permission.clone()).await.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            etcdrs::RoleErrorKind::InvalidAuthManagement,
+            "{permission:?}: {err:?}"
+        );
+    }
 }
 
 /// A permission failure is an answer, not a transient fault: etcd settles the token and identifies

@@ -727,10 +727,17 @@ pub enum RoleErrorKind {
     /// This comes from the gRPC API as `FAILED_PRECONDITION` with "permission is not granted to
     /// the role".
     PermissionNotGranted,
-    /// The operation is not permitted on this role while authentication is enabled.
+    /// The operation is not permitted on this role, or the permission's range is invalid.
     ///
-    /// Deleting the root role while authentication is enabled is rejected. This comes from the
-    /// gRPC API as `INVALID_ARGUMENT` with "invalid auth management".
+    /// Two conditions produce this kind:
+    ///
+    /// - Deleting the root role while authentication is enabled.
+    /// - Granting a permission whose range is invalid: its key is empty (`""`), or it ends at or
+    ///   before its key (`"b".."a"`, `"a".."a"`). etcd rejects these even when authentication is
+    ///   disabled. The permission [`role_get`][Client::role_get] reports for the root role has an
+    ///   empty key too, so granting it to another role fails although it covers every key.
+    ///
+    /// This comes from the gRPC API as `INVALID_ARGUMENT` with "invalid auth management".
     InvalidAuthManagement,
     /// Authentication is not enabled.
     ///

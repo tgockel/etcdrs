@@ -361,10 +361,11 @@ pub enum AuthErrorKind {
     ///
     /// This comes from the gRPC API as `FAILED_PRECONDITION` with "not enabled".
     NotEnabled,
-    /// The root user has not been created yet.
+    /// The root user is missing, or it has not been granted the `root` role.
     ///
-    /// A root user must exist before authentication can be enabled. This comes from the gRPC API as
-    /// `FAILED_PRECONDITION` with "root user".
+    /// Authentication can be enabled only when a user named `root` exists and has the `root` role.
+    /// This comes from the gRPC API as `FAILED_PRECONDITION` with "etcdserver: root user does not
+    /// exist" or "etcdserver: root user does not have root role".
     RootUserRequired,
     /// The provided credentials are invalid.
     ///
