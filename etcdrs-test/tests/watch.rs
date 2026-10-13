@@ -267,9 +267,10 @@ async fn watch_request_progress(etcd_server: EtcdServer) {
         .expect("stream ended")
         .expect("stream yielded an error");
 
-    let WatchEvent::Progress { revision, .. } = event else {
+    let WatchEvent::Progress { watch_id, revision, .. } = event else {
         panic!("expected Progress, got {event:?}");
     };
+    assert_eq!(watch_id, WatchId::new(-1));
     assert!(revision >= rev);
 }
 

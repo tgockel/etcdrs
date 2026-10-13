@@ -137,9 +137,10 @@ pub enum WatchEvent {
     },
     /// A progress notification from the server.
     ///
-    /// Contains the current store revision. The `watch_id` is `None` for responses to a global
-    /// [`Watcher::request_progress`] call, or `Some` for per-watch progress notifications enabled
-    /// via [`Watch::progress_notify`].
+    /// Contains the current store revision. A notification enabled via [`Watch::progress_notify`]
+    /// carries the ID of its watch in `watch_id`. A response to a global
+    /// [`Watcher::request_progress`] call is not about one watch: etcd sends it with watch ID -1,
+    /// so `watch_id` is `WatchId::new(-1)`, not `None`.
     Progress {
         header: ResponseHeader,
         watch_id: Option<WatchId>,
@@ -299,8 +300,7 @@ impl<W> Watch<W> {
     /// Request periodic progress notifications from the server for this watch.
     ///
     /// When enabled, the server sends progress notifications when no events have occurred recently.
-    /// These are consumed internally by the stream (they contain no events), but they keep the
-    /// connection alive and allow the server to advance its watch revision.
+    /// The stream yields each one as a [`WatchEvent::Progress`] carrying this watch's ID.
     pub fn progress_notify(mut self) -> Self {
         self.current.progress_notify = true;
         self
