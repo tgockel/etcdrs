@@ -29,8 +29,7 @@ impl RangeSpec {
         match TargetRange::from_wire(&lower, &upper) {
             TargetRange::All => RangeSpec::All,
             // etcd refuses to list the key `""`, so seeding it would retry forever and block every
-            // later range. Cache an empty span instead, spelled out because etcdrs 0.1.1, which this
-            // crate still accepts, encodes `..=""` as every key.
+            // later range. Cache an empty span instead.
             TargetRange::Single([]) => RangeSpec::Span(Bytes::from_static(b"\0\0"), Bytes::from_static(b"\0\0")),
             TargetRange::Single(_) => RangeSpec::Single(lower),
             TargetRange::ToEnd(_) => RangeSpec::From(lower),
